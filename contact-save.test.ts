@@ -128,3 +128,70 @@ test('native contact creation invokes the unambiguous save selector before verif
   expect(saved).toBe(true);
   expect(fields.firstName).toBe(draft.firstName);
 });
+
+// Exercise the shipped native adapter and inspect entry point with synthetic
+// framework objects. No real Contacts store is opened or modified.
+function inspectNative(options: {native?: 'nil'|'throw'|'empty'|'match', phones?: string[], email?: string,
+  brokenBook?: boolean, denied?: boolean} = {}) {
+  const source=readFileSync(new URL('./bridge/mac/contact-save.js',import.meta.url),'utf8');
+  const value={operation:'create',...request,phase:'inspect',handle:'5551234567',phone:'5551234567'};
+  const person={valueForProperty:(property:string)=>{
+    const entries=property==='phone' ? options.phones ?? ['+15551234567'] : [options.email ?? ''];
+    return {count:entries.length,valueAtIndex:(index:number)=>entries[index]};
+  }};
+  const book={get people(){
+    if(options.brokenBook) throw new Error('AddressBook read failed');
+    return {count:1,objectAtIndex:()=>person};
+  },addRecord:()=>{throw new Error('inspection must never create');}};
+  const dollar:any=(item:unknown)=>item;
+  Object.assign(dollar,{
+    ABAddressBook:{sharedAddressBook:book},kABPhoneProperty:'phone',kABEmailProperty:'email',
+    CNContactStore:{authorizationStatusForEntityType:()=>options.denied ? 2 : 3,alloc:{init:{
+      unifiedContactsMatchingPredicateKeysToFetchError:()=>{
+        if(options.native==='throw') throw new Error('native predicate failed');
+        return options.native==='empty' ? {count:0} : options.native==='match' ? {count:1} : null;
+      },
+    }}},
+    CNContact:{predicateForContactsMatchingPhoneNumber:()=>({}),predicateForContactsMatchingEmailAddress:()=>({})},
+    CNPhoneNumber:{phoneNumberWithStringValue:(item:unknown)=>item},CNContactIdentifierKey:'identifier',
+    NSFileHandle:{fileHandleWithStandardInput:{readDataOfLength:()=>JSON.stringify(value)}},
+    NSString:{alloc:{initWithDataEncoding:(item:unknown)=>item}},NSUTF8StringEncoding:4,
+  });
+  const helper=runInNewContext(source+'\n({run,nativeAdapter})',{
+    ObjC:{import:()=>{},unwrap:(item:unknown)=>item},$:dollar,Ref:()=>[],
+  });
+  return {response:JSON.parse(helper.run()),adapter:helper.nativeAdapter(),value};
+}
+test('nil or throwing native predicates still produce regional phone candidates',()=>{
+  for(const native of ['nil','throw','empty'] as const)
+    expect(inspectNative({native}).response).toEqual({ok:true,duplicate:false,phones:['+15551234567']});
+});
+test('failed or empty native predicates still check exact phones and email before creation',()=>{
+  for(const result of ['nil','empty'] as const)
+  for(const options of [{phones:['5551234567']},{email:draft.email.toUpperCase()}]) {
+    const fixture=inspectNative({...options,native:result});
+    expect(fixture.response).toEqual({ok:true,duplicate:true,phones:[]});
+    expect(native().createContact(fixture.value,fixture.adapter)).toEqual({ok:false,code:'duplicate'});
+  }
+});
+test('failed native and AddressBook checks refuse inspection and creation',()=>{
+  const fixture=inspectNative({brokenBook:true});
+  expect(fixture.response).toEqual({ok:false,code:'unavailable'});
+  expect(native().createContact(fixture.value,fixture.adapter)).toEqual({ok:false,code:'unavailable'});
+  expect(inspectNative({denied:true}).response).toEqual({ok:false,code:'permission'});
+});
+test('successful native duplicate result does not require AddressBook fallback',()=>{
+  expect(inspectNative({native:'match',brokenBook:true}).response).toEqual({ok:true,duplicate:true,phones:[]});
+});
+test('phone format grammar cannot drift across the four contact validators',()=>{
+  const sites=[['contact-review.ts',/!\/\^(.+)\$\/\.test\(handle\)/],
+    ['bridge/mac/contact-save.js',/!\/\^(.+)\$\/\.test\(value\)/],
+    ['bridge/mac/contact-save',/re\.fullmatch\(r"([^"]+)", value\)/g],
+    ['bridge/mac/contacts',/re\.fullmatch\(r"([^"]+)", handle\)/]] as const;
+  const expected=String.raw`\+?[0-9(][0-9 ()./-]{2,39}`;
+  for(const [file,pattern] of sites) {
+    const source=readFileSync(new URL(file,import.meta.url),'utf8');
+    const matches=[...source.matchAll(new RegExp(pattern.source,'g'))].map(match=>match[1]);
+    expect(matches.filter(rule=>rule.startsWith(String.raw`\+?`))).toEqual([expected]);
+  }
+});

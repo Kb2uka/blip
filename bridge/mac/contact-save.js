@@ -97,7 +97,13 @@ function nativeAdapter() {
     available:function(){return !nativePermissionDenied() && !!ObjC.unwrap(book);},
     permissionDenied:nativePermissionDenied,
     contains:function(draft){
-      if (nativeContactMatch(draft,nativeLookup())) return true;
+      try {
+        if (nativeContactMatch(draft,nativeLookup())) return true;
+      } catch (_) {
+        // A failed Contacts predicate must not bypass the AddressBook check
+        // below or prevent inspection from collecting regional candidates.
+        // AddressBook failures still propagate and block creation.
+      }
       const people=book.people, count=Number(people.count);
       if (!Number.isInteger(count) || count<0 || count>100000) throw new Error('unavailable');
       const keys=[draft.phone,draft.email].filter(Boolean).map(saveKey);
