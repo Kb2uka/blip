@@ -55,6 +55,15 @@ attachment ROWID.
 
 ## Hardening by hand
 
+The confined key can also invoke `contact-save` and `imsg-delete`. These are
+write capabilities: creating a contact and deleting a stored message through
+the Mac's native apps. The UI requires explicit confirmation, but confirmation
+is not a separate security boundary against someone who already has the key.
+The helpers validate bounded stdin, serialize operations, and verify the exact
+saved contact or deleted message before reporting success. They never write
+Messages or Contacts databases directly. Accessibility for deletion grants the
+SSH process UI control; grant it only on a bridge account you trust.
+
 - **Pin the Blip key on a LAN.** `blip-setup` pins the key (`from=`) only when
   the Mac is reached over Tailscale, where the address is a stable per-node
   identity (finding 13). On a LAN, give the Linux box a reserved address and
