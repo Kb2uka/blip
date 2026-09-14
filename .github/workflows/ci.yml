@@ -48,3 +48,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: public Accessibility helper typecheck
         run: swiftc -typecheck bridge/mac/message-delete.swift
+      - name: Accessibility traversal regressions (synthetic graphs)
+        run: python3 bridge/mac/test_message_delete_swift.py

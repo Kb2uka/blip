@@ -25,6 +25,26 @@ Keep the Mac logged into the same user account that runs Messages, signed into
 Messages, unlocked, and with Messages open for deletion. Linux needs no Swift
 installation. These actions use macOS APIs behind the existing SSH bridge.
 
+### A Mac without a monitor
+
+These actions let you manage conversations from Omarchy while a Mac serves as
+the iMessage gateway. Deletion still operates the Mac's Messages interface:
+the Mac must be awake, logged in, **unlocked**, and have Messages open. A
+connected monitor is not required; use Screen Sharing to unlock the Mac and
+open Messages before returning to Blip. SSH connectivity alone does not make
+the desktop available to the deletion helper.
+
+Messages does not expose an individual-message deletion command in its
+scripting dictionary. Blip uses Accessibility to operate its Delete action,
+then verifies the result through a read-only database query. This means
+deletion cannot run in a locked or logged-out desktop session. Blip does not
+unlock the Mac or change its automatic-lock settings.
+
+If a first attempt after unlocking says to keep Messages open, bring Messages
+forward, wait for the conversation to load, then reopen the Blip deletion
+dialog. If an attempt says deletion could not be verified, check Messages
+before retrying: the action may already have completed.
+
 ## One-time Mac approvals
 
 Open **System Settings → Privacy & Security** on the Mac.

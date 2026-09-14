@@ -26,6 +26,20 @@ test('requires a name and preserves the selected sender identity',()=>{
     expect(()=>normalizeContactDraft(value)).toThrow();
   expect(normalizeContactDraft({...draft,phone:'1 (555) 123-4567'}).phone).toBe('1 (555) 123-4567');
 });
+test('parenthesized phone numbers work in the form and both native identity fields',()=>{
+  const helper=native();
+  for(const fields of [{handle:'(555) 123-4567',phone:'5551234567'},
+    {handle:'5551234567',phone:'(555) 123-4567'}]) {
+    const value={...draft,...fields};
+    expect(normalizeContactDraft(value)).toEqual(value);
+    expect(helper.normalizeSave({operation:'create',confirmed:true,...value})).toEqual(value);
+  }
+  for(const phone of ['(555) 123-4568','(abc) 123-4567','(12)','()','555+1234567']) {
+    const value={...draft,handle:'5551234567',phone};
+    expect(()=>normalizeContactDraft(value)).toThrow();
+    expect(()=>helper.normalizeSave({operation:'create',confirmed:true,...value})).toThrow();
+  }
+});
 test('sends a confirmed new card on bounded stdin and validates the exact result',()=>{
   expect(()=>saveContact(draft,runner(success))).toThrow('Review');
   expect(saveContact(request,runner(success))).toEqual({ok:true,name:'Example Person'});

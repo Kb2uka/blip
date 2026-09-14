@@ -64,6 +64,13 @@ saved contact or deleted message before reporting success. They never write
 Messages or Contacts databases directly. Accessibility for deletion grants the
 SSH process UI control; grant it only on a bridge account you trust.
 
+Exact-message selection uses `sms://open?message-guid=`, an undocumented Apple
+URL interface. Accessibility is public, but this URL and the Messages layout
+are not stable contracts. The helper clears the old selection, checks the
+new selection and its content before invoking Delete, and refuses ambiguous
+or unsupported layouts. An unlocked graphical session is required, including
+on a Mac with no monitor. The helper does not bypass the lock screen.
+
 - **Pin the Blip key on a LAN.** `blip-setup` pins the key (`from=`) only when
   the Mac is reached over Tailscale, where the address is a stable per-node
   identity (finding 13). On a LAN, give the Linux box a reserved address and

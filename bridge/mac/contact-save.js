@@ -11,7 +11,7 @@ function saveKey(value) {
     if (value.length>254 || !/^[^@\s]+@[^@\s]+$/.test(value)) throw new Error('invalid');
     return 'email:'+value.toLowerCase();
   }
-  if (!/^\+?[0-9][0-9 ()./-]{2,39}$/.test(value)) throw new Error('invalid');
+  if (!/^\+?[0-9(][0-9 ()./-]{2,39}$/.test(value)) throw new Error('invalid');
   const digits=value.replace(/\D/g,'');
   if (digits.length<5 || digits.length>15) throw new Error('invalid');
   return 'phone:'+digits;

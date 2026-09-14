@@ -17,9 +17,16 @@ func children(_ element: AXUIElement) -> [AXUIElement] {
 }
 func descendants(_ root: AXUIElement) throws -> [AXUIElement] {
     var result = [AXUIElement](), queue = [(root, 0)], index = 0
+    var callbacks = kCFTypeSetCallBacks
+    let visited = CFSetCreateMutable(nil, 0, &callbacks)!
     while index < queue.count {
         let (element, depth) = queue[index]; index += 1
-        if index > 2000 || depth > 30 { throw Failure.reason("unsupported") }
+        // A locked desktop can expose the application as its own child.
+        // Deduplicate by AX identity, preserving the bounds on distinct nodes.
+        let pointer = Unmanaged.passUnretained(element).toOpaque()
+        if CFSetContainsValue(visited, pointer) { continue }
+        if result.count >= 2000 || depth > 30 { throw Failure.reason("unsupported") }
+        CFSetAddValue(visited, pointer)
         result.append(element)
         queue.append(contentsOf: children(element).map { ($0, depth+1) })
     }

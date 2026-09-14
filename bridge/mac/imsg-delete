@@ -44,6 +44,8 @@ def lookup(con, item):
 def decoded_text(row, directory):
     if row["text"]:
         return row["text"]
+    # Keep imsg import-safe: its command entry point must stay behind __main__,
+    # and module initialization must not read conversations or perform actions.
     loader = importlib.machinery.SourceFileLoader("blip_delete_reader", str(directory / "imsg"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)

@@ -80,6 +80,15 @@ class ContactSaveTransportTests(unittest.TestCase):
                                        lambda *args: self.fail("invalid request performed lookup")),
                              {"ok": False, "code": "invalid"})
 
+    def test_parenthesized_phone_preserves_selected_identity(self):
+        request = {**REQUEST, "handle": "(555) 123-4567", "phone": "5551234567"}
+        self.assertEqual(module.valid_request(request), request)
+        request = {**request, "handle": "5551234567", "phone": "(555) 123-4567"}
+        self.assertEqual(module.valid_request(request), request)
+        for invalid in ("(555) 123-4568", "(abc) 123-4567", "(12)", "()", "555+1234567"):
+            with self.subTest(phone=invalid), self.assertRaises(ValueError):
+                module.valid_request({**request, "phone": invalid})
+
     def test_region_aware_duplicates_reuse_the_bridge_matcher(self):
         parse, matches = module.phone_matcher(PATH)
         cases = [("1", "+12025550187", "2025550187", True),

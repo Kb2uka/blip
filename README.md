@@ -609,6 +609,11 @@ it does not unsend it. See the [Mac action setup guide](docs/MAC-ACTIONS.md)
 for automated helper installation, permission checks, and the one-time macOS
 approval steps.
 
+Message deletion currently supports **English Messages only** and requires an
+awake, unlocked Mac with Messages open. A Mac without a monitor works, but use
+Screen Sharing to unlock its desktop first. Deletion brings Messages forward;
+see [using a Mac without a monitor](docs/MAC-ACTIONS.md#a-mac-without-a-monitor).
+
 ## Keyboard
 
 | where | key | does |
