@@ -39,6 +39,7 @@ focused = None
 focus_id = str(uuid.uuid4())
 last_signature = None
 last_target = None
+last_segments = None
 buffer = bytearray()
 held = None
 browser_re = re.compile(r"^(?:brave(?:-.*)?|chromium(?:-.*)?|google-chrome(?:-.*)?|chrome(?:-.*)?|firefox(?:-.*)?|zen(?:-.*)?|org\.mozilla\.firefox|app\.zen_browser\.zen|vivaldi(?:-.*)?|microsoft-edge(?:-.*)?)$", re.I)
@@ -196,8 +197,72 @@ def field_anchor(obj, window, monitor, metadata):
         return None
 
 
+def segment_group(obj, window, metadata):
+    """Recognize a small row of digit boxes, including JS-only size limits.
+
+    Keep the actual accessible objects private. Never infer permission to type
+    into an arbitrary newly focused field after a character advances focus.
+    """
+    if not obj or not metadata or not metadata["web"] or metadata["tag"] != "input" or metadata["type"] not in ("text", "tel", "number"):
+        return None
+    stop = time.monotonic() + 0.2
+    def item(node):
+        if not node.is_text() or not node.get_state_set().contains(Atspi.StateType.EDITABLE):
+            return None
+        attrs = node.get_attributes()
+        state = node.get_state_set()
+        rect = node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+        if (attrs.get("tag") != "input" or attrs.get("text-input-type", attrs.get("input-type", "text")) != metadata["type"]
+            or attrs.get("maxlength", "-1") not in ("1", "-1")
+            or not all(state.contains(s) for s in (Atspi.StateType.SHOWING, Atspi.StateType.SENSITIVE))
+            or state.contains(Atspi.StateType.MULTI_LINE) or node.get_application().get_process_id() != window["pid"]
+            or not 8 <= rect.height <= 512 or not 8 <= rect.width <= rect.height * 2.5
+            or node.get_text_iface().get_character_count() > 1):
+            raise ValueError("not a digit box")
+        return (node, rect)
+    try:
+        item(obj)  # Avoid tree walks for ordinary full-width fields.
+        parent = obj
+        for _ in range(4):
+            parent = parent.get_parent()
+            if parent is None or parent.get_role() in (Atspi.Role.DOCUMENT_WEB, Atspi.Role.DOCUMENT_FRAME):
+                return None
+            boxes, stack, visited = [], [(parent, 0)], 0
+            while stack:
+                node, depth = stack.pop()
+                visited += 1
+                if visited > 64 or time.monotonic() >= stop:
+                    return None
+                if node.get_role() in (Atspi.Role.DOCUMENT_WEB, Atspi.Role.DOCUMENT_FRAME):
+                    return None
+                entry = item(node)
+                if entry:
+                    boxes.append(entry)
+                    if len(boxes) > 12:
+                        return None
+                else:
+                    count = node.get_child_count()
+                    if count > 24 or (count and depth >= 4):
+                        return None
+                    stack.extend((node.get_child_at_index(i), depth + 1) for i in reversed(range(count)))
+            if len(boxes) < 4:
+                continue
+            if not any(node == obj for node, _ in boxes):
+                return None
+            # Same-sized adjacent boxes on one row, in accessibility order.
+            for (_, a), (_, b) in zip(boxes, boxes[1:]):
+                if (abs(a.y - b.y) > a.height * 0.25 or abs(a.height - b.height) > a.height * 0.25
+                    or abs(a.width - b.width) > a.width * 0.25 or not -2 <= b.x - a.x - a.width <= a.height * 2):
+                    return None
+            return [node for node, _ in boxes]
+    except Exception:
+        pass
+    return None
+
+
 def snapshot():
-    global focus_id, last_signature, last_target
+    global focus_id, last_signature, last_target, last_segments
+    last_segments = None
     if not unlocked():
         last_target = None
         return None
@@ -220,6 +285,10 @@ def snapshot():
         "browser": browser, "monitor": monitor}
     if metadata:
         last_target["field"] = metadata
+        last_segments = segment_group(focused, window, metadata)
+        if last_segments:
+            last_target["segments"] = {"count": len(last_segments), "index": last_segments.index(focused),
+                "empty": all(node.get_text_iface().get_character_count() == 0 for node in last_segments)}
         anchor = field_anchor(focused, window, output, metadata)
         if anchor:
             last_target["anchor"] = anchor
@@ -257,10 +326,16 @@ def fill(event):
     if not chosen or current != chosen:
         return
     original = focused
+    segments = last_segments if chosen.get("segments") else None
+    if segments:
+        if len(segments) != len(code) or not chosen["segments"]["empty"]:
+            return
+        if original != segments[0] and not segments[0].get_component_iface().grab_focus():
+            return
     if chosen.get("field"):
         if not chosen["field"]["empty"]:
             return
-        if original and original.is_editable_text():
+        if not segments and original and original.is_editable_text():
             original.get_editable_text_iface().set_text_contents(code)
             poll()
             return
@@ -270,14 +345,27 @@ def fill(event):
     # same window-targeted insertion path as Blip's typecode, on its socket.
     # No process argv or clipboard transport; only validated key names enter
     # the fixed Hyprland dispatcher call.
-    for ch in code:
+    for index, ch in enumerate(code):
+        expected = segments[index] if segments else original
+        if expected and chosen.get("field"):
+            # A site may move focus asynchronously after input. Wait only for
+            # this prevalidated next box, never follow arbitrary focus changes.
+            wait_until = min(deadline / 1000, time.time() + 0.15)
+            while True:
+                expected.clear_cache()
+                state = expected.get_state_set()
+                if state.contains(Atspi.StateType.FOCUSED):
+                    break
+                if not segments or time.time() >= wait_until:
+                    return
+                time.sleep(0.01)
+            if not all(state.contains(s) for s in (Atspi.StateType.EDITABLE, Atspi.StateType.SHOWING, Atspi.StateType.SENSITIVE)):
+                return
+            if segments and expected.get_text_iface().get_character_count() != 0:
+                return
         window = active()
         if time.time() * 1000 >= deadline or not unlocked() or not window or window["address"] != chosen["window"] or window["pid"] != chosen["pid"]:
             break
-        if original and chosen.get("field"):
-            state = original.get_state_set()
-            if not state.contains(Atspi.StateType.FOCUSED):
-                break
         key = "minus" if ch == "-" else ch.lower()
         mods = "SHIFT" if ch.isupper() else ""
         for state in ("down", "up"):

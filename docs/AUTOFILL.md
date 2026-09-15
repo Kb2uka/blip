@@ -28,6 +28,10 @@ across subsequent focus changes. It sends no Enter key and submits no form.
 
 - **Smart:** an empty, single-line input has a verification label or OTP metadata.
   A site need not declare `autocomplete="one-time-code"`.
+- **Separate digit boxes:** a compact row of 4–12 matching inputs is treated as
+  one code entry, including sites that limit each box in JavaScript instead of
+  declaring `maxlength="1"`. All boxes must be empty and the number of boxes
+  must match the code length. Focusing any box in an empty group is supported.
 - **Excluded when known:** chat composers, multiline/contenteditable editors,
   password, email, phone, search, address-bar and unrelated labeled controls.
 - **Manual:** a browser exposes an ambiguous input or no usable field metadata.
@@ -57,7 +61,11 @@ On a click, metadata and focus are checked again. Native widgets offering
 for its web inputs in the tested build, so Blip sends individual key down/up
 pairs directly to Hyprland's socket, targeting the original window. No clipboard,
 DevTools connection, virtual keyboard daemon, code in process arguments, or
-Enter key is involved. A focus/window change aborts insertion.
+Enter key is involved. Before filling separate boxes, the adapter captures their
+exact accessibility objects inside one bounded group. It types only when the
+expected next box has focus, allowing a short wait for the site's auto-advance.
+It never follows focus into an unrelated field. A window change, session lock,
+unexpected focus, occupied box or expired deadline stops further insertion.
 
 ## Browser coverage and activation
 
@@ -95,12 +103,14 @@ exposes equally complete metadata.
 ## Current limits
 
 Labels are heuristic and currently English-oriented. Initial focus that predates
-the helper can require refocusing the field before smart mode appears. Separate
-one-character OTP boxes, cross-field auto-advance, custom canvas widgets and
-incomplete accessibility trees are not fully supported. Chromium field geometry on Wayland is converted from physical pixels to the
+the helper can require refocusing the field before smart mode appears. Digit
+groups require a compact horizontal row within a small common container; wrapped
+rows, unusual layouts, replaced accessibility objects, custom canvas widgets and
+incomplete accessibility trees may require further adapters. Partially filled
+groups must be cleared before offering a new fill. Chromium field geometry on Wayland is converted from physical pixels to the
 compositor's logical coordinates; other browser/toolkit coordinate conventions
 may need an adapter adjustment. Known fields that cannot
-hold the complete code are rejected. Unknown browsers can be added to the
+hold the complete code, either alone or as a recognized group, are rejected. Unknown browsers can be added to the
 application-identity adapter; accessible web documents are also recognized.
 
 No automatic submission is sent by Blip, but a site may itself submit when its

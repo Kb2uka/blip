@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import { classify, OtpState, validTarget, type DesktopTarget } from "./otp-policy";
 import { Frames } from "./otp-autofill";
 import { selectCodes, extractCode } from "./collector";
+import { join } from "node:path";
 const target = (field: any = {}): DesktopTarget => ({ id: "focus-1", window: "0xabc", pid: 100, browser: true, monitor: "DP-1",
   field: { tag: "input", type: "text", label: "Verification code", autocomplete: "", multiline: false,
     editable: true, empty: true, maxLength: 6, web: true, origin: "https://example.test", ...field } });
@@ -87,4 +88,29 @@ test("field geometry is bounded, follows the field, and invalidates an old click
   expect(s.state.accept(offer.id)).toBeNull();
   expect(validTarget({ ...first, anchor: { ...first.anchor, x: Infinity } })).toBe(false);
   expect(validTarget({ ...first, anchor: { ...first.anchor, w: -1 } })).toBe(false);
+});
+
+test("digit groups require a complete empty group matching the code length", () => {
+  const group = { ...target({ type: "tel", maxLength: 1, label: "Please enter OTP character 1" }),
+    segments: { count: 6, index: 0, empty: true } };
+  expect(validTarget(group)).toBe(true);
+  expect(classify(group)).toBe("smart");
+  const s = setup(); s.state.focus(group); s.state.publish(code());
+  expect(s.state.accept(s.out.at(-1).id)?.target.segments).toEqual(group.segments);
+  for (const segments of [{ count: 5, index: 0, empty: true }, { count: 6, index: 0, empty: false }]) {
+    const refused = setup(); refused.state.focus({ ...group, segments }); refused.state.publish(code());
+    expect(refused.out).toHaveLength(0);
+  }
+  for (const segments of [{ count: 13, index: 0, empty: true }, { count: 6, index: 6, empty: true }, { count: 6, index: 0, empty: "yes" }]) {
+    expect(validTarget({ ...group, segments })).toBe(false);
+  }
+  expect(classify({ ...group, segments: undefined })).toBeNull();
+  expect(classify({ ...group, field: { ...group.field!, label: "Phone number" } })).toBeNull();
+  expect(classify({ ...group, field: { ...group.field!, maxLength: -1 } })).toBe("smart");
+});
+
+test("native adapter follows only the prevalidated digit boxes", () => {
+  const result = Bun.spawnSync(["python3", "-I", join(import.meta.dir, "otp-desktop.test.py")]);
+  expect(result.stderr.toString()).toContain("OK");
+  expect(result.exitCode).toBe(0);
 });
