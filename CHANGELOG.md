@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Fill a security code beside the field.** `otp_autofill=on` offers incoming
+  codes through a Blip prompt using native Linux accessibility, including
+  separate digit boxes. The prompt shares Blip's fonts and colors, falls back
+  to the top right when field bounds are unavailable, and expires after five
+  minutes. No browser extension or clipboard is needed.
+
 ## 2.5.0 — 2026-09-13 — photos at once, and sends that stay put
 
 - **Sending a link no longer opens the share sheet** (#54, @jondkinney). A

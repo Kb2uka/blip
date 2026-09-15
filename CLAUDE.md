@@ -115,8 +115,10 @@ what it is handed. Keep it that way.
   no copy. `otp-policy.ts` owns lifetime, field policy and click tokens;
   `otp-desktop.py` reads native OS metadata and inserts on a click. Focus
   changes preserve the original deadline. `BlipAppearance.qml` is the shared
-  appearance policy for the main view and the field-attached prompt. With
-  autofill off, upstream's legacy path is unchanged:
+  appearance policy for the main view and the field-attached prompt. Digit
+  groups use prevalidated accessibility objects; auto-advance may move only
+  to the expected next box. With autofill off, the code toast and keyboard
+  shortcuts keep their existing behavior:
   **A security code lives five minutes in BarWidget memory, nowhere else.**
   `selectCodes()` (collector) spots it; `noteCode()` holds the newest and
   toasts THAT A CODE ARRIVED — never the digits. Omarchy's daemon persists

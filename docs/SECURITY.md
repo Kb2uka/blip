@@ -83,3 +83,22 @@ nonblocking descriptors with owner/type checks. Writes use a private staging
 file and descriptor-relative atomic rename. It holds contact summaries, never
 messages, and requires matching handle-set and live store fingerprints before
 reuse. It is a cache, not user configuration.
+
+## Security-code autofill
+
+`otp-policy.ts` owns the five-minute lifetime, field classification and one-use
+click tokens. `otp-autofill.ts` supervises `otp-desktop.py` over inherited pipes,
+bounded to 4096 bytes per frame. Only the leader widget starts it, and closing
+the owning pipe stops the child. No new Mac operation or public socket is added.
+
+On a click, the adapter rechecks the active window, accessibility application
+PID, field and session lock. Hyprland receives validated key names over its
+owner-checked socket; codes never enter argv or a shell. Separate digit boxes
+are captured before typing; each character requires focus on the expected box.
+An origin-bound code requires the exact HTTPS document hostname. Missing origin
+metadata refuses that code rather than falling back to an unverified origin.
+
+Field labels are hints supplied by applications, not an authentication boundary.
+Manual browser fallback cannot distinguish a code field from another editor:
+the user's click authorizes insertion into the field they selected. A website
+may submit its own form when the last digit arrives; Blip sends no Enter key.

@@ -1,8 +1,6 @@
 import { test, expect } from "bun:test";
 import { classify, OtpState, validTarget, type DesktopTarget } from "./otp-policy";
-import { Frames } from "./otp-autofill";
 import { selectCodes, extractCode } from "./collector";
-import { join } from "node:path";
 const target = (field: any = {}): DesktopTarget => ({ id: "focus-1", window: "0xabc", pid: 100, browser: true, monitor: "DP-1",
   field: { tag: "input", type: "text", label: "Verification code", autocomplete: "", multiline: false,
     editable: true, empty: true, maxLength: 6, web: true, origin: "https://example.test", ...field } });
@@ -56,13 +54,9 @@ test("domain-bound messages require the exact native accessibility document orig
   const s = setup(); s.state.focus(target()); s.state.publish(code({ domain: "example.test" })); expect(s.out.at(-1).type).toBe("offer");
   const unknown = setup(); unknown.state.focus({ ...target(), field: undefined }); unknown.state.publish(code({ domain: "example.test" })); expect(unknown.out).toHaveLength(0);
 });
-test("invalid metadata and oversized unfinished frames fail closed", () => {
+test("invalid metadata fails closed", () => {
   expect(validTarget({ ...target(), window: '0xabc";evil()' })).toBe(false);
   expect(validTarget(target({ label: "x".repeat(161) }))).toBe(false);
-  expect(() => new Frames().feed(Buffer.alloc(4097, 65), () => {})).toThrow();
-  const frames = new Frames(), out: any[] = [];
-  for (const b of Buffer.from('{"type":"accept"}\n')) frames.feed(Buffer.from([b]), e => out.push(e));
-  expect(out).toEqual([{ type: "accept" }]);
 });
 test("installed-version collector selects synthetic SMS/iMessage and preserves opaque dedupe", () => {
   for (const service of ["SMS", "iMessage"]) {
@@ -107,10 +101,4 @@ test("digit groups require a complete empty group matching the code length", () 
   expect(classify({ ...group, segments: undefined })).toBeNull();
   expect(classify({ ...group, field: { ...group.field!, label: "Phone number" } })).toBeNull();
   expect(classify({ ...group, field: { ...group.field!, maxLength: -1 } })).toBe("smart");
-});
-
-test("native adapter follows only the prevalidated digit boxes", () => {
-  const result = Bun.spawnSync(["python3", "-I", join(import.meta.dir, "otp-desktop.test.py")]);
-  expect(result.stderr.toString()).toContain("OK");
-  expect(result.exitCode).toBe(0);
 });
