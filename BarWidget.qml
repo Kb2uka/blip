@@ -269,6 +269,7 @@ BarWidget {
   }
   function runRefresh(req) {
     var args = ["bun", collectorPath]
+    if (root.otpAutofill) args.push("--otp-autofill")
     if (req.deep) args.push("--deep")
     if (req.markRead) args.push("--mark-read")
     if (req.readChat !== "") {
@@ -413,6 +414,7 @@ BarWidget {
             }
             root.unread = list.reduce(function(n, t) { return n + (Number(t.unread) || 0) }, 0)
             root.healthy = d.persisted !== false
+            if (Array.isArray(d.codes) && d.codes.length > 0) otp.receive(d.codes[d.codes.length - 1])
             if (Array.isArray(d.toast)) root.fireToasts(d.toast)
             // A link that just arrived opens the share sheet (Fred, 2.3.0).
             // Only onto a surface that is ALREADY open: Omarchy runs
@@ -625,6 +627,14 @@ BarWidget {
     function onExited(code, status) { toastWatchdog.stop(); Qt.callLater(root.drainToasts) }
   }
 
+  // Optional extension-free OTP assistance, owned by the leader widget.
+  property bool otpAutofill: false
+  OtpAutofill {
+    id: otp
+    enabled: root.leader && root.otpAutofill
+    appearance: root.appearance
+  }
+
   // ------------------------------------------------------------ IPC
   // IPC that sends or reads message content is a deputy for any local
   // process (Codex audit #3). It is opt-in: automation=on in bridge.conf.
@@ -643,6 +653,7 @@ BarWidget {
     onFileChanged: reload()
     onLoaded: {
       var t = text()
+      root.otpAutofill = /^\s*otp_autofill\s*=\s*on\s*$/mi.test(t)
       root.automationOn = /^\s*automation\s*=\s*['"]?(on|true|1|yes)\b/mi.test(t)
       // ui_font=theme keeps Omarchy's family even where SF Pro is installed.
       root.uiFontTheme = /^\s*ui_font\s*=\s*['"]?theme\b/mi.test(t)
@@ -650,7 +661,7 @@ BarWidget {
       var n = sm ? parseInt(sm[1], 10) : 0
       root.uiFontSize = (!isFinite(n) || n <= 0) ? 0 : Math.min(24, Math.max(9, n))
     }
-    onLoadFailed: { root.automationOn = false; root.uiFontTheme = false; root.uiFontSize = 0 }
+    onLoadFailed: { root.otpAutofill = false; root.automationOn = false; root.uiFontTheme = false; root.uiFontSize = 0 }
   }
   IpcHandler {
     target: root.moduleName
@@ -661,6 +672,7 @@ BarWidget {
         + " window=" + (w && w.visible ? (w.focused ? "focused" : "unfocused") : "hidden")
         + " threads=" + root.threads.length + " healthy=" + root.healthy
         + " push=" + root.watchAlive
+        + " autofill=" + (root.otpAutofill ? (otp.ready ? "ready" : "starting") : "off")
         + (root.lastError !== "" ? " error=" + root.lastError : "")
     }
     function threads(): string { return root.automationOn ? JSON.stringify(root.threads) : root.automationOff }
@@ -762,5 +774,7 @@ BarWidget {
   // (several Omarchy themes use red, which must stay reserved for alerts, and a
   // red dot on a messaging icon reads as an error). Fred, 2.3.3: "should ALWAYS
   // be BLUE no matter what."
-  readonly property color blipAccent: "#0a84ff"
+  property alias appearance: blipAppearance
+  BlipAppearance { id: blipAppearance; hostWidget: root; themeFont: button.fontFamily }
+  readonly property color blipAccent: blipAppearance.accent
 }

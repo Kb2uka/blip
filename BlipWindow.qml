@@ -23,7 +23,7 @@ FloatingWindow {
   title: "Blip" + (hostWidget && hostWidget.unread > 0 ? " (" + hostWidget.unread + ")" : "")
   // Same fill as Omarchy's other FloatingWindow (dev gallery). A 0.70
   // alpha assumed Hyprland blur, which Omarchy 4.x ships off.
-  color: Color.background
+  color: hostWidget && hostWidget.appearance ? hostWidget.appearance.background : Color.background
   implicitWidth: 1040
   implicitHeight: 720
   minimumSize: Qt.size(720, 480)
