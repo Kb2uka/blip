@@ -1,9 +1,11 @@
 # Extension-free OTP autofill
 
-This experimental local enhancement is bundled into Blip, based on the installed
-2.3.2 revision (`a0031784de1632ba14f9a3723f2d03429b4e02d4`). It backports upstream
-OTP extraction and adds a native Omarchy prompt. It does not require a separate
-plugin, a browser extension, or changes to the Mac bridge.
+This local enhancement is bundled into Blip and merged with upstream `main`
+at Blip 2.5.0 (`abde42dd1b00419598c2d1e8edc11be1cac53aba`). It consumes upstream's
+existing OTP events without changing the collector. It adds an OS field adapter
+and a native Omarchy prompt; no separate plugin or browser extension is required.
+When enabled, the new private helper owns the pending code. Upstream's legacy
+code toast/copy/type path remains available when this option is off.
 
 ## What it does
 
@@ -121,9 +123,9 @@ absolute Bun executable; the repository template uses `/usr/bin/bun` and a local
 installer must substitute the actual installed location. The Python executable
 is `/usr/bin/python3`, launched in isolated mode.
 
-Install the four changed files (`collector.ts`, `BarWidget.qml`, `BlipView.qml`,
-`BlipWindow.qml`) and the six new
-runtime files (`OtpAutofill.qml`, `OtpRuntime.qml`, `otp-autofill.ts`,
+Start from the complete Blip 2.5.0 tree (including its `.mjs` modules), then
+install the three changed QML files (`BarWidget.qml`, `BlipView.qml`,
+`BlipWindow.qml`) and the six new runtime files (`OtpAutofill.qml`, `OtpRuntime.qml`, `otp-autofill.ts`,
 `otp-policy.ts`, `otp-desktop.py`, `BlipAppearance.qml`) in the user-owned Blip plugin. Restart with
 `omarchy restart shell` after QML changes; Blip's existing IPC handler can otherwise
 remain attached to the old widget. `nixfred.blip status` reports

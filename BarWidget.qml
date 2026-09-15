@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import Quickshell.Hyprland
 
 // blip — iMessage in the bar.
 //
@@ -42,8 +43,21 @@ BarWidget {
   property int unread: 0
   property bool online: false        // the Mac is reachable
   property bool healthy: false       // last collector run parsed cleanly
+  // Which reads reach the Mac, straight from the collector (bridge.conf's
+  // push_read). "all" is the default and pushes ONLY on the mark-all gesture,
+  // so reading a conversation clears it here and leaves the phone's badge —
+  // by design, and indistinguishable from a broken push until status said so.
+  property string readPush: ""
   property string lastError: ""
   property string lastRun: ""
+  // Unsent compose text per chat id, shared by the panel and the app window.
+  // In memory only: message text never lands on disk.
+  property var draftCache: ({})
+  // Contact photo per handle (file:// url, "" = letters), shared by the panel
+  // and the app window. The window is REBUILT on every show, so a map kept in
+  // BlipView started empty on each SUPER+M and asked for every photo again.
+  // Cache paths only, never image bytes.
+  property var avatarCache: ({})
 
   readonly property bool hasUnread: unread > 0
 
@@ -74,16 +88,29 @@ BarWidget {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  // Omarchy's panel hotkeys (`omarchy-shell shell toggle nixfred.blip`,
+  // SUPER+CTRL+<n> by bar position) find a bar widget's panel through open(),
+  // close() AND this property — without it the shell logs "summon: no live
+  // bar widget" and does nothing. Same line as Omarchy's clock widget.
+  readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   function open() { if (panelLoader.item) panelLoader.item.open() }
   function close() { if (panelLoader.item) panelLoader.item.close() }
   function toggle() { if (panelLoader.item) panelLoader.item.toggle() }
+  /** Open a conversation by chat id. Returns false when the id is not one —
+   *  `goto ""` used to open a nameless thread with no header that nothing
+   *  could send to, and a script with an unset variable is how you get there.
+   *  The shape test is the one the toast's argv guard already uses; an id that
+   *  LOOKS like a handle but is unknown still opens, on purpose, so you can
+   *  start a conversation with a number you have never messaged. */
   function show(chat) {
-    if (!panelLoader.item) return
+    var raw = String(chat === undefined || chat === null ? "" : chat).trim()
+    if (raw === "" || !/^[A-Za-z0-9._@:;$-]{1,256}$/.test(raw)) return false
+    if (!panelLoader.item) return false
     panelLoader.item.open()
     // `qs ipc call` rejects a leading "+" as a flag, so accept the bare digits too.
     // Exact match FIRST, alias second: when both variants exist as threads,
     // the alias must never shadow the exact one (Codex HIGH, 1.2.0).
-    var want = String(chat)
+    var want = raw
     var t = null
     for (var i = 0; i < threads.length; i++) {
       if (String(threads[i].chat) === want) { t = threads[i]; break }
@@ -95,15 +122,18 @@ BarWidget {
     if (!t && /^[0-9]{10,}$/.test(want)) want = "+" + want
     // Unknown to the current window: still open it, with the id as the name.
     panelLoader.item.openThread(t || { chat: want, handle: want, name: want })
+    return true
   }
 
   /** Newest arriving link → the share sheet on whichever surface is open. */
   function shareArrivingLink(link) {
     if (!link || !link.url) return
+    // Every link of the message: the sheet steps through them.
+    var urls = Array.isArray(link.urls) && link.urls.length > 0 ? link.urls.map(String) : [String(link.url)]
     var w = windowLoader.item
-    if (w && root.windowVisible && typeof w.shareLink === "function") { w.shareLink(String(link.url)); return }
+    if (w && root.windowVisible && typeof w.shareLink === "function") { w.shareLink(urls); return }
     var p = panelLoader.item
-    if (p && p.opened === true && typeof p.shareLink === "function") p.shareLink(String(link.url))
+    if (p && p.opened === true && typeof p.shareLink === "function") p.shareLink(urls)
   }
 
   function injectPanel() {
@@ -156,16 +186,26 @@ BarWidget {
     }
     // A fresh BlipWindow honours window.json (which may say hidden) — this
     // call means SHOW, so make it so once its restore pass has run.
-    Qt.callLater(function() { if (windowLoader.item && !windowLoader.item.visible) windowLoader.item.visible = true })
+    Qt.callLater(function() { if (windowLoader.item) windowLoader.item.requestShow() })
   }
+  /** Toggle the app window. Returns what it just DID, not what windowVisible
+   *  says: ensureWindow() defers the actual `visible = true` to a callLater
+   *  (a fresh BlipWindow has to run its restore pass first), so reading the
+   *  property straight after showing still says hidden — IPC `window` reported
+   *  "window hidden" on both paths and could never say it had shown one. */
   function toggleWindow() {
-    if (root.windowVisible) hideWindow()
-    else ensureWindow()
+    if (root.windowVisible) { hideWindow(); return false }
+    ensureWindow()
+    return true
   }
   // Show AND focus: a window restored on another workspace is invisible to
   // the user, and a plain toggle would HIDE it ("SUPER+M doesn't load the
   // app"). Hyprland ≥0.56 dispatch takes Lua; classic focuswindow is rejected.
   function showApp() {
+    // The popout gets out of the way first: the window is the same view,
+    // larger. Here, once, so double-click, the ⇱ button and IPC `app` (a
+    // SUPER+M bind) all agree — `app` used to leave the popout open.
+    root.close()
     ensureWindow()
     if (!windowLoader.item) return
     // Fire-and-forget on purpose: a Process object silently ignores
@@ -194,7 +234,6 @@ BarWidget {
     }
     if (dblClick.running) {
       dblClick.stop()
-      root.close()
       root.showApp()
       return
     }
@@ -269,7 +308,6 @@ BarWidget {
   }
   function runRefresh(req) {
     var args = ["bun", collectorPath]
-    if (root.otpAutofill) args.push("--otp-autofill")
     if (req.deep) args.push("--deep")
     if (req.markRead) args.push("--mark-read")
     if (req.readChat !== "") {
@@ -318,12 +356,15 @@ BarWidget {
     return out
   }
 
-  function markThreadRead(chat) {
+  /** `seen` = the newest ts the surface actually rendered. Without it the
+   *  mark went through the sidebar's last_ts, which can be a message that
+   *  arrived after the snapshot the user is looking at (Astra A#3). */
+  function markThreadRead(chat, seen) {
     var c = String(chat)
-    var lastTs = ""
+    var lastTs = seen ? String(seen) : ""
     var list = threads.map(function(t) {
       if (String(t.chat) !== c) return t
-      lastTs = String(t.last_ts || "")
+      if (lastTs === "") lastTs = String(t.last_ts || "")
       return t.unread > 0 ? Object.assign({}, t, { unread: 0 }) : t
     })
     noteLocalRead(c, lastTs)
@@ -355,18 +396,21 @@ BarWidget {
     var p = panelLoader.item
     if (p && p.opened === true && p.inThread === true) return p
     var w = windowLoader.item
-    // the window must be FOCUSED to count as being read (war room #25)
-    if (w && w.visible === true && w.focused === true && w.inThread === true) return w
+    // the window must be FOCUSED to count as being read (war room #25), and
+    // a thread merely peeked from the sidebar cursor is not being read either
+    if (w && w.visible === true && w.focused === true && w.inThread === true && w.peeking !== true) return w
     return null
   }
   function activeReadChat() {
     var s = readingSurface()
-    // a still-LOADING conversation is not yet read (Codex #4)
-    return (s && s.loading !== true) ? String(s.active.chat) : ""
+    // a still-LOADING conversation is not yet read (Codex #4), and neither is
+    // one whose load FAILED — nothing was seen (Astra A#2)
+    return (s && s.loading !== true && s.rendered === true) ? String(s.active.chat) : ""
   }
   function activeSeenTs() {
     var s = readingSurface()
-    return s ? String(s.activeLastTs || "") : ""
+    // the newest ts that RENDERED, not the sidebar's (Astra A#3)
+    return s ? String(s.seenTs || "") : ""
   }
 
   Process {
@@ -394,6 +438,7 @@ BarWidget {
           root.online = d.online === true
           root.lastError = String(d.error || "")
           root.lastRun = String(d.ts || "")
+          if (typeof d.readPush === "string") root.readPush = d.readPush
           if (d.ok === true) {
             // Filter through the optimistic-read ledger: a poll that was
             // already in flight when the user opened a thread must not
@@ -414,14 +459,20 @@ BarWidget {
             }
             root.unread = list.reduce(function(n, t) { return n + (Number(t.unread) || 0) }, 0)
             root.healthy = d.persisted !== false
-            if (Array.isArray(d.codes) && d.codes.length > 0) otp.receive(d.codes[d.codes.length - 1])
-            if (Array.isArray(d.toast)) root.fireToasts(d.toast)
+            // A message that carries a security code gets the code toast only:
+            // its ordinary preview would put the digits into the daemon's
+            // on-disk history like any other body (Astra #1).
+            var codeKeys = {}
+            if (Array.isArray(d.codes)) d.codes.forEach(function(c) { codeKeys[String(c.chat) + "\u0000" + String(c.ts)] = true })
+            if (Array.isArray(d.toast)) root.fireToasts(d.toast.filter(function(t) { return !codeKeys[String(t.chat) + "\u0000" + String(t.ts)] }))
             // A link that just arrived opens the share sheet (Fred, 2.3.0).
             // Only onto a surface that is ALREADY open: Omarchy runs
             // focus_on_activate=false and Blip never steals focus, so a bank
             // alert must not throw a panel over full-screen work. When Blip is
             // closed the desktop toast is still the notification.
             if (Array.isArray(d.links) && d.links.length > 0) root.shareArrivingLink(d.links[d.links.length - 1])
+            // A security code that just arrived: hold the newest, toast it.
+            if (Array.isArray(d.codes) && d.codes.length > 0) root.noteCode(d.codes[d.codes.length - 1])
             // A send of YOURS that died — not allowlist-gated, interrupts once.
             if (Array.isArray(d.failures) && d.failures.length > 0)
               root.fireToasts(d.failures.map(function(f) {
@@ -551,11 +602,14 @@ BarWidget {
     stdout: StdioCollector {
       onStreamFinished: {
         var action = text.trim()
+        if (action === "default" && notifyProc.toastCode !== "") { root.copyCode(notifyProc.toastCode); return }
         if ((action === "default" || action === "reply") && notifyProc.toastChat !== "")
           root.show(notifyProc.toastChat)
       }
     }
     property string toastChat: ""
+    property string toastCode: ""    // set for a code toast: click = copy, not open
+    property double toastCodeAt: 0   // when that code was toasted — expiry applies here too (Astra A#9)
   }
   property var toastQueue: []
 
@@ -572,11 +626,17 @@ BarWidget {
   function drainToasts() {
     if (notifyProc.running || toastQueue.length === 0) return
     var q = toastQueue.slice()
+    // A code toast that waited out its five minutes in the queue is stale: the
+    // code it would offer has expired (Astra A#9).
+    while (q.length > 0 && q[0].code && Date.now() - Number(q[0].at || 0) > 300000) q.shift()
+    if (q.length === 0) { toastQueue = q; return }
     var t = q.shift()
     toastQueue = q
     var body = String(t.text || "")
     if (body.length > 220) body = body.substring(0, 217) + "…"
     notifyProc.toastChat = String(t.chat || "")
+    notifyProc.toastCode = String(t.code || "")
+    notifyProc.toastCodeAt = Number(t.at || 0)
     // Where this toast came from, in a form that outlives it.
     //
     // --action=default lives inside this notify-send process and dies with it
@@ -590,7 +650,12 @@ BarWidget {
     // read it as a flag (show() matches the bare digits as an alias).
     var reopen = []
     var chatArg = notifyProc.toastChat.replace(/^\+/, "")
-    if (chatArg !== "" && /^[A-Za-z0-9._@:;$-]{1,256}$/.test(chatArg))
+    if (notifyProc.toastCode !== "")
+      // popup only: the daemon must not write the code into its on-disk
+      // history (~/.local/state/omarchy/notifications/history). It expires
+      // from memory in five minutes; there is nothing to restore.
+      reopen = ["--hint=boolean:transient:true"]
+    else if (chatArg !== "" && /^[A-Za-z0-9._@:;$-]{1,256}$/.test(chatArg))
       reopen = ["--hint=string:omarchy-exec-argv:" + JSON.stringify(
         ["qs", "-p", "/usr/share/omarchy/shell", "ipc", "call",
          root.moduleName, "goto", chatArg])]
@@ -605,7 +670,7 @@ BarWidget {
       // renders no action BUTTONS and only ever invokes default — an
       // advertised Reply button would be a lie (Codex, read the daemon).
       "--wait",
-      "--action=default=Open",
+      notifyProc.toastCode !== "" ? "--action=default=Copy" : "--action=default=Open",
     ].concat(reopen).concat([
       "--",                                   // a name or text starting with "-" is data, not a flag
       String(t.name || t.chat || "iMessage"),
@@ -627,12 +692,117 @@ BarWidget {
     function onExited(code, status) { toastWatchdog.stop(); Qt.callLater(root.drainToasts) }
   }
 
-  // Optional extension-free OTP assistance, owned by the leader widget.
+  // Extension-free prompts use Blip's existing code event stream. When on,
+  // only the private autofill helper owns a pending code; the legacy toast,
+  // clipboard and typecode paths do not receive it.
   property bool otpAutofill: false
-  OtpAutofill {
-    id: otp
-    enabled: root.leader && root.otpAutofill
-    appearance: root.appearance
+  OtpAutofill { id: otp; enabled: root.leader && root.otpAutofill; appearance: root.appearance }
+  onOtpAutofillChanged: if (otpAutofill) {
+    root.pendingCode = null
+    codeExpiry.stop()
+    root.toastQueue = root.toastQueue.filter(function(t) { return !t.code })
+    notifyProc.toastCode = ""
+  }
+
+  // ------------------------------------------------------ security codes
+  // macOS reads a 2FA code out of an SMS and offers it to the browser. Blip's
+  // version: the collector spots the code, the widget holds it IN MEMORY for
+  // five minutes (never state.json — it is message text), toasts it, and on
+  // request copies it (click the toast, or `copycode`) or types it into
+  // whatever has keyboard focus (`typecode`, bound to a hotkey). The code
+  // reaches wl-copy through an environment variable and stdin, and the
+  // focused window as key events over Hyprland's socket — never argv, where
+  // any process could read it from /proc.
+  //
+  // NOT wtype. A virtual keyboard's key presses are merged with the physical
+  // keyboard's modifier state, so the digits typed while the user's fingers
+  // are still on Super+Shift became Super+Shift+<digit> — workspace binds.
+  // `send_key_state` (what Omarchy's universal paste uses) hands the key
+  // straight to the focused window without consulting binds.
+  property var pendingCode: null         // {code, name, domain, ts} or null
+  Timer {
+    id: codeExpiry
+    interval: 300000
+    onTriggered: root.pendingCode = null
+  }
+  function noteCode(c) {
+    if (root.otpAutofill) { otp.receive(c); return }
+    if (!c || !c.code) return
+    pendingCode = { code: String(c.code), name: String(c.name || c.chat || ""), domain: String(c.domain || ""), ts: String(c.ts || "") }
+    codeExpiry.restart()
+    var who = pendingCode.name !== "" ? pendingCode.name : "a message"
+    // The digits are NOT in the body. Omarchy's daemon persists every displayed
+    // toast's body to ~/.local/state/omarchy/notifications/history — its own
+    // Service.qml says the transient hint only decides whether a DND-silenced
+    // one is recorded — so a body with the code put the code on disk (Astra
+    // #1). The toast says a code arrived; click copies it from memory.
+    var body = (pendingCode.domain !== "" ? "For " + pendingCode.domain + " · " : "")
+             + "Click to copy"
+    fireToasts([{ chat: "", name: "Security code from " + who, text: body, ts: pendingCode.ts, key: "", code: pendingCode.code, at: Date.now() }])
+  }
+  // The code goes straight to wl-copy on stdin. An environment variable
+  // outlived the copy: wl-copy stays resident to serve the selection, so the
+  // code sat readable in /proc/<wl-copy>/environ for as long as the clipboard
+  // held it -- past the five minutes copyCode() enforces, and past the toast
+  // that offered it. stdin is read once and closed.
+  property string copyValue: ""          // what the NEXT copy hands to wl-copy
+  Process {
+    id: codeCopyProc
+    command: ["wl-copy"]
+    onStarted: {
+      write(root.copyValue)
+      stdinEnabled = false
+    }
+    onExited: root.copyValue = ""
+  }
+  /** Copy a code. A toast passes the code it DISPLAYED, so clicking an older
+   *  toast after a newer code arrived copies what was on the card, not the
+   *  newer one (Astra #14). IPC `copycode` passes nothing: the newest. */
+  function copyCode(code) {
+    if (!pendingCode) return "no code pending"
+    // An older toast's code is copied only within ITS five minutes (Astra A#9).
+    if (code && String(code) !== pendingCode.code && Date.now() - notifyProc.toastCodeAt > 300000) return "code expired"
+    copyValue = String(code || pendingCode.code)
+    codeCopyProc.stdinEnabled = true
+    codeCopyProc.running = true
+    return "copied"
+  }
+  // One key event per tick: down, then up, 20 ms apart (Omarchy's paste
+  // helper uses 50 between the two). A single dispatch per event keeps the
+  // socket write small and the order guaranteed.
+  property var keyQueue: []
+  Timer {
+    id: keyPump
+    interval: 20
+    repeat: true
+    onTriggered: {
+      if (root.keyQueue.length === 0) { stop(); return }
+      var q = root.keyQueue.slice()
+      var k = q.shift()
+      root.keyQueue = q
+      Hyprland.dispatch('hl.dsp.send_key_state({ mods = "' + k.mods + '", key = "' + k.key + '", state = "' + k.state + '" })')
+    }
+  }
+  /** xkb key name + modifiers for one character of a code, or null. */
+  function keyFor(ch) {
+    if (/^[0-9a-z]$/.test(ch)) return { key: ch, mods: "" }
+    if (/^[A-Z]$/.test(ch)) return { key: ch.toLowerCase(), mods: "SHIFT" }
+    if (ch === "-") return { key: "minus", mods: "" }
+    return null
+  }
+  function typeCode() {
+    if (!pendingCode) return "no code pending"
+    var q = []
+    var code = String(pendingCode.code)
+    for (var i = 0; i < code.length; i++) {
+      var k = keyFor(code.charAt(i))
+      if (!k) continue
+      q.push({ key: k.key, mods: k.mods, state: "down" })
+      q.push({ key: k.key, mods: k.mods, state: "up" })
+    }
+    keyQueue = q
+    keyPump.start()
+    return "typed"
   }
 
   // ------------------------------------------------------------ IPC
@@ -644,6 +814,22 @@ BarWidget {
   property bool uiFontTheme: false
   /** `ui_font_size=N` in bridge.conf: bubble text in px (9–24). 0 = Omarchy default. */
   property int uiFontSize: 0
+  // The version, read from THIS plugin's manifest.json — the one place it is
+  // written, so a release bump is the only thing that ever updates what the
+  // header shows (Fred, 2.3.3: "keep it there forever updated"). Both surfaces
+  // take it from here through BlipView, so they can never disagree.
+  property string version: ""
+  FileView {
+    id: manifestFile
+    path: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try { root.version = String(JSON.parse(text()).version || "") } catch (e) { root.version = "" }
+    }
+    onLoadFailed: root.version = ""
+  }
   readonly property string automationOff: "blip: automation=off — set automation=on in ~/.config/blip/bridge.conf to allow ipc send/read"
   FileView {
     id: bridgeConf
@@ -671,7 +857,8 @@ BarWidget {
       return "online=" + root.online + " unread=" + root.unread + " leader=" + root.leader
         + " window=" + (w && w.visible ? (w.focused ? "focused" : "unfocused") : "hidden")
         + " threads=" + root.threads.length + " healthy=" + root.healthy
-        + " push=" + root.watchAlive
+        + " watch=" + root.watchAlive
+        + " read_push=" + (root.readPush !== "" ? root.readPush : "?")
         + " autofill=" + (root.otpAutofill ? (otp.ready ? "ready" : "starting") : "off")
         + (root.lastError !== "" ? " error=" + root.lastError : "")
     }
@@ -681,13 +868,15 @@ BarWidget {
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function goto(chat: string): string { if (!root.automationOn) return root.automationOff; root.show(chat); return "shown" }
+    function goto(chat: string): string { if (!root.automationOn) return root.automationOff; return root.show(chat) ? "shown" : "not a conversation id" }
+    function copycode(): string { if (!root.automationOn) return root.automationOff; return root.copyCode() }
+    function typecode(): string { if (!root.automationOn) return root.automationOff; return root.typeCode() }
     function share(url: string): string { if (!root.automationOn) return root.automationOff; root.open(); return panelLoader.item ? panelLoader.item.shareLink(url) : "no panel" }
     function compose(text: string): string { if (!root.automationOn) return root.automationOff; return panelLoader.item ? panelLoader.item.composeAndSend(text) : "no panel" }
     function bubbles(): string { if (!root.automationOn) return root.automationOff; return panelLoader.item ? panelLoader.item.bubbleModel() : "[]" }
     function find(query: string): string { if (!root.automationOn) return root.automationOff; return panelLoader.item ? panelLoader.item.searchFor(query) : "no panel" }
     function newchat(query: string): string { if (!root.automationOn) return root.automationOff; return panelLoader.item ? panelLoader.item.newChatFor(query) : "no panel" }
-    function window(): string { root.toggleWindow(); return root.windowVisible ? "window shown" : "window hidden" }
+    function window(): string { return root.toggleWindow() ? "window shown" : "window hidden" }
     function app(): string { root.showApp(); return "app shown + focused" }
     function windowgoto(chat: string): string {
       if (!root.automationOn) return root.automationOff
@@ -733,6 +922,15 @@ BarWidget {
     useActiveColor: false
     tooltipText: root.tooltip()
     onPressed: function(code) {
+      if (!root.leader && code !== Qt.LeftButton) {
+        // A follower bar (second monitor): only the leader owns the collector.
+        // A refresh or mark-all started HERE was a second collector racing the
+        // leader's over state.json (Astra #10). Ask the leader, like leftClick.
+        // `read` is automation-gated, so with automation=off this is a no-op.
+        Quickshell.execDetached(["qs", "-p", "/usr/share/omarchy/shell", "ipc", "call",
+                                 root.moduleName, code === Qt.RightButton ? "read" : "refresh"])
+        return
+      }
       if (code === Qt.MiddleButton) root.refresh(root.anySurfaceOpen(), false)
       else if (code === Qt.RightButton) root.markAllRead()
       else root.leftClick()

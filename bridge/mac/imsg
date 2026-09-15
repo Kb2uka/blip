@@ -31,7 +31,9 @@ import plistlib
 import re
 import sqlite3
 import struct
+import subprocess
 import sys
+import unicodedata
 from glob import glob
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -46,6 +48,7 @@ PINNING_PLIST_PATHS = (
     ),
 )
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC
+CONTACT_HELPER = os.path.expanduser("~/.blip/bin/contact-delete")
 
 # ---------- Contacts name resolution (built-in, no external deps) ----------
 
@@ -219,6 +222,51 @@ def _same_number(handle: Phone, card: Phone) -> bool:
     return False
 
 
+def _card_name(first, last, org, nick) -> str:
+    """The name a ZABCDRECORD row shows: first + last, else organisation, else nickname."""
+    return " ".join(filter(None, [first, last])).strip() or org or nick or ""
+
+
+def _name_key(name: str) -> str:
+    """Spelling-insensitive identity of a name WITHIN one source. Two cards in
+    one book sharing a number are two people when their names differ, but
+    "Mom ❤️" and "Mom❤️" — a space, a capital, a compatibility form — are
+    one card saved twice. Treating those as strangers left the most talked-to
+    person in the list as a bare number, with no photo."""
+    return "".join(unicodedata.normalize("NFKC", name or "").casefold().split())
+
+
+def _one_person(con: sqlite3.Connection, pks: set) -> list[int]:
+    """The records in `pks`, oldest first, when they are one person under
+    _name_key; [] when they are two (or nameless). Photos follow the rule
+    names follow: the first of the duplicates carrying a picture wins."""
+    if not pks:
+        return []
+    if len(pks) == 1:
+        return list(pks)
+    marks = ",".join("?" * len(pks))
+    rows = con.execute(
+        f"SELECT Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION, ZNICKNAME "
+        f"FROM ZABCDRECORD WHERE Z_PK IN ({marks})", sorted(pks)
+    ).fetchall()
+    keys = {_name_key(_card_name(*r[1:])) for r in rows}
+    return sorted(pks) if len(rows) == len(pks) and len(keys) == 1 and "" not in keys else []
+
+
+def _vote(local: dict, key, name: str) -> None:
+    """One source's answer for a key: the single name it gives, or None once two
+    names have collided — and None STAYS None. The old one-liner let a third
+    card with the same number resurrect a name after two had cancelled out
+    (Alice, Bob → ambiguous; Carol → "Carol") (Astra #2). The same name spelled
+    twice (_name_key) is not a collision; the first spelling stays."""
+    if key in local:
+        if local[key] is not None and _name_key(local[key]) != _name_key(name):
+            local[key] = None
+    else:
+        local[key] = name
+
+
+_EXACT_SEEN: set = set()                             # every exact key ANY source carried, ambiguous or not
 _NAME_INDEX: dict[str, str] | None = None            # exact keys: last-ten digits, lowercased email
 _PHONE_INDEX: dict[Phone, str] | None = None          # every saved number, parsed, for the region-aware fallback
 
@@ -254,6 +302,9 @@ def _dm_name(handle: str | None, chat_identifier: str | None) -> str | None:
     return name_for(chat_identifier) if _is_dm_id(chat_identifier) else None
 
 
+_SHORT_NAMES: dict[str, set[str]] = {}
+
+
 def name_for(handle: str | None) -> str | None:
     """Resolve a Messages handle (phone or email) to a Contacts display name.
     Lazily builds an in-memory index from all AddressBook source DBs on first
@@ -278,14 +329,17 @@ def name_for(handle: str | None) -> str | None:
             try:
                 con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
                 con.row_factory = sqlite3.Row
-                names = {
-                    r["pk"]: " ".join(filter(None, [r["first"], r["last"]])).strip()
-                    or r["org"] or r["nick"] or ""
-                    for r in con.execute(
-                        "SELECT Z_PK AS pk, ZFIRSTNAME AS first, ZLASTNAME AS last, "
-                        "ZORGANIZATION AS org, ZNICKNAME AS nick FROM ZABCDRECORD"
-                    )
-                }
+                cards = con.execute(
+                    "SELECT Z_PK AS pk, ZFIRSTNAME AS first, ZLASTNAME AS last, "
+                    "ZORGANIZATION AS org, ZNICKNAME AS nick FROM ZABCDRECORD"
+                ).fetchall()
+                names = {}
+                for card in cards:
+                    full = _card_name(card["first"], card["last"], card["org"], card["nick"])
+                    names[card["pk"]] = full
+                    short = card["first"] or card["nick"] or full
+                    if full and short:
+                        _SHORT_NAMES.setdefault(full, set()).add(short)
                 local: dict[str | Phone, str | None] = {}   # None = ambiguous within this source
                 for r in con.execute(
                     "SELECT ZOWNER AS pk, ZFULLNUMBER AS num FROM ZABCDPHONENUMBER"
@@ -293,19 +347,20 @@ def name_for(handle: str | None) -> str | None:
                     name = names.get(r["pk"])
                     key = _normalize_phone(r["num"] or "")
                     if name and key:
-                        local[key] = None if (key in local and local[key] not in (None, name)) else (local.get(key) or name)
+                        _vote(local, key, name)
                     parsed = _parse_phone(r["num"] or "")
                     if name and parsed:
-                        local[parsed] = None if (parsed in local and local[parsed] not in (None, name)) else (local.get(parsed) or name)
+                        _vote(local, parsed, name)
                 for r in con.execute(
                     "SELECT ZOWNER AS pk, ZADDRESS AS addr FROM ZABCDEMAILADDRESS"
                 ):
                     name = names.get(r["pk"])
                     addr = (r["addr"] or "").strip().lower()
                     if name and addr:
-                        local[addr] = None if (addr in local and local[addr] not in (None, name)) else (local.get(addr) or name)
+                        _vote(local, addr, name)
                 con.close()
                 for key, name in local.items():
+                    _EXACT_SEEN.add(key)
                     if name:
                         slot = votes.setdefault(key, {})
                         if name in slot:
@@ -324,10 +379,54 @@ def name_for(handle: str | None) -> str | None:
     hit = _NAME_INDEX.get(_normalize_phone(handle))
     if hit:
         return hit
+    # An exact card EXISTS but was ambiguous: that is the answer — never let a
+    # suffix match name a stranger over it (Astra C#2).
+    if _normalize_phone(handle) in _EXACT_SEEN:
+        return None
     # No exact key: a unique region-aware match names it; two different names do not.
     parsed = _parse_phone(handle)
     near = {n for card, n in _PHONE_INDEX.items() if parsed and _same_number(parsed, card)}
     return near.pop() if len(near) == 1 else None
+
+
+def short_name_for(handle: str) -> str | None:
+    """Prefer the structured given name; never split a full name on spaces."""
+    full = name_for(handle)
+    choices = _SHORT_NAMES.get(full, set())
+    return next(iter(choices)) if len(choices) == 1 else full
+
+
+def unified_names(handles: list[str]) -> dict[str, dict[str, str]]:
+    """Resolve a bounded set through the same unified-card view Messages uses."""
+    bounded = []
+    seen = set()
+    for value in handles[:128]:
+        if (isinstance(value, str) and 1 <= len(value) <= 320
+                and not re.search(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]", value)
+                and value not in seen):
+            seen.add(value)
+            bounded.append(value)
+    if not bounded or not os.path.isfile(CONTACT_HELPER):
+        return {}
+    try:
+        result = subprocess.run(
+            [CONTACT_HELPER], input=json.dumps({"operation": "names", "handles": bounded}),
+            text=True, capture_output=True, timeout=10, check=False,
+        )
+        payload = json.loads(result.stdout) if result.returncode == 0 else {}
+        rows = payload.get("names") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return {}
+        return {
+            row["handle"]: {
+                "name": str(row.get("name") or "")[:160],
+                "short": str(row.get("shortName") or row.get("name") or "")[:160],
+            }
+            for row in rows
+            if isinstance(row, dict) and row.get("handle") in seen and row.get("name")
+        }
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return {}
 
 
 def label(handle: str | None, is_from_me: int, with_names: bool) -> str:
@@ -376,9 +475,13 @@ def decode_attributed_body(blob: bytes | None) -> str | None:
         return None
     first = blob[p]
     if first == 0x81:
+        if p + 3 > len(blob):
+            return None
         length = struct.unpack_from("<H", blob, p + 1)[0]
         p += 3
     elif first == 0x82:
+        if p + 5 > len(blob):
+            return None
         length = struct.unpack_from("<I", blob, p + 1)[0]
         p += 5
     else:
@@ -396,7 +499,15 @@ def fmt_ts(apple_ns: int | None) -> str:
 
 
 def message_text(row: sqlite3.Row) -> str:
-    return _app_card_text(row) or row["text"] or decode_attributed_body(row["attributedBody"]) or ""
+    # One malformed blob is ONE row's text, never a dead JSON response for
+    # every message in the window (Astra C#7).
+    try:
+        return _app_card_text(row) or row["text"] or decode_attributed_body(row["attributedBody"]) or ""
+    except Exception:
+        try:
+            return row["text"] or ""
+        except Exception:
+            return ""
 
 
 def _unarchive(blob) -> dict | None:
@@ -408,22 +519,45 @@ def _unarchive(blob) -> dict | None:
         return None
 
 
-def _deref(objs: list, v, depth: int = 0):
+_DEREF_BUDGET = 20000
+
+
+def _deref(objs: list, v, depth: int = 0, _path=None, _budget=None):
     """Follow archive references: UIDs into the object table, NSURL to its
-    string, NSDictionary to a plain dict. Anything deeper than six hops is
-    a cycle or an object we do not model — None."""
-    if depth > 6:
+    string, NSDictionary to a plain dict. Anything deeper than six hops, any
+    UID already on the current path (a cycle), or more than _DEREF_BUDGET
+    steps in total — None. The payload comes from the SENDER: a 1000x1000
+    self-referencing dictionary cost a billion iterations under a depth
+    limit alone (Astra C#5)."""
+    if _path is None:
+        _path = set()
+    if _budget is None:
+        _budget = [_DEREF_BUDGET]
+    _budget[0] -= 1
+    if _budget[0] < 0 or depth > 6:
         return None
     if isinstance(v, plistlib.UID):
-        if v.data == 0:   # $null
+        if v.data == 0 or v.data >= len(objs) or v.data in _path:   # $null, out of range, cycle
             return None
-        return _deref(objs, objs[v.data], depth + 1) if v.data < len(objs) else None
+        _path.add(v.data)
+        try:
+            return _deref(objs, objs[v.data], depth + 1, _path, _budget)
+        finally:
+            _path.discard(v.data)
     if isinstance(v, dict) and "NS.relative" in v:   # NSURL
-        return _deref(objs, v["NS.relative"], depth + 1)
+        return _deref(objs, v["NS.relative"], depth + 1, _path, _budget)
     if isinstance(v, dict) and "NS.keys" in v and "NS.objects" in v:   # NSDictionary
-        pairs = ((_deref(objs, k, depth + 1), _deref(objs, o, depth + 1))
-                 for k, o in zip(v["NS.keys"], v["NS.objects"]))
-        return {k: o for k, o in pairs if isinstance(k, str)}
+        keys, vals = v["NS.keys"], v["NS.objects"]
+        if not isinstance(keys, list) or not isinstance(vals, list):   # a hostile shape (Astra C#7)
+            return None
+        out = {}
+        for k, o in zip(keys, vals):
+            dk = _deref(objs, k, depth + 1, _path, _budget)
+            if isinstance(dk, str):
+                out[dk] = _deref(objs, o, depth + 1, _path, _budget)
+            if _budget[0] < 0:
+                return None
+        return out
     return v
 
 
@@ -524,22 +658,31 @@ def _same_chat_id(left: str, right: str) -> bool:
     # Some preference/database versions omit the plus on phone identifiers.
     if re.fullmatch(r"\+?[0-9]{5,}", left) and re.fullmatch(r"\+?[0-9]{5,}", right):
         return left.lstrip("+") == right.lstrip("+")
+    # Pins store a dashed UUID; chat_identifier for newer groups is 32 hex.
+    left_hex = left.replace("-", "")
+    right_hex = right.replace("-", "")
+    if re.fullmatch(r"[0-9a-f]{32}", left_hex) and re.fullmatch(r"[0-9a-f]{32}", right_hex):
+        return left_hex == right_hex
     return False
 
 
-def pin_order_for(pins: list[set[str]], chat_identifier: str, guid: str | None,
-                  group_id: str | None = None, original_group_id: str | None = None) -> int | None:
-    """Return the Messages pin position for one chat, or None.
+def pin_order_for(pins: list[set[str]], *candidates: str | None) -> int | None:
+    """Return the Messages pin position for one conversation, or None.
 
     DMs are pinned by handle (chat_identifier / guid). GROUPS are pinned by
     the chat row's `group_id` (or `original_group_id`) — dashed UUIDs that
     never equal the chat_identifier (chat<digits>) or the guid
     (any;+;chat<digits>), so a pinned group was invisible without them.
+
+    Pass every identifier in the conversation cluster, not just the live
+    row: a re-keyed group's pin stays on a retired row's group_id, and a
+    merged DM (phone + email, same group_id) is pinned by whichever handle
+    was tapped.
     """
-    candidates = [c for c in (chat_identifier, guid, group_id, original_group_id) if c]
-    for index, ids in enumerate(pins):
-        for pin_id in ids:
-            if any(_same_chat_id(pin_id, c) for c in candidates):
+    ids = [c for c in candidates if c]
+    for index, pin_ids in enumerate(pins):
+        for pin_id in pin_ids:
+            if any(_same_chat_id(pin_id, c) for c in ids):
                 return index
     return None
 
@@ -791,6 +934,10 @@ def render(rows, as_json: bool, with_names: bool = True, con=None, rich: bool = 
                 # via Messages in iCloud, so a client can mirror the phone's
                 # badge. Own messages are trivially "read".
                 "read": bool(r["is_from_me"]) or bool(r["is_read"]),
+                # edited / retracted ride the plain rows as well: the collector
+                # polls without --rich, and its self-thread unsend handling
+                # (dedupeSelfEcho) never saw the flag (Astra #16).
+                **_edit_flags(r["date_edited"], r["date_retracted"], r["message_summary_info"]),
                 # Tapback rows are messages too, but no Apple client counts
                 # them toward a badge — flag them so clients can match.
                 "tapback": bool(r["assoc_type"] and 2000 <= r["assoc_type"] < 4000),
@@ -826,6 +973,47 @@ def render(rows, as_json: bool, with_names: bool = True, con=None, rich: bool = 
 #   count as unread forever. Group names are still recovered from rename rows;
 #   cmd_groups reads the raw table for that.
 HIDE_DELETED = os.environ.get("IMSG_INCLUDE_DELETED") != "1"
+
+# chat.is_filtered (macOS / iOS Messages): 0 inbox, 1 Filter Unknown Senders,
+# 2 Spam. The iPhone badge ignores 1 and 2; Blip used to count them. Opt-in
+# via --hide-spam / --hide-unknown (the Linux shim sets these from bridge.conf).
+_CHAT_COLS: set[str] | None = None
+
+
+def _chat_has_col(con, name: str) -> bool:
+    global _CHAT_COLS
+    if _CHAT_COLS is None:
+        _CHAT_COLS = {r[1] for r in con.execute("PRAGMA table_info(chat)")}
+    return name in _CHAT_COLS
+
+
+def filtered_chat_predicate(hide_spam: bool, hide_unknown: bool, has_is_filtered: bool) -> str:
+    """Boolean SQL over alias `c` (chat). Empty when there is nothing to hide.
+
+    LEFT JOIN chat: keep rows with no chat so a handle-only SMS still appears.
+    """
+    if not has_is_filtered:
+        return ""
+    skip: list[str] = []
+    if hide_unknown:
+        skip.append("1")
+    if hide_spam:
+        skip.append("2")
+    if not skip:
+        return ""
+    return f"(c.ROWID IS NULL OR c.is_filtered NOT IN ({', '.join(skip)}))"
+
+
+def chat_filter_sql(con, args, *, already_where: bool) -> str:
+    pred = filtered_chat_predicate(
+        bool(getattr(args, "hide_spam", False)),
+        bool(getattr(args, "hide_unknown", False)),
+        _chat_has_col(con, "is_filtered"),
+    )
+    if not pred:
+        return ""
+    return (" AND " if already_where else " WHERE ") + pred
+
 
 
 def message_src(has_recently_deleted: bool) -> str:
@@ -869,7 +1057,8 @@ def base_select(con) -> str:
 
 def cmd_recent(con, args):
     rows = con.execute(
-        base_select(con) + " ORDER BY m.date DESC LIMIT ?", (args.n,)
+        base_select(con) + chat_filter_sql(con, args, already_where=False)
+        + " ORDER BY m.date DESC LIMIT ?", (args.n,)
     ).fetchall()
     render(reversed(rows) if args.chrono else rows, args.json,
            with_names=not args.no_names, con=con, rich=args.rich)
@@ -936,15 +1125,24 @@ def _search_needles(query: str) -> list[str]:
 
 
 def cmd_search(con, args):
+    if getattr(args, "stdin", False):
+        # `search --stdin N`: the positional slot holds N, the query is on stdin.
+        if args.query and args.query.isdigit():
+            args.n = int(args.query)
+        args.query = sys.stdin.read().strip()
+    if not args.query:
+        sys.exit("error: empty query")
     # text column is null for newer messages; also scan attributedBody as bytes
     needles = _search_needles(args.query)
     blob_or = " OR ".join("instr(m.attributedBody, CAST(? AS BLOB)) > 0" for _ in needles)
     rows = con.execute(
         base_select(con)
         + f"""
-        WHERE m.text LIKE ?
-           OR (m.attributedBody IS NOT NULL AND ({blob_or}))
-        ORDER BY m.date DESC LIMIT ?""",
+        WHERE (m.text LIKE ?
+           OR (m.attributedBody IS NOT NULL AND ({blob_or})))
+        """
+        + chat_filter_sql(con, args, already_where=True)
+        + " ORDER BY m.date DESC LIMIT ?",
         (f"%{args.query}%", *needles, args.n),
     ).fetchall()
     render(reversed(rows) if args.chrono else rows, args.json,
@@ -989,15 +1187,17 @@ def cmd_chats(con, args):
     # original_group_id is absent on older chat.db schemas; probe once.
     chat_cols = {row[1] for row in con.execute("PRAGMA table_info(chat)")}
     orig_col = "c.original_group_id" if "original_group_id" in chat_cols else "NULL"
+    filt = chat_filter_sql(con, args, already_where=False)
     rows = con.execute(
         f"""
         SELECT c.ROWID AS cid, c.chat_identifier, c.guid, c.group_id,
-               {orig_col} AS original_group_id, c.display_name, c.room_name,
+               {orig_col} AS original_group_id, c.display_name, c.room_name, c.style,
                c.service_name, MAX(m.date) AS last_date,
                COUNT(m.ROWID) AS n
         FROM chat c
         LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
         LEFT JOIN {MESSAGE_SRC} m ON m.ROWID = cmj.message_id
+        {filt}
         GROUP BY c.ROWID
         HAVING n > 0
         ORDER BY last_date DESC
@@ -1007,22 +1207,39 @@ def cmd_chats(con, args):
     if args.json:
         pin_ids = pinned_chat_identifiers()
         # One entry per CONVERSATION: a group re-keyed by Messages leaves
-        # several chat rows and used to list once per row.
+        # several chat rows and used to list once per row. A merged DM
+        # (phone + email sharing group_id) is the same shape.
         clusters = _group_cluster_map(con)
+        pin_candidates = _cluster_pin_candidates(con, clusters)
         merged_counts: dict = {}
+        pin_orders: dict[str, int] = {}
         for r in rows:
-            canon = clusters.get(r["chat_identifier"])
-            if canon:
-                merged_counts[canon] = merged_counts.get(canon, 0) + r["n"]
-        out = []
+            chat_id = r["chat_identifier"]
+            canon = clusters.get(chat_id, chat_id)
+            merged_counts[canon] = merged_counts.get(canon, 0) + r["n"]
+            order = pin_order_for(pin_ids, chat_id, r["guid"],
+                                  r["group_id"], r["original_group_id"],
+                                  *pin_candidates.get(chat_id, ()))
+            if order is not None and (canon not in pin_orders or order < pin_orders[canon]):
+                pin_orders[canon] = order
+
+        selected = []
+        seen_ids = set()
         for r in rows:
-            canon = clusters.get(r["chat_identifier"])
-            if canon and canon != r["chat_identifier"]:
+            chat_id = r["chat_identifier"]
+            if chat_id in seen_ids:
+                continue
+            seen_ids.add(chat_id)
+            canon = clusters.get(chat_id)
+            if canon and canon != chat_id:
                 continue                 # an older row of a conversation listed under `canon`
-            pin_order = pin_order_for(pin_ids, r["chat_identifier"], r["guid"],
-                                      r["group_id"], r["original_group_id"])
+            selected.append(r)
+
+        latest = {}
+        for r in selected:
             last = con.execute(
-                f"""SELECT m.text, m.attributedBody, m.is_from_me, h.id AS handle
+                f"""SELECT m.ROWID AS mid, m.text, m.attributedBody, m.is_from_me, h.id AS handle,
+                           m.balloon_bundle_id, m.payload_data
                     FROM chat_message_join cmj
                     JOIN {MESSAGE_SRC} m ON m.ROWID = cmj.message_id
                     LEFT JOIN handle h ON h.ROWID = m.handle_id
@@ -1030,26 +1247,89 @@ def cmd_chats(con, args):
                     ORDER BY m.date DESC LIMIT 1""",
                 (r["cid"],),
             ).fetchone()
+            if last:
+                latest[r["cid"]] = last
+
+        attachments = {}
+        for attachment in _chunked_in(
+            con,
+            """SELECT maj.message_id AS mid, a.transfer_name AS name, a.mime_type AS mime
+                 FROM message_attachment_join maj
+                 JOIN attachment a ON a.ROWID = maj.attachment_id
+                WHERE maj.message_id IN ({marks})
+                  AND COALESCE(a.transfer_name, '') NOT LIKE '%.pluginPayloadAttachment'
+                ORDER BY a.ROWID""",
+            [last["mid"] for last in latest.values()],
+        ):
+            attachments.setdefault(attachment["mid"], {
+                "name": attachment["name"] or "", "mime": attachment["mime"] or "",
+            })
+
+        participants = {}
+        for member in _chunked_in(
+            con,
+            """SELECT chj.chat_id AS cid, h.id AS handle
+                 FROM chat_handle_join chj JOIN handle h ON h.ROWID = chj.handle_id
+                WHERE chj.chat_id IN ({marks}) ORDER BY chj.chat_id, h.ROWID""",
+            [r["cid"] for r in selected if r["style"] == 43],
+        ):
+            if member["handle"]:
+                participants.setdefault(member["cid"], []).append(member["handle"])
+
+        wanted_names = []
+        for r in selected:
+            if r["chat_identifier"] not in pin_orders:
+                continue
+            if r["style"] == 43:
+                wanted_names.extend(participants.get(r["cid"], []))
+            else:
+                wanted_names.append(r["chat_identifier"])
+        contact_names = unified_names(wanted_names)
+
+        out = []
+        for r in selected:
+            chat_id = r["chat_identifier"]
+            last = latest.get(r["cid"])
+            raw_name = r["display_name"] or r["room_name"] or ""
+            explicit_name = raw_name if raw_name != chat_id else ""
+            pin_order = pin_orders.get(chat_id)
+            pin_name = ""
+            if pin_order is not None:
+                if r["style"] == 43:
+                    member_names = [
+                        contact_names.get(handle, {}).get("short") or name_for(handle) or handle
+                        for handle in participants.get(r["cid"], [])
+                    ]
+                    if len(member_names) == 2:
+                        generated_name = " & ".join(member_names)
+                    elif len(member_names) > 2:
+                        generated_name = ", ".join(member_names[:-1]) + " & " + member_names[-1]
+                    else:
+                        generated_name = member_names[0] if member_names else ""
+                    pin_name = explicit_name or generated_name
+                else:
+                    pin_name = contact_names.get(chat_id, {}).get("short") or ""
+
             out.append({
-                "id": r["chat_identifier"],
-                "name": r["display_name"] or r["room_name"],
+                "id": chat_id,
+                "name": explicit_name or None,
                 "service": r["service_name"],
-                "messages": r["n"],
+                "messages": merged_counts.get(chat_id, r["n"]),
                 "last": fmt_ts(r["last_date"]),
                 "last_text": message_text(last) if last else "",
                 "last_from_me": bool(last["is_from_me"]) if last else False,
                 "last_handle": (last["handle"] if last else None) or "",
                 "last_name": (None if args.no_names
                               else _dm_name(last["handle"] if last else None, r["chat_identifier"])),
+                "last_attachment": attachments.get(last["mid"]) if last else None,
                 "pinned": pin_order is not None,
                 "pin_order": pin_order,
+                "pin_name": pin_name or None,
                 # Other chat rows of this same conversation. A client must fold
                 # any thread carrying one of these onto this id.
                 "aliases": [c for c, k in clusters.items()
-                            if k == r["chat_identifier"] and c != r["chat_identifier"]],
+                            if k == chat_id and c != chat_id][:15],
             })
-            if canon:
-                out[-1]["messages"] = merged_counts.get(canon, r["n"])
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return
     for r in rows:
@@ -1102,6 +1382,13 @@ def cmd_groups(con, args):
         live.append(r)
     rows = live[: args.n]
     if args.json:
+        participant_lists = [
+            (r["participants"] or "").split(",") if r["participants"] else []
+            for r in rows
+        ]
+        contact_names = unified_names([
+            handle for members in participant_lists for handle in members
+        ]) if not args.no_names else {}
         print(
             json.dumps(
                 [
@@ -1109,10 +1396,23 @@ def cmd_groups(con, args):
                         "chat": r["chat_identifier"],
                         "guid": r["guid"],
                         "name": r["display_name"] or "",
-                        "participants": (r["participants"] or "").split(",") if r["participants"] else [],
+                        "participants": participant_lists[index],
+                        "participant_names": {
+                            handle: (
+                                contact_names.get(handle, {}).get("name")
+                                or name_for(handle)
+                                or handle
+                            )
+                            for handle in participant_lists[index]
+                        } if not args.no_names else {},
+                        "participant_short_names": {
+                            handle: contact_names.get(handle, {}).get("short")
+                                or short_name_for(handle) or handle
+                            for handle in participant_lists[index]
+                        } if not args.no_names else {},
                         "last": fmt_ts(r["last_date"]) if r["last_date"] else None,
                     }
-                    for r in rows
+                    for index, r in enumerate(rows)
                 ],
                 indent=2,
             )
@@ -1128,11 +1428,22 @@ def cmd_groups(con, args):
 
 
 ATTACHMENTS_ROOT = os.path.expanduser("~/Library/Messages/Attachments")
+# Stickers (Memoji, Genmoji, sticker packs) are attachment rows like any other,
+# but Messages files them here instead of under Attachments/.
+STICKER_ROOT = os.path.expanduser("~/Library/Messages/StickerCache")
 # Files Blip sent: imsg-send keeps them here because Messages may leave the
 # attachment row pointing at the (deleted) ~/Pictures/.blip-outbox staging path.
 OUTBOX_ROOT = os.path.expanduser("~/Pictures/.blip-outbox")
 SENT_ROOT = os.path.expanduser("~/.blip/sent")
 ATTACH_MAX_BYTES = 100 * 1024 * 1024  # hard ceiling, deliberately no flag
+
+
+def _in_message_store(path: str) -> bool:
+    """`path`, symlinks resolved, sits under a directory message media lives in.
+    commonpath, not startswith: a sibling sharing the name prefix is outside."""
+    path = os.path.realpath(path)
+    roots = (ATTACHMENTS_ROOT, STICKER_ROOT, SENT_ROOT)
+    return any(os.path.commonpath([path, r]) == r for r in map(os.path.realpath, roots))
 
 
 def _sniff_image(head: bytes) -> str:
@@ -1160,11 +1471,24 @@ def _group_cluster_map(con) -> dict:
     two different conversations with the same people never collapse. The
     canonical row is the one with the newest message (ties: highest ROWID),
     because that is the row Messages is writing to now.
+
+    1:1 chats that Messages has merged (phone SMS + email iMessage) share a
+    `group_id` while keeping different chat_identifiers. Those are clustered
+    the same way, keyed by group_id, so the sidebar and `thread --chat`
+    agree with Messages.app.
     """
+    # The same recovered name cmd_groups uses: a re-sync blanks display_name,
+    # and two NAMED groups with the same members then clustered as one (Astra
+    # C#1). Gated like the other optional columns so a minimal schema still works.
+    name_expr = ("COALESCE(NULLIF(c.display_name, ''), (SELECT m2.group_title "
+                 "FROM chat_message_join j2 JOIN message m2 ON m2.ROWID = j2.message_id "
+                 "WHERE j2.chat_id = c.ROWID AND m2.group_title IS NOT NULL "
+                 "ORDER BY m2.ROWID DESC LIMIT 1), '')"
+                 if _has_col(con, "group_title") else "COALESCE(c.display_name, '')")
     rows = con.execute(
         f"""
         SELECT c.ROWID AS rid, c.chat_identifier AS cid,
-               COALESCE(c.display_name, '') AS nm,
+               {name_expr} AS nm,
                (SELECT GROUP_CONCAT(h.id, ',')
                   FROM (SELECT h.id FROM chat_handle_join j JOIN handle h ON h.ROWID = j.handle_id
                          WHERE j.chat_id = c.ROWID ORDER BY h.id) h) AS parts,
@@ -1190,6 +1514,36 @@ def _group_cluster_map(con) -> dict:
         canonical = best[key][1]
         for cid in ids:
             out[cid] = canonical
+    # DMs Messages has merged (phone + email, SMS + iMessage) share group_id
+    # across different chat_identifiers. style 43 stays on the name+members
+    # path above — never mix a group with a 1:1.
+    dms = con.execute(
+        f"""
+        SELECT c.ROWID AS rid, c.chat_identifier AS cid, c.group_id AS gid,
+               (SELECT MAX(m.date) FROM chat_message_join j JOIN {MESSAGE_SRC} m ON m.ROWID = j.message_id
+                 WHERE j.chat_id = c.ROWID) AS last_date
+        FROM chat c
+        WHERE c.style != 43 AND c.group_id IS NOT NULL AND TRIM(c.group_id) != ''
+        """
+    ).fetchall()
+    dm_best: dict = {}
+    dm_members: dict = {}
+    for r in dms:
+        if not r["cid"]:
+            continue
+        key = r["gid"]
+        dm_members.setdefault(key, []).append(r["cid"])
+        rank = (r["last_date"] or -1, r["rid"])
+        cur = dm_best.get(key)
+        if cur is None or rank > cur[0]:
+            dm_best[key] = (rank, r["cid"])
+    for key, ids in dm_members.items():
+        uniq = list(dict.fromkeys(ids))
+        if len(uniq) < 2:
+            continue
+        canonical = dm_best[key][1]
+        for cid in uniq:
+            out[cid] = canonical
     return out
 
 
@@ -1197,6 +1551,34 @@ def _group_photo_chat_ids(con, chat_identifier: str) -> tuple[str, ...]:
     clusters = _group_cluster_map(con)
     canon = clusters.get(chat_identifier, chat_identifier)
     return tuple(sorted({c for c, k in clusters.items() if k == canon} | {chat_identifier, canon}))
+
+
+def _cluster_pin_candidates(con, clusters: dict) -> dict:
+    """canon chat_identifier -> identifiers Messages may have stored as a pin.
+
+    A re-keyed group's pin stays on a retired row's group_id. A merged DM is
+    pinned by whichever handle was tapped. Matching only the live row missed
+    both. Look at every chat row, not the sidebar LIMIT, so a quiet alias
+    still donates its ids.
+    """
+    chat_cols = {row[1] for row in con.execute("PRAGMA table_info(chat)")}
+    orig = "original_group_id" if "original_group_id" in chat_cols else "NULL"
+    rows = con.execute(
+        f"SELECT chat_identifier, guid, group_id, {orig} AS original_group_id FROM chat"
+    ).fetchall()
+    seen: dict = {}
+    for r in rows:
+        cid = r["chat_identifier"]
+        if not cid:
+            continue
+        canon = clusters.get(cid, cid)
+        bucket = seen.setdefault(canon, [])
+        have = set(bucket)
+        for v in (cid, r["guid"], r["group_id"], r["original_group_id"]):
+            if v and str(v).strip() and str(v) not in have:
+                have.add(str(v))
+                bucket.append(str(v))
+    return seen
 
 
 def _group_photo_path(con, chat_identifier: str) -> str:
@@ -1403,7 +1785,9 @@ def _avatar_candidates(handle: str) -> list[tuple[str, int]]:
     if not key:
         return []
     parsed = None if want_email else _parse_phone(handle)
-    candidates: list[tuple[str, int]] = []
+    exact_cands: list[tuple[str, int]] = []
+    near_cands: list[tuple[str, int]] = []
+    exact_any = False                      # an exact card exists somewhere, even ambiguously
     for path in _ab_sources():
         try:
             con2 = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -1421,14 +1805,24 @@ def _avatar_candidates(handle: str) -> list[tuple[str, int]]:
                     exact.add(pk)
                 elif parsed and (card := _parse_phone(v or "")) and _same_number(parsed, card):
                     near.add(pk)
+            # Several records inside ONE source: ambiguous there — skip that
+            # source only — unless they are one person saved twice (_one_person).
+            exact_pks = _one_person(con2, exact)
+            near_pks = _one_person(con2, near)
             con2.close()
         except sqlite3.DatabaseError:
             continue
-        pks = exact or near
-        if len(pks) == 1:
-            candidates.append((path, pks.pop()))
-        # len > 1 inside ONE source: ambiguous there — skip that source only
-    return candidates
+        if exact:
+            exact_any = True
+        if exact_pks:
+            exact_cands.extend((path, pk) for pk in exact_pks)
+        elif not exact and near_pks:
+            near_cands.extend((path, pk) for pk in near_pks)
+    # The exact key decides whenever ANY source has it — the rule name_for
+    # applies globally. Per-source `exact or near` let a nearer source's
+    # suffix card put its photo on a conversation named after another source's
+    # exact card (Astra #3). Suffix matches only when nothing is exact.
+    return exact_cands if exact_cands else ([] if exact_any else near_cands)
 
 
 def cmd_attachment(con, args):
@@ -1461,16 +1855,22 @@ def cmd_attachment(con, args):
             LIMIT 1""",
         (int(args.id),),
     ).fetchone()
-    if not row or not row["filename"]:
+    if not row:
         sys.exit("error: no such visible attachment")
+    if not row["filename"]:
+        # The row is real but Messages in iCloud has not brought the bytes to
+        # this Mac (filename NULL, transfer_state 0): a headless gateway that
+        # syncs through CloudKit gets metadata first and media only when the
+        # Mac decides to pull it. Say so — "no such attachment" sent people
+        # hunting for a Blip bug.
+        sys.exit("error: attachment not downloaded on the Mac yet (Messages in iCloud)")
 
     raw = os.path.expanduser(row["filename"])
     outbox = os.path.realpath(OUTBOX_ROOT)
     if os.path.commonpath([os.path.realpath(raw), outbox]) == outbox and not os.path.exists(raw):
         raw = os.path.join(SENT_ROOT, os.path.relpath(os.path.realpath(raw), outbox))
     path = os.path.realpath(raw)
-    roots = [os.path.realpath(ATTACHMENTS_ROOT), os.path.realpath(SENT_ROOT)]
-    if not any(os.path.commonpath([path, r]) == r for r in roots):
+    if not _in_message_store(path):
         sys.exit("error: attachment path escapes the Messages store")
 
     # Ceiling applies to the SOURCE before any conversion — sips must not be
@@ -1722,18 +2122,25 @@ def main() -> None:
     common.add_argument("--rich", action="store_true", default=argparse.SUPPRESS,
                         help="JSON only: fold tapbacks onto their targets and add "
                              "read_at/edited/retracted/reply_to/attachments/effect/audio")
+    common.add_argument("--hide-spam", action="store_true", default=argparse.SUPPRESS,
+                        help="omit chats with is_filtered=2 (iPhone Spam)")
+    common.add_argument("--hide-unknown", action="store_true", default=argparse.SUPPRESS,
+                        help="omit chats with is_filtered=1 (Filter Unknown Senders)")
     # also accept on the parent for `imsg --json recent 5` style
     p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--chrono", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--no-names", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--rich", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--hide-spam", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--hide-unknown", action="store_true", help=argparse.SUPPRESS)
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("recent",   parents=[common]); s.add_argument("n", nargs="?", type=int, default=20); s.set_defaults(func=cmd_recent)
     s = sub.add_parser("from",     parents=[common]); s.add_argument("handle"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_from)
     s = sub.add_parser("thread",   parents=[common]); s.add_argument("handle", nargs="?", default=""); s.add_argument("n", nargs="?", type=int, default=50); s.add_argument("--chat", default="", help="exact chat_identifier (groups: 32-hex / chat<digits>)"); s.set_defaults(func=cmd_thread)
-    s = sub.add_parser("search",   parents=[common]); s.add_argument("query"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_search)
+    s = sub.add_parser("search",   parents=[common]); s.add_argument("query", nargs="?", default=""); s.add_argument("n", nargs="?", type=int, default=50)
+    s.add_argument("--stdin", action="store_true", help="read the query from stdin (it is message text: never argv)"); s.set_defaults(func=cmd_search)
     s = sub.add_parser("contacts", parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_contacts)
     s = sub.add_parser("chats",    parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_chats)
     s = sub.add_parser("groups",   parents=[common]); s.add_argument("n", nargs="?", type=int, default=2000); s.set_defaults(func=cmd_groups)

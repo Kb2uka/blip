@@ -42,11 +42,17 @@ if [[ -z "${host:-}" ]]; then
   read -r -p "Mac ssh target ([user@]host, Tailscale name works best): " host
 fi
 [[ -n "$host" ]] || { echo "no host given" >&2; exit 64; }
-if ! [[ "$host" =~ ^([A-Za-z0-9._-]+@)?[A-Za-z0-9._:-]+$ ]]; then
+# Neither part may start with "-": `host=-Fssh_config` used to reach ssh as an
+# OPTION and pull a ProxyCommand out of an attacker's file (Astra D#1).
+if ! [[ "$host" =~ ^([A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
   echo "✗ '$host' is not a [user@]hostname — no spaces, quotes, or shell characters" >&2; exit 64
 fi
 
-# 1. config
+# 1. config. Keys the installer does not own — push_read, link_previews,
+# spell, ui_font, ui_font_size, anything set by hand — must survive a re-run; a
+# wholesale rewrite silently re-enabled what the user had turned off (Astra #18).
+kept=""
+[[ -r "$conf" ]] && kept="$(grep -vE '^[[:space:]]*(#|$|host=|remote_bin=|python=|key=|automation=|country_code=)' "$conf" || true)"
 mkdir -p "$conf_dir"
 {
   echo "# Blip bridge — read (never sourced) by ~/bin/imsg, imsg-send, imsg-read, contacts"
@@ -59,6 +65,7 @@ mkdir -p "$conf_dir"
   echo "automation=${BLIP_AUTOMATION:-${prev_automation:-off}}"   # a re-run keeps a hand-set value
   echo "# country calling code for numbers typed without one (1 = US/Canada, 44 = UK, 49 = DE…)"
   echo "country_code=${prev_country:-1}"
+  if [[ -n "$kept" ]]; then echo "# kept from the previous bridge.conf"; printf '%s\n' "$kept"; fi
 } > "$conf"
 chmod 0600 "$conf"
 echo "✓ $conf"
@@ -95,33 +102,60 @@ for t in imsg imsg-send imsg-read contacts; do
 done
 echo "✓ shims installed: ~/bin/imsg ~/bin/imsg-send ~/bin/imsg-read ~/bin/contacts"
 
+# The from= option for the Blip key's authorized_keys line. $1 = the address
+# this machine reached the Mac from. Over Tailscale that address is a stable
+# per-node identity, so the key is pinned to it — to BOTH of this node's
+# addresses when tailscale is here, since MagicDNS hands out either family.
+# Any other address (a LAN, DHCP) prints nothing: an unpinned key beats a
+# stranded one, and docs/SECURITY.md shows the one-line manual pin.
+blip_key_from() {
+  local seen="$1" v="" second
+  case "$seen" in
+    100.*) second="${seen#100.}"; second="${second%%.*}"
+           [[ "$second" =~ ^[0-9]+$ ]] && (( second >= 64 && second <= 127 )) && v="$seen" ;;   # 100.64.0.0/10
+    fd7a:115c:a1e0:*) v="$seen" ;;                                                            # Tailscale IPv6
+  esac
+  [[ -n "$v" ]] || return 0
+  if command -v tailscale >/dev/null 2>&1; then
+    local ips; ips="$(tailscale ip 2>/dev/null | paste -sd, -)"
+    case ",$ips," in *",$seen,"*) v="$ips" ;; esac
+  fi
+  [[ "$v" =~ ^[0-9A-Fa-f.:,]+$ ]] || return 0
+  printf 'from="%s",' "$v"
+}
+
 # 4. Mac install (needs ssh to already work — key-based)
-if ssh -n -o ConnectTimeout=6 -o BatchMode=yes "$host" true 2>/dev/null; then
-  ssh "$host" 'mkdir -p ~/.blip/src'
+if ssh -n -o ConnectTimeout=6 -o BatchMode=yes -- "$host" true 2>/dev/null; then
+  ssh -n -- "$host" 'mkdir -p ~/.blip/src'
   scp -q "$here"/bridge/mac/* "$host:~/.blip/src/"
-  ssh "$host" 'bash ~/.blip/src/install.sh'
+  ssh -n -- "$host" 'bash ~/.blip/src/install.sh --no-check'   # the check runs below, after the "be at the Mac" pause
 
   # python3 on a fresh Mac is a Command Line Tools STUB that exits 1 (and may
   # pop an install dialog). Every bridge tool needs the real thing; say so
   # here instead of letting the key-confinement check misdiagnose it.
-  if ! ssh "$host" "python3 -c 'import sqlite3, subprocess'" >/dev/null 2>&1; then
+  if ! ssh -n "$host" "python3 -c 'import sqlite3, subprocess'" >/dev/null 2>&1; then
     echo "✗ python3 on $host cannot run: install Xcode Command Line Tools there —  xcode-select --install  — then re-run blip-setup" >&2
     exit 1
   fi
 
   # 4b. Dedicated key, confined on the Mac to blip-dispatch (restrict = no
-  # shell, no forwarding, no pty). Your everyday key is untouched; Blip's key
-  # cannot do anything but run the five bridge tools.
+  # shell, no forwarding, no pty) and, over Tailscale, pinned to this
+  # machine's addresses (from=): sshd refuses it from anywhere else, even
+  # with the private key in hand. A re-run REPLACES the key's line, so a
+  # changed address is one re-run away. Your everyday key is untouched.
   key="$HOME/.ssh/blip_ed25519"
   [[ -f "$key" ]] || ssh-keygen -q -t ed25519 -N "" -C "blip@$(hostname)" -f "$key"
   pub="$(cut -d" " -f1,2 < "$key.pub")"
-  ssh "$host" "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; \
-    if [ -s ~/.ssh/authorized_keys ] && [ \"\$(tail -c1 ~/.ssh/authorized_keys)\" != '' ]; then echo >> ~/.ssh/authorized_keys; fi; \
-    grep -qF -- '$pub' ~/.ssh/authorized_keys || \
-    printf '%s\n' 'restrict,command=\"\$HOME/.blip/bin/blip-dispatch\" $pub' >> ~/.ssh/authorized_keys"
-  if [[ "$(ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ControlPath=none "$host" ping 2>/dev/null)" == pong ]] \
-     && ! ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ControlPath=none "$host" true >/dev/null 2>&1; then
-    echo "✓ dedicated key enrolled: $key can run only the Blip tools on $host"
+  seen="$(ssh -n -- "$host" 'printf %s "${SSH_CONNECTION%% *}"')"
+  from_opt="$(blip_key_from "$seen")"
+  ssh -n "$host" "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; \
+    grep -vF -- '$pub' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.blip.tmp || true; \
+    printf '%s\n' '${from_opt}restrict,command=\"\$HOME/.blip/bin/blip-dispatch\" $pub' >> ~/.ssh/authorized_keys.blip.tmp; \
+    mv ~/.ssh/authorized_keys.blip.tmp ~/.ssh/authorized_keys"
+  if [[ "$(ssh -n -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ControlPath=none "$host" ping 2>/dev/null)" == pong ]] \
+     && ! ssh -n -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ControlPath=none "$host" true >/dev/null 2>&1; then
+    if [[ -n "$from_opt" ]]; then echo "✓ dedicated key enrolled: $key can run only the Blip tools on $host, and only from ${from_opt#from=}"
+    else echo "✓ dedicated key enrolled: $key can run only the Blip tools on $host (not pinned to an address: $host is not reached over Tailscale — docs/SECURITY.md shows the manual pin)"; fi
   else
     echo "✗ dedicated key did not confine as expected — check ~/.ssh/authorized_keys on the Mac" >&2; exit 1
   fi
@@ -129,15 +163,31 @@ if ssh -n -o ConnectTimeout=6 -o BatchMode=yes "$host" true 2>/dev/null; then
   # The three grants, checked in the ssh context that matters. The automation
   # check TALKS to Messages.app, which pops the one-time Allow prompt on the
   # Mac's screen when the grant is missing — so give the user a beat to click.
+  # The prompt expires in about two minutes and an EXPIRED prompt is recorded
+  # as a denial that macOS 26's Settings switch may then refuse to flip (#36):
+  # say so before it fires, not after.
+  echo
+  echo "Next: the Mac will ask, ON ITS OWN SCREEN, whether sshd may control Messages."
+  echo "  Be at the Mac (or in Screen Sharing) and click Allow within two minutes — an"
+  echo "  unanswered prompt is recorded as a denial. Ready?"
+  read -r -p "  Press Enter to run the permission check: " _
+  granted=0
   for attempt in 1 2 3; do
     echo; echo "Checking Mac permissions (attempt $attempt)…"
     # a grant applies to NEW sessions: drop the multiplexed master so the re-check sees it
     ssh -O exit "$host" >/dev/null 2>&1 || true
-    if ssh "$host" 'python3 ~/.blip/bin/blip-check'; then break; fi
+    if ssh -n -- "$host" 'python3 "$HOME/.blip/bin/blip-check"'; then granted=1; break; fi
     if [[ $attempt -lt 3 ]]; then
       read -r -p "Grant what is missing on the Mac (an Allow prompt may be on its screen), then press Enter to re-check (or Ctrl-C): " _
     fi
   done
+  if [[ $granted != 1 ]]; then
+    # Reading chat.db works without the Automation grant, so the smoke test
+    # below would have said "bridge is up" over a Mac that cannot send (Astra #19).
+    echo "✗ The Mac is still missing a permission after 3 checks. Blip can read but cannot send until it is granted." >&2
+    echo "  Fix it on the Mac, then re-run blip-setup — or check any time with: ssh $host 'python3 \"\$HOME/.blip/bin/blip-check\"'" >&2
+    exit 1
+  fi
 else
   echo "✗ cannot ssh to $host non-interactively yet. Set up key auth (ssh-copy-id $host), then re-run blip-setup." >&2
   echo "  On the Mac, you can also run the installer by hand:" >&2
@@ -157,7 +207,7 @@ if out="$("$HOME/bin/imsg" --json recent 1 2>&1)"; then
   # else the Omarchy theme font. We install Inter (OFL, in Arch's `extra`) and
   # only POINT AT Apple for SF Pro: its licence forbids redistribution, so the
   # font is never carried in this repo and never fetched by us.
-  if fc-list : family 2>/dev/null | grep -qiE '"'"'(^|,)\s*(SF Pro Text|SF Pro Display|Inter)\s*($|,)'"'"'; then
+  if fc-list : family 2>/dev/null | grep -qiE '(^|,)[[:space:]]*(SF Pro Text|SF Pro Display|Inter)[[:space:]]*($|,)'; then
     echo "✓ UI font present — Blip will render like Messages rather than in the theme's monospace"
   else
     echo "Blip looks most like Messages in a UI sans. Omarchy's font is monospace."

@@ -8,7 +8,7 @@ QtObject {
   property string themeFont: Style.font.family
   property color foreground: Color.foreground
   readonly property color background: Color.background
-  readonly property color muted: Qt.darker(foreground, 1.45)
+  readonly property color muted: Qt.alpha(foreground, 0.66)
   readonly property color accent: "#0a84ff"
   readonly property color accentText: "#ffffff"
   readonly property real cornerRadius: Style.cornerRadius
@@ -53,6 +53,7 @@ QtObject {
     var small = Style.font.bodySmall
     return small > 0 ? uiFontSizePx / small : 1
   }
+  readonly property int fontTitle: Math.max(1, Math.round(Style.font.title * uiFontScale))
   readonly property int fontCaption: Math.max(1, Math.round(Style.font.caption * uiFontScale))
   readonly property int fontBodySmall: Math.max(1, Math.round(Style.font.bodySmall * uiFontScale))
   readonly property int fontBody: Math.max(1, Math.round(Style.font.body * uiFontScale))

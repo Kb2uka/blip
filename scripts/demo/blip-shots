@@ -39,8 +39,26 @@ cleanup() {
 [[ $KEEP == 0 ]] && trap cleanup EXIT
 
 echo "· sandbox $SANDBOX"
+# Only ever wipe a directory THIS script made: BLIP_DEMO_HOME="$HOME" used to
+# `rm -rf` the real home (Astra D#2). A marker file proves ownership.
+for d in "$SANDBOX" "$SHELLDIR"; do
+  case "$d" in /|"$HOME"|"$REPO"|"") echo "refusing to use $d as a scratch dir" >&2; exit 64;; esac
+  if [[ -e $d && ! -e $d/.blip-demo-scratch ]]; then
+    echo "refusing to remove $d: not a Blip demo scratch dir (no .blip-demo-scratch marker)" >&2; exit 64
+  fi
+done
 rm -rf "$SANDBOX" "$SHELLDIR"
 mkdir -p "$SANDBOX/bin" "$SANDBOX/.config/blip" "$SANDBOX/.cache" "$SANDBOX/.local/state" "$OUT"
+touch "$SANDBOX/.blip-demo-scratch"
+# ($SHELLDIR is created by the `cp -r` below — pre-creating it made cp nest the
+# shell one level down and qs.Commons vanished; its marker follows the copy.)
+# A PRIVATE runtime dir: the real one holds the contact-search dump, drafts and
+# QR files, and the demo read and swept them (Astra D#3). The compositor and
+# Hyprland sockets are linked in so the shell still reaches the desk.
+RUNDIR="$SANDBOX/run"; mkdir -p "$RUNDIR"; chmod 700 "$RUNDIR"
+[[ -n ${WAYLAND_DISPLAY:-} && -e "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]] && ln -s "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" "$RUNDIR/$WAYLAND_DISPLAY"
+[[ -d "$XDG_RUNTIME_DIR/hypr" ]] && ln -s "$XDG_RUNTIME_DIR/hypr" "$RUNDIR/hypr"
+export XDG_RUNTIME_DIR="$RUNDIR"
 printf '#!/usr/bin/env bash\nexec bun %q "$@"\n' "$REPO/scripts/demo/fake-imsg" > "$SANDBOX/bin/imsg"
 chmod +x "$SANDBOX/bin/imsg"
 # The shims Blip would call for sending: a screenshot never sends, so these
@@ -55,7 +73,8 @@ CONF
 
 echo "· shell copy $SHELLDIR"
 cp -r /usr/share/omarchy/shell "$SHELLDIR"
-cp "$REPO"/*.qml "$REPO"/*.ts "$SHELLDIR/"
+touch "$SHELLDIR/.blip-demo-scratch"
+cp "$REPO"/*.qml "$REPO"/*.ts "$REPO"/*.mjs "$REPO/manifest.json" "$SHELLDIR/"   # manifest: the header's version (Astra D#7)
 cp "$REPO/scripts/demo/DemoShell.qml" "$SHELLDIR/shell.qml"
 
 echo "· launching"

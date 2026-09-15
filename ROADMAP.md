@@ -220,6 +220,41 @@ panel (3 lenses × finding, against current main) confirmed 11 closed and
   reading; a future hybrid could borrow BT MAP *just* for read-marking.
   Check its license before lifting code.
 
+  **Re-examined 2026-09-09, and the license question is now answered: NO code
+  can be lifted.** The backend is GPL-2.0-or-later, the Omarchy widget
+  (`erikwb/omarchy-blueferry`, a UI shell with no backend in it) is
+  GPL-2.0-only. Blip is MIT. Copying either relicenses Blip. What can cross is
+  knowledge: their `PROTOCOL.md` records observed iPhone behaviour, and facts
+  about how a device responds belong to nobody. An independent implementation
+  from those findings plus BlueZ's public API is clean; reworking their code is
+  not.
+
+  Mechanism, read from their source rather than their README: sending is
+  `MessageAccess1.PushMessage` with a bMessage payload over BlueZ's OBEX D-Bus
+  API; read-marking sets the `Read` property on an `org.bluez.obex.Message1`
+  object; PBAP carries contacts; ANCS over BLE mirrors other notifications on a
+  second bearer. iOS only grants messaging permission to an adapter presenting
+  as a hands-free car kit (Class of Device major 4, minor 8), and the pairing
+  order decides whether one bond covers both transports.
+
+  **The prize is group read-marking.** Via the Mac it is impossible (see
+  CLAUDE.md: a group's `chat<digits>` id has no `imessage://` form), and the
+  DM path that does work has to open the conversation in Messages, which pulls
+  it to the front of the Mac. MAP needs no Mac and steals no focus. Untested:
+  it would only reach messages a live MAP session has seen, and handles go
+  stale across reconnects, so it could never clear historical stragglers.
+
+  **Tried 2026-09-09, blocked on hardware.** Software side is ready:
+  `bluez-obex` installed, `obexd` carries `MessageAccess1`, BlueZ 5.87 clears
+  both floors their doc states (5.72 MAP, 5.86 dual-bearer). dex's radio is
+  not: the Realtek RTL8852CE (`0bda:886c`) sits in a reset loop the moment it
+  is unblocked — `command 0xfc61 tx timeout`, `Read reg16 failed (-110)`,
+  `Resetting usb device`, every two seconds — so it never enumerates long
+  enough to pair. Firmware is present, so this is the part or the driver, not a
+  missing blob. Bluetooth was left soft-blocked, as found. A USB dongle with a
+  chipset they have actually tested (MediaTek MT7922 or Intel) turns this back
+  into a one-evening experiment.
+
 ## Not possible (and why)
 
 - **Outbound tapbacks / edits / typing indicators** — no public API; requires

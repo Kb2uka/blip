@@ -39,7 +39,7 @@ import sys
 import time
 
 MENU = 'menu 1 of menu bar item "Conversation" of menu bar 1'
-TIMEOUT = 15
+TIMEOUT = 150   # the first System Events call can be a consent prompt; give it the ~2 minutes macOS gives it (Astra C#8)
 
 
 def osa(script: str) -> tuple[int, str]:
@@ -212,9 +212,13 @@ def select_chat(handle: str) -> str:
     if not re.fullmatch(r"\+?[0-9]{3,15}|[^@\s]+@[^@\s]+", handle):
         return "not a DM handle (groups cannot be selected by URL — use --all)"
     try:
-        subprocess.run(["open", f"imessage://{handle}"], capture_output=True, timeout=TIMEOUT)
+        r = subprocess.run(["open", f"imessage://{handle}"], capture_output=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
         return "opening the conversation timed out"
+    if r.returncode != 0:
+        # Selection did not move: clicking now would mark whatever Messages
+        # had selected, some OTHER conversation (Astra C#4).
+        return f"could not open the conversation (open exited {r.returncode})"
     subprocess.run(["sleep", "1.5"], capture_output=True)
     return ""
 
@@ -274,13 +278,16 @@ def main() -> None:
         if len(argv) < 2:
             sys.stderr.write("imsg-read: --chat needs a handle\n")
             sys.exit(64)
+        before = unread_on_mac(argv[1])
+        if before == 0:
+            print("nothing unread")     # and no reason to pull Messages forward
+            return
         why = select_chat(argv[1])
         if why:
             sys.stderr.write(f"imsg-read: {why}\n")
             sys.exit(64)
         # The per-conversation item is literally named for what it will do:
         # "Mark as Unread" when the chat is read, "Mark as Read" when it is not.
-        before = unread_on_mac(argv[1])
         ok, err = click("Mark as Read")
         if err:
             sys.stderr.write(f"imsg-read: {err}\n")

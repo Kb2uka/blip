@@ -1,3 +1,4 @@
+import "SendState.mjs" as SendState
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -20,6 +21,17 @@ import qs.Ui
 FocusScope {
   id: root
 
+  PinnedShortcuts {
+    pins: root.pinnedThreads
+    active: root.surfaceOpen && !root.contactsOpen && root.shareUrl === ""
+    onChosen: function(thread) {
+      if (root.newMode) root.exitNew()
+      if (root.searching) root.exitSearch()
+      if (root.inThread && String(root.active.chat) === String(thread.chat)) root.focusDefault()
+      else root.openThread(thread)
+    }
+  }
+
   // ---- host contract (docs/app-design-review.md) ----------------------
   property var hostWidget: null
   /** Qt format strings, owned by the host widget (see BarWidget). Empty when no host is
@@ -41,13 +53,14 @@ FocusScope {
   BlipAppearance { id: appearance; hostWidget: root.hostWidget; themeFont: root.themeFont; foreground: root.foreground }
   readonly property string fontFamily: appearance.fontFamily
   readonly property real uiFontScale: appearance.uiFontScale
+  readonly property int fontTitle: appearance.fontTitle
   readonly property int fontCaption: appearance.fontCaption
   readonly property int fontBodySmall: appearance.fontBodySmall
   readonly property int fontBody: appearance.fontBody
-  readonly property color dim: Qt.darker(foreground, 1.45)
+  readonly property color dim: appearance.muted
   /** An editor owns the keyboard — the host's key catcher must stand down. */
   readonly property bool editorActive:
-    composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
+    contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
   readonly property alias composeEditor: composeField
   readonly property real contentHeightHint: listContent.implicitHeight
   /** The view wants keyboard navigation focus back (list mode). */
@@ -65,6 +78,9 @@ FocusScope {
   readonly property color mineFill: accent
   readonly property color mineText: appearance.accentText
   readonly property color theirsFill: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.14)
+  // Omarchy's hover-cursor fill for rows and the bubble band alike: the theme's
+  // colour and alpha (foreground at 0.08 by default), not a hard-coded copy of them.
+  readonly property color hoverFill: Style.hoverFillFor(foreground, accent)
   readonly property color theirsText: foreground
 
   // Links inside a bubble take the bubble's readable text color instead of
@@ -136,6 +152,8 @@ FocusScope {
   readonly property var unpinnedThreads: root.threads.filter(function(t) { return t.pinned !== true })
   readonly property bool online: hostWidget ? hostWidget.online : false
   readonly property int unread: hostWidget ? hostWidget.unread : 0
+  /** The plugin's version, from the host (manifest.json). "" hides the tag. */
+  readonly property string version: hostWidget && hostWidget.version ? String(hostWidget.version) : ""
 
   // ---- share sheet (right-click a link in a bubble, or a link card)
   property string shareUrl: ""        // "" = closed
@@ -144,11 +162,43 @@ FocusScope {
   /** Open the share sheet for one http(s) URL. Anything else is ignored. The
    *  URL is message content: it reaches qrencode and the LocalSend temp file
    *  on STDIN, never argv (CLAUDE.md: message text never rides argv). */
-  function openShare(u) {
-    u = String(u || "")
-    if (!/^https?:\/\//i.test(u)) return
-    shareUrl = u
+  property var shareUrls: []       // the links the sheet was opened on
+  property int shareIndex: 0       // which of them it shows; ←/→ and ‹ › step
+  property int shareCursor: 0      // highlighted action (mouse and keys agree)
+  property real shareKeysFrom: 0   // Enter and digits act from this time on
+  /** Open the sheet on one URL or a list (a message's links, first showing).
+   *  `auto`: it opened by itself — a link that arrived, IPC.
+   *  The sheet is the warning either way (host, full URL, a button that says
+   *  what Enter does), but for 700 ms after an auto sheet appears Enter and
+   *  digits still belong to the draft, so a link landing as Enter is pressed
+   *  to send is never opened by it. False when nothing in `u` is http(s). */
+  function openShare(u, auto) {
+    var urls = (Array.isArray(u) ? u : [u]).map(function(x) { return String(x || "") })
+      .filter(function(x) { return /^https?:\/\//i.test(x) })
+    if (urls.length === 0) return false
+    shareUrls = urls
+    shareIndex = 0
+    shareCursor = 0
+    shareKeysFrom = Date.now() + (auto === true ? 700 : 0)
     shareQr = ""
+    showShareUrl(urls[0])
+    return true
+  }
+  function shareStep(d) {
+    var n = shareUrls.length
+    if (n < 2) return
+    shareIndex = (shareIndex + d + n) % n
+    showShareUrl(shareUrls[shareIndex])
+  }
+  /** The QR for `u`. The box keeps the previous code until this one is
+   *  written, so stepping swaps the image instead of re-flowing the card. */
+  function showShareUrl(u) {
+    shareUrl = u
+    // A sheet opened over a still-rendering one: the old job's exit would have
+    // published ITS result under the new outFile (Astra A#8). Kill it; the
+    // non-zero exit keeps its result out. Stepping between links re-runs this,
+    // so it matters more here than it did for one link.
+    if (qrProc.running) qrProc.running = false
     var out = shareDir + "/qr-" + Date.now() + ".png"
     qrProc.outFile = out
     qrProc.command = ["sh", "-c", 'mkdir -p "$1" && chmod 700 "$1" && umask 077 && exec qrencode -o "$2" -s 6 -m 2 -l M', "blip", shareDir, out]
@@ -157,18 +207,29 @@ FocusScope {
     qrProc.write(u)
     qrProc.stdinEnabled = false
   }
-  function closeShare() { shareUrl = ""; shareQr = "" }
+  function closeShare() { shareUrl = ""; shareQr = ""; shareUrls = [] }
   /** First http(s) URL in a string, or "" — mirrors collector.firstUrl. */
   function firstUrl(t) {
     var m = /https?:\/\/[^\s<>"']+/i.exec(String(t || ""))
     return m ? m[0].replace(/[.,;:!?)\]}'"]+$/, "") : ""
   }
-  /** IPC `share <url>` (host gates it behind automation=on). */
+  /** Every link in a message, in order, exactly as linkify() anchors them
+   *  (same pattern, same trailing-punctuation rule, www. gets https://). */
+  function allUrls(t) {
+    var re = /\bhttps?:\/\/[^\s<>"']+|\bwww\.[^\s<>"']+\.[^\s<>"']+/gi, out = [], m
+    while ((m = re.exec(String(t || ""))) !== null) {
+      var u = m[0].replace(/[.,;:!?\]]+$/, "")
+      while (u.endsWith(")") && u.split("(").length < u.split(")").length) u = u.slice(0, -1)
+      u = u.replace(/[.,;:!?\]]+$/, "")
+      if (/^www\./i.test(u)) u = "https://" + u
+      if (out.indexOf(u) < 0) out.push(u)
+    }
+    return out
+  }
+  /** IPC `share <url>` (host gates it behind automation=on), and the host's
+   *  arriving-link path, which hands over every link of the message. */
   function shareLink(u) {
-    u = String(u || "")
-    if (!/^https?:\/\//i.test(u)) return "not an http(s) url"
-    openShare(u)
-    return "share sheet"
+    return openShare(u, true) ? "share sheet" : "not an http(s) url"
   }
   /** The full app window. The host owns creation (Quickshell never re-maps a
    *  hidden FloatingWindow), so this asks the widget, exactly like SUPER+M.
@@ -177,8 +238,24 @@ FocusScope {
   function openApp() {
     closeShare()
     if (!hostWidget) return
-    if (typeof hostWidget.close === "function") hostWidget.close()
     if (typeof hostWidget.showApp === "function") hostWidget.showApp()
+  }
+  /** The sheet's keys: Esc closes, ←/→ step links, ↑/↓ move the highlight,
+   *  Enter takes it, 1/2/3 pick directly. Anything else falls through to the
+   *  field (a sheet over a draft never blocks typing); see openShare for
+   *  the grace on an auto sheet. True when the key was the sheet's. */
+  function shareKey(key) {
+    if (shareUrl === "") return false
+    var acts = [shareOpen, shareCopy, shareSend]
+    if (key === Qt.Key_Escape) { closeShare(); return true }
+    // ←/→ are the sheet's only when there is something to step through; a
+    // draft keeps its caret keys otherwise.
+    if ((key === Qt.Key_Left || key === Qt.Key_Right) && shareUrls.length > 1) { shareStep(key === Qt.Key_Right ? 1 : -1); return true }
+    if (key === Qt.Key_Up || key === Qt.Key_Down) { shareCursor = Math.max(0, Math.min(2, shareCursor + (key === Qt.Key_Down ? 1 : -1))); return true }
+    if (Date.now() < shareKeysFrom) return false
+    if (key === Qt.Key_Return || key === Qt.Key_Enter) { acts[shareCursor](); return true }
+    if (key >= Qt.Key_1 && key <= Qt.Key_3) { acts[key - Qt.Key_1](); return true }
+    return false
   }
   function shareOpen() { var u = shareUrl; closeShare(); openLink(u) }
   function shareCopy() { var u = shareUrl; closeShare(); copyText(u) }
@@ -207,8 +284,38 @@ FocusScope {
   property var active: null          // selected thread object, null = list view
   property var bubbles: []           // decorated messages for `active` (see thread.ts)
   property bool loading: false
+  // A conversation is READ only after a snapshot of it actually rendered.
+  // `rendered` is false from openThread until bubbles land; a failed load
+  // (timeout, bad JSON) leaves it false, so a later refresh cannot mark the
+  // conversation read unseen (Astra A#2). `seenTs` is the newest ts IN that
+  // snapshot — what the eye saw — and is what every read mark carries; the
+  // sidebar's last_ts can be newer than anything on screen (Astra A#3).
+  property bool rendered: false
+  property string seenTs: ""
   property string note: ""           // transient status line (send result, errors)
   property int cursor: -1            // keyboard row selection in list view
+  // Split view: the thread on screen because the cursor RESTED on its row, not
+  // because the reader chose it. Read marks wait until they commit — Enter, a
+  // click or typing all put focus in the compose field, which clears this.
+  property bool peeking: false
+  // Chat of the cursor row, so every row answers "am I the cursor?" with one
+  // string compare instead of an O(n) scan of threads per row per keypress.
+  readonly property string cursorChat: cursor >= 0 && cursor < threads.length ? String(threads[cursor].chat) : ""
+  // The row drawing the keyboard cursor right now — a thread row, pinned tile,
+  // search hit or contact hit registers itself when its hasCursor turns true,
+  // so the move functions never translate indexes between the four models.
+  // A destroyed row reads back as null (guarded QObject property).
+  property Item cursorRow: null
+  // The cursor is kept while the search field holds focus (Esc and Down
+  // return to it), but a row must not LOOK selected while typing happens
+  // elsewhere — Up from the top and a click in the field both got here.
+  readonly property bool cursorShown: !searchField.activeFocus
+  // The bubble the arrows have selected in a conversation (-1 = none) and the
+  // delegate drawing it — registered by the row itself, like cursorRow. The
+  // selection is a TARGET for actions (copy, open, reply), not a scroll state.
+  property int bubbleCursor: -1
+  property Item bubbleCursorItem: null
+  onBubblesChanged: clearBubbleCursor()   // a reload renumbers the rows
   property bool pinToBottom: false   // scroll to the newest bubble once layout settles
   property bool bubbleFocused: false // a bubble's TextEdit has focus (text selection in progress)
   property string threadRunningChat: "" // chat owned by the current threadProc
@@ -217,14 +324,21 @@ FocusScope {
   property string pendingThreadChat: "" // latest chat requested while it runs
   property string sendChat: ""          // immutable context for the current send
   property string sendText: ""
+  property string sendLocalId: ""
+  property int nextSendId: 0
+  property int pendingRevision: 0
+  property int threadPendingRevision: 0
+  property string sendStamp: ""         // local "YYYY-MM-DD HH:mm:ss" the current send was typed at
+  // Text sends queue instead of refusing while one is on the wire; each gets
+  // its bubble the instant Enter is pressed (see pendingSends).
+  property var sendQueue: []
+  // Sends the Mac has not written a row for yet, {chat, text, ts}. Every
+  // thread reload carries them to thread.ts (--pending-stdin, never argv),
+  // which keeps their bubbles until the real row lands. Memory only.
+  property var pendingSends: []
+  property int reloadTries: 0            // post-send reloads still waiting for the row
   property string reloadChat: ""
 
-  function threadIndex(thread) {
-    for (var i = 0; i < root.threads.length; i++) {
-      if (String(root.threads[i].chat) === String(thread.chat)) return i
-    }
-    return -1
-  }
   function avatarInitials(thread) {
     var n = String(thread.name || "")
     if (/^[+0-9]/.test(n) || n === "") return "#"
@@ -233,7 +347,8 @@ FocusScope {
     return (parts[0][0] + (parts.length > 1 ? parts[parts.length - 1][0] : "")).toUpperCase()
   }
 
-  readonly property bool inThread: active !== null
+  readonly property bool contactsOpen: contactReview.opened
+  readonly property bool inThread: active !== null && !contactReview.opened
   // last_ts of the open conversation as of its last load — the push watcher
   // refreshes the thread list, and when OUR thread advances, the bubbles
   // reload themselves. The guard makes unchanged refreshes free.
@@ -293,14 +408,37 @@ FocusScope {
     return /^\+?[0-9]{5,}$/.test(c) || c.indexOf("@") > 0
   }
 
-  /** Back to the list view, scrolled to top — the host calls this on open. */
-  function resetToList() {
+  // Unsent compose text per chat id. It lives on the host (BarWidget.draftCache)
+  // so the panel and the app window share it, and in memory only: message text
+  // never lands on disk. Written in place: nothing binds to the map, so there
+  // is no copy to make and no change to signal.
+  readonly property var drafts: hostWidget ? hostWidget.draftCache : ({})
+
+  /** Drop the thread on screen, peeked or opened: the pane is empty again, a
+   *  load still in flight is ignored when it lands, and a share sheet over it
+   *  goes too (it belonged to the link you were looking at). */
+  function clearThread() {
+    closeShare()
+    peekTimer.stop()
+    peeking = false
     active = null
     bubbles = []
     note = ""
-    cursor = -1
     loading = false
     pendingThreadChat = ""
+  }
+  /** Leaving the list for the search or new-message field: a thread that was
+   *  only peeked goes; one opened on purpose stays. */
+  function endPeek() {
+    peekTimer.stop()
+    if (peeking) clearThread()
+  }
+
+  /** Back to the list view, scrolled to top — the host calls this on open. */
+  function resetToList() {
+    clearThread()
+    contactReview.opened = false
+    cursor = -1
     composeField.text = ""
     searching = false
     searchResults = []
@@ -317,31 +455,64 @@ FocusScope {
   }
 
   function back() {
-    active = null
-    bubbles = []
-    note = ""
-    loading = false
-    pendingThreadChat = ""
+    clearThread()
     composeField.text = ""
     clearDraft()   // a queued file must never survive into another thread
     pinToBottom = false
-    Qt.callLater(function() { threadFlick.contentY = 0; root.navigationFocusRequested() })
+    // Top of the list for a mouse user; the cursor row for a keyboard user.
+    Qt.callLater(function() {
+      threadFlick.contentY = 0
+      scrollCursorIntoView()
+      root.navigationFocusRequested()
+    })
   }
 
+  function isShowing(t) { return inThread && String(active.chat) === String(t.chat) }
   function openThread(t) {
     if (!t) return
+    // A sheet opened over the PREVIOUS conversation (an arriving link opens it
+    // by itself) otherwise floats over this one, offering a QR for a link that
+    // is no longer on screen. Found by driving the live panel, 2026-09-07.
+    closeShare()
+    // Enter on the row already peeked commits it (the compose field's focus
+    // handler marks it read) without reloading what is on screen.
+    if (!(peeking && isShowing(t))) { peeking = false; showThread(t) }
+    Qt.callLater(function() { composeField.forceActiveFocus() })
+  }
+  /** peekTimer fired (split view only): show the cursor row's thread the way
+   *  Messages' sidebar does, but leave focus in the list and the dot alone. */
+  function peekCursor() {
+    var t = threads[cursor]
+    if (!t || !cursorShown || isShowing(t)) return   // no cursor shown, no peek
+    peeking = true
+    showThread(t)
+  }
+  function commitPeek() {
+    if (!peeking) return
+    peeking = false
+    // A load still running marks it on completion (peeking is false by then).
+    if (!loading) markRead(String(active.chat), seenTs)
+  }
+  /** The one gate for "this thread was looked at": a surface that marks read,
+   *  and not a thread merely peeked. */
+  function markRead(chat, seen) {
+    if (hostWidget && readActive && !peeking) hostWidget.markThreadRead(chat, seen)
+  }
+  function showThread(t) {
     active = t
     activeLastTs = String(t.last_ts || "")
     bubbles = []
     bubblesJson = ""
+    rendered = false
+    seenTs = ""
     firstLoad = true
     pushPending = false
     note = ""
     loading = true
-    composeField.text = ""
+    composeField.text = drafts[String(t.chat)] || ""   // this conversation's unsent text
+    composeField.cursorPosition = composeField.length
     clearDraft()   // a queued file must never survive into another thread
     requestThreadLoad(String(t.chat))
-    Qt.callLater(function() { composeField.forceActiveFocus() })
   }
 
   function requestThreadLoad(chat) {
@@ -353,17 +524,123 @@ FocusScope {
     if (threadProc.running || pendingThreadChat === "") return
     threadRunningChat = pendingThreadChat
     pendingThreadChat = ""
+    root.threadPendingRevision = root.pendingRevision
+    var pending = root.pendingSends.filter(function(p) { return p.chat === threadRunningChat })
     threadProc.command = ["bun", root.threadScript, threadRunningChat, "80",
                           "--time-format", root.timeFormat,
                           "--date-format", root.dateFormat,
                           "--date-format-with-year", root.dateFormatWithYear]
-    threadProc.running = true
+                         .concat(pending.length ? ["--pending-stdin"] : [])
+    if (pending.length) {
+      // In-flight sends ride stdin (message text never in argv) so their
+      // bubbles survive the reload until the Mac has the row.
+      threadProc.stdinEnabled = true
+      threadProc.running = true
+      threadProc.write(JSON.stringify(pending))
+      threadProc.stdinEnabled = false
+    } else {
+      threadProc.running = true
+    }
   }
 
   /** IPC test hook: drive the exact user send path minus the keyboard.
    *  Keystroke injection (wtype) proved non-deterministic — a virtual
    *  keyboard's events can land on whatever surface Hyprland favors. */
   /** Clear every badge/dot locally. Read state never goes back to iMessage. */
+  /** Move the conversation by dy pixels — the wheel and the keys share this,
+   *  so the bottom-stick (which gates the deferred push reload) behaves the
+   *  same whichever way the reader moves. */
+  function scrollConversation(dy) {
+    var max = Math.max(0, flick.contentHeight - flick.height)
+    flick.contentY = Math.max(0, Math.min(max, flick.contentY + dy))
+    flick.stick = flick.contentY >= max - 4
+  }
+  /** Up/Down in an empty compose field walk the bubbles, newest first, and
+   *  keep the selected one in view. Down past the newest drops the selection
+   *  and re-sticks to the bottom, so the conversation follows new messages
+   *  again — the reader is back where they started. */
+  function moveBubbleCursor(dy) {
+    var n = bubbles.length
+    if (n === 0) return
+    if (bubbleCursor < 0) {
+      if (dy > 0) return
+      bubbleCursor = n - 1
+    } else if (dy > 0 && bubbleCursor >= n - 1) {
+      leaveBubbles()
+      return
+    } else {
+      bubbleCursor = Math.max(0, bubbleCursor + dy)
+    }
+    revealBubbleCursor()
+  }
+  /** PgUp/PgDn walk the bubbles a screen at a time, and unlike the arrows
+   *  they work with text in the compose field (they move no caret). PgUp
+   *  selects the topmost visible bubble; already there, it pages up first.
+   *  PgDn mirrors it with the bottommost, and past the newest leaves. */
+  function pageBubbles(dy) {
+    if (bubbles.length === 0) return
+    var items = repeaterItems(bubbleRepeater)
+    var edge = edgeVisible(flick, items, dy)
+    if (edge === bubbleCursor && bubbleCursorItem) {
+      if (dy > 0 && edge === bubbles.length - 1) { leaveBubbles(); return }
+      // Page so the selected row lands at the OPPOSITE edge — a screen with
+      // one row of overlap, the way a pager turns a page.
+      var it = bubbleCursorItem, margin = Style.space(6)
+      scrollConversation(dy < 0 ? it.y + it.height + margin - flick.height - flick.contentY
+                                : it.y - margin - flick.contentY)
+      edge = edgeVisible(flick, items, dy)
+    }
+    if (edge < 0) return
+    bubbleCursor = edge
+    revealBubbleCursor()
+  }
+  function revealBubbleCursor() {
+    var it = bubbleCursorItem   // set synchronously by the row's hasCursor binding
+    if (!it) return
+    var margin = Style.space(6)
+    if (it.y < flick.contentY + margin)
+      scrollConversation(it.y - margin - flick.contentY)
+    else if (it.y + it.height > flick.contentY + flick.height - margin)
+      scrollConversation(it.y + it.height + margin - flick.height - flick.contentY)
+  }
+  function clearBubbleCursor() { bubbleCursor = -1; bubbleCursorItem = null }
+  /** Out of the selection and back where reading started: newest at the
+   *  bottom, stick re-armed. Down past the newest and Esc both land here. */
+  function leaveBubbles() {
+    clearBubbleCursor()
+    scrollConversation(flick.contentHeight)
+  }
+  function selectedBubble() {
+    return bubbleCursor >= 0 && bubbleCursor < bubbles.length ? bubbles[bubbleCursor] : null
+  }
+  /** Enter on the selected bubble: its first attachment, else its link card,
+   *  else the first URL in its text — the same handlers a click reaches. */
+  function openBubble(b) {
+    if (b.attachments && b.attachments.length > 0) { openAttachment(b.attachments[0]); return }
+    // A link goes to the share sheet, not straight to the browser: the sheet
+    // shows the host and the URL and makes opening a deliberate second step.
+    var urls = allUrls(b.text)
+    if (b.link && b.link.url && urls.indexOf(String(b.link.url)) < 0) urls.unshift(String(b.link.url))
+    openShare(urls, false)
+  }
+  /** Ctrl+C on the selected bubble: its text, or — for a bubble that is only
+   *  a picture — the first image attachment, as an image. */
+  function copyBubble(b) {
+    var t = String(b.text || "")
+    if (t !== "") { copyText(t); return }
+    var atts = b.attachments || []
+    for (var i = 0; i < atts.length; i++) {
+      if (isImageMime(atts[i].mime)) { copyAttachment(atts[i]); return }
+    }
+  }
+  /** Ctrl+R: quote the selected bubble into the compose field. iMessage's
+   *  inline reply is not reachable through the bridge (no message GUID leaves
+   *  the Mac and AppleScript has no reply-to), so this is a plain "> quote". */
+  function quoteBubble(b) {
+    composeField.text = "> " + String(b.text || "").replace(/\s+/g, " ").slice(0, 200) + "\n"
+    composeField.cursorPosition = composeField.length
+    leaveBubbles()
+  }
   function markAllRead() {
     if (!root.hostWidget || root.unread === 0) return
     root.hostWidget.markAllRead()
@@ -384,6 +661,36 @@ FocusScope {
     var s = ""
     for (var i = 0; i < (list || []).length; i++) s += list[i].emoji
     return s
+  }
+  // The tapback pill, overlapping the top corner opposite the tail. One
+  // definition for the text bubble and for the attachments: a picture-only
+  // message hides its text bubble, so the pill sits on the picture (or the
+  // file chip) itself, or the reaction is never seen.
+  component TapbackPill: Rectangle {
+    id: pill
+    property bool mine: false
+    property var tapbacks: []
+    visible: (tapbacks || []).length > 0
+    width: Math.ceil(pillText.implicitWidth) + Style.space(12)
+    height: Math.ceil(pillText.implicitHeight) + Style.space(8)
+    radius: height / 2
+    color: mine ? Qt.darker(root.mineFill, 2.2) : root.mineFill
+    border.color: Qt.rgba(0, 0, 0, 0.5)
+    border.width: 2
+    z: 2
+    anchors.top: parent.top
+    anchors.topMargin: -Style.space(12)
+    anchors.right: mine ? undefined : parent.right
+    anchors.rightMargin: mine ? 0 : -Style.space(6)
+    anchors.left: mine ? parent.left : undefined
+    anchors.leftMargin: mine ? -Style.space(6) : 0
+    Text {
+      id: pillText
+      anchors.centerIn: parent
+      text: root.tapbackRow(pill.tapbacks)
+      textFormat: Text.PlainText
+      font.pixelSize: root.fontCaption
+    }
   }
 
   // ---------------------------------------------------- attachment fetching
@@ -429,8 +736,12 @@ FocusScope {
   function pumpPreview() {
     if (previewProc.running || previewQueue.length === 0) return
     previewProc.url = previewQueue.shift()
-    previewProc.command = ["bun", root.previewScript, previewProc.url]
+    // The URL is message content: stdin, never argv (Astra #6).
+    previewProc.command = ["bun", root.previewScript, "--stdin"]
+    previewProc.stdinEnabled = true
     previewProc.running = true
+    previewProc.write(previewProc.url)
+    previewProc.stdinEnabled = false
   }
   Process {
     id: previewProc
@@ -452,17 +763,33 @@ FocusScope {
     onExited: Qt.callLater(root.pumpPreview)
   }
 
-  property var avatarFiles: ({})     // handle → file:// url, "" = no photo
+  // handle → file:// url, "" = no photo. Lives on the host (BarWidget.avatarCache)
+  // like the drafts: the app window is rebuilt on every show, and a map kept
+  // here started empty each time, so every SUPER+M fetched every photo again.
+  property var localAvatarFiles: ({})
+  readonly property var avatarFiles: hostWidget ? hostWidget.avatarCache : localAvatarFiles
+  function putAvatarFiles(m) {
+    if (hostWidget) hostWidget.avatarCache = m
+    else localAvatarFiles = m
+  }
+  function setAvatar(handle, url) {
+    var m = Object.assign({}, root.avatarFiles)
+    m[handle] = url
+    root.putAvatarFiles(m)
+  }
   property var avatarQueue: []
+  property var avatarInFlight: []
   function requestAvatar(handle) {
     handle = String(handle || "")
     if (handle === "") return          // groups are welcome: avatar.ts asks for the group's own photo
-    if (avatarFiles[handle] !== undefined || avatarQueue.indexOf(handle) >= 0) return
+    if (avatarFiles[handle] !== undefined || avatarQueue.indexOf(handle) >= 0 || avatarInFlight.indexOf(handle) >= 0) return
     avatarQueue.push(handle)
-    pumpAvatar()
+    // Rows ask as they are created; callLater lets one frame's worth of rows
+    // share a single batch instead of the first row going alone.
+    Qt.callLater(root.pumpAvatar)
   }
   // Letters stick in avatarFiles as "". Opening the panel/window again drops
-  // those and re-asks, so a photo set a minute ago is not stuck until tomorrow.
+  // those and re-asks, so a photo set a few minutes ago is not stuck until tomorrow.
   function retryBareAvatars() {
     var m = Object.assign({}, root.avatarFiles)
     var keys = []
@@ -470,32 +797,49 @@ FocusScope {
       if (m[k] === "") { keys.push(k); delete m[k] }
     }
     if (keys.length === 0) return
-    root.avatarFiles = m
+    root.putAvatarFiles(m)
     for (var i = 0; i < keys.length; i++) root.requestAvatar(keys[i])
   }
   onSurfaceOpenChanged: if (surfaceOpen) root.retryBareAvatars()
   function pumpAvatar() {
     if (avatarProc.running || avatarQueue.length === 0) return
-    avatarProc.handle = avatarQueue.shift()
-    // --retry skips the 24h "no photo" marker so a picture set after the
-    // first ask (a new group photo, a Contacts card) shows up this session.
-    avatarProc.command = ["bun", root.avatarScript, "--retry", avatarProc.handle]
+    avatarInFlight = avatarQueue.slice(0, 1024)
+    avatarQueue = avatarQueue.slice(avatarInFlight.length)
+    // One process answers the whole batch: disk hits first, the Mac only for
+    // the rest. --retry trusts a "no photo" marker for 15 minutes rather than
+    // a day, so a picture set after the first ask still shows up. Handles go
+    // on stdin, one per line.
+    avatarProc.command = ["bun", root.avatarScript, "--batch", "--retry"]
+    avatarProc.stdinEnabled = true
     avatarProc.running = true
+    avatarProc.write(avatarInFlight.join("\n") + "\n")
+    avatarProc.stdinEnabled = false
   }
   Process {
     id: avatarProc
-    property string handle: ""
-    stdout: StdioCollector {
-      onStreamFinished: {
-        var url = ""
-        try { var d = JSON.parse(text.trim()); if (d.ok === true) url = String(d.url || "") } catch (e) {}
-        var m = Object.assign({}, root.avatarFiles)
-        m[avatarProc.handle] = url
-        root.avatarFiles = m
-        root.pumpAvatar()
+    // One JSON line per handle, as each is answered, so cached photos land
+    // while the misses still wait on the Mac. The handle rides in the line.
+    stdout: SplitParser {
+      onRead: function(line) {
+        try {
+          var d = JSON.parse(String(line))
+          if (typeof d.handle === "string" && root.avatarInFlight.indexOf(d.handle) >= 0)
+            root.setAvatar(d.handle, d.ok === true ? String(d.url || "") : "")
+        } catch (e) {}
       }
     }
-    onExited: Qt.callLater(root.pumpAvatar)
+    onExited: {
+      // Anything the run never answered (it crashed, bun is missing) becomes
+      // letters, which the next open retries, instead of never being asked again.
+      var m = null
+      for (var i = 0; i < root.avatarInFlight.length; i++) {
+        var h = root.avatarInFlight[i]
+        if (root.avatarFiles[h] === undefined) { m = m || Object.assign({}, root.avatarFiles); m[h] = "" }
+      }
+      if (m) root.putAvatarFiles(m)
+      root.avatarInFlight = []
+      Qt.callLater(root.pumpAvatar)
+    }
   }
   /** Only media/documents are handed to xdg-open. Anything a sender could
    *  make executable (scripts, .desktop, unknown blobs) is saved and named,
@@ -506,29 +850,31 @@ FocusScope {
            m === "application/pdf" || m === "text/plain" || m === "text/vcard" || m === "text/calendar"
   }
 
-  function enqueueFetch(att, openWhenDone, auto) {
+  /** action: "" = just cache it, "open" = xdg-open when it lands, "copy" =
+   *  put it on the clipboard when it lands. */
+  function enqueueFetch(att, action, auto) {
     var id = String(att.id || "")
     if (id === "" || fetchingId === id) return
-    if (attFiles[id] !== undefined && !openWhenDone) return
+    if (attFiles[id] !== undefined && !action) return
     for (var i = 0; i < fetchQueue.length; i++) {
       if (fetchQueue[i].id === id) {
-        if (openWhenDone) fetchQueue[i].open = true
+        if (action) fetchQueue[i].action = action
         return
       }
     }
     fetchQueue.push({ id: id, name: String(att.name || "file"),
-                      mime: String(att.mime || ""), open: openWhenDone === true,
+                      mime: String(att.mime || ""), action: action || "",
                       auto: auto === true })
     pumpFetch()
   }
 
-  property bool fetchJobOpen: false
+  property string fetchJobAction: ""
   property string fetchJobMime: ""
   function pumpFetch() {
     if (fetchProc.running || fetchQueue.length === 0) return
     var job = fetchQueue.shift()
     fetchingId = job.id
-    fetchJobOpen = job.open === true
+    fetchJobAction = job.action
     fetchJobMime = job.mime
     // Auto-pulls carry a hard transfer cap: claimed metadata is not the limit.
     fetchProc.command = ["bun", root.fetchScript, job.id, job.name, job.mime, job.auto ? "5242880" : ""]
@@ -553,11 +899,11 @@ FocusScope {
         // iPhone photos were rejected at both ends and simply never appeared.
         var b = atts[j].bytes
         if (isImageMime(atts[j].mime) && typeof b === "number" && b > 0 && b <= root.autoFetchMaxSource)
-          enqueueFetch(atts[j], false, true)
+          enqueueFetch(atts[j], "", true)
       }
       // link-card preview PNGs are small; the auto-fetch transfer cap bounds them
       var l = bubbles[i].link
-      if (l && l.image_id) enqueueFetch({ id: String(l.image_id), name: "preview.png", mime: "image/png", bytes: 0 }, false, true)
+      if (l && l.image_id) enqueueFetch({ id: String(l.image_id), name: "preview.png", mime: "image/png", bytes: 0 }, "", true)
     }
   }
 
@@ -570,7 +916,13 @@ FocusScope {
     if (attFiles[id] === "") {   // failed marker — clear it so a retry runs
       var m = Object.assign({}, attFiles); delete m[id]; attFiles = m
     }
-    enqueueFetch(att, true)
+    enqueueFetch(att, "open")
+  }
+  /** Ctrl+C on an image bubble: fetch-then-clipboard, the same round trip as
+   *  a click, ending in wl-copy with the image's own MIME type. */
+  function copyAttachment(att) {
+    if (String(att.id || "") === "") return
+    enqueueFetch(att, "copy")
   }
 
   // ------------------------------------------------------ compose attachment
@@ -600,7 +952,9 @@ FocusScope {
 
   function startNew() {
     if (inThread && !splitView) return   // split view: the list pane is right there
+    endPeek()
     exitSearch()
+    threadFlick.contentY = 0   // the field sits above the rows
     newMode = true
     newResults = []
     newNote = ""
@@ -612,6 +966,14 @@ FocusScope {
     })
   }
 
+  /** Down in an empty search or new-message field: back to the list, cursor
+   *  on the first row — the list is showing its top, so that is where the eye
+   *  is. Esc keeps the old cursor instead. */
+  function listFromTop() {
+    if (newMode) exitNew()
+    else exitSearch()
+    cursor = 0
+  }
   function exitNew() {
     newMode = false
     newResults = []
@@ -621,6 +983,9 @@ FocusScope {
     newField.text = ""
     newField.focus = false
     root.navigationFocusRequested()
+    // The field pushed the list to the top; bring the cursor row back once
+    // the rows have been rebuilt and laid out.
+    Qt.callLater(scrollCursorIntoView)
   }
 
   // Same identity discipline as message search: a stale completion must
@@ -647,6 +1012,7 @@ FocusScope {
     if (!newMode) return
     if (newFieldQuery() === "") {
       newSearchTimer.stop()
+      contactSeq++                      // an in-flight answer must not repopulate an emptied field (Astra A#5)
       newResults = []
       newNote = ""
       newQueryRan = ""
@@ -664,6 +1030,10 @@ FocusScope {
     // never shown as clickable rows under the newer query (Codex audit #5).
     if (contactProc.running) { contactSeq++; contactPending = q; return }
     contactSeq++
+    // The previous query's rows are not answers to THIS query: clear them so
+    // nothing stale is clickable — or Enter-able, since acceptNewField gates on
+    // newQueryRan, which is about to become q (Astra A#5).
+    if (q !== newQueryRan) { newResults = []; newCursor = 0 }
     newQueryRan = q
     newNote = "searching…"
     // The recency map names every conversation you have. argv is world-readable
@@ -685,7 +1055,11 @@ FocusScope {
   }
   function moveNewCursor(dy) {
     if (newResults.length === 0 || dy === 0) return
-    newCursor = (newCursor + dy + newResults.length) % newResults.length
+    // Up from the first hit brings the field (which already has focus) back
+    // into view, as moveCursor does for the thread list.
+    if (dy < 0 && newCursor <= 0) { threadFlick.contentY = 0; return }
+    newCursor = Math.max(0, Math.min(newResults.length - 1, newCursor + dy))
+    scrollCursorIntoView()
   }
 
   /** Start (or resume) a DM with a picked handle. An existing thread is
@@ -705,6 +1079,8 @@ FocusScope {
 
   function startSearch() {
     if (inThread && !splitView) return
+    endPeek()
+    threadFlick.contentY = 0   // the field sits above the rows
     searching = true
     searchResults = []
     searchNote = ""
@@ -723,6 +1099,7 @@ FocusScope {
     searchField.text = ""
     searchField.focus = false
     if (!newMode) root.navigationFocusRequested()
+    Qt.callLater(scrollCursorIntoView)   // no-op while the rows are gone
   }
 
   // Instant sidebar preview. search.ts matchConversations ranks the list
@@ -780,6 +1157,7 @@ FocusScope {
     var q = searchFieldQuery()
     if (q === "") {
       searchTimer.stop()
+      searchSeq++                       // same rule as the contact search (Astra A#5)
       searchResults = []
       searchNote = ""
       searchQueryRan = ""
@@ -795,7 +1173,9 @@ FocusScope {
   }
   function moveSearchCursor(dy) {
     if (searchResults.length === 0 || dy === 0) return
-    searchCursor = (searchCursor + dy + searchResults.length) % searchResults.length
+    if (dy < 0 && searchCursor <= 0) { threadFlick.contentY = 0; return }
+    searchCursor = Math.max(0, Math.min(searchResults.length - 1, searchCursor + dy))
+    scrollCursorIntoView()
   }
   function acceptSearchField() {
     var q = searchFieldQuery()
@@ -830,10 +1210,12 @@ FocusScope {
     searchSeq++
     searchQueryRan = q
     if (searchResults.length === 0) searchNote = "searching…"
-    searchProc.command = ["bun", root.searchScript, q, "40"]
+    // The query is message text once a sentence is pasted in: it rides the
+    // same stdin payload as the sidebar identities, never argv (Astra B#2).
+    searchProc.command = ["bun", root.searchScript, "--stdin", "40"]
     searchProc.stdinEnabled = true
     searchProc.running = true
-    searchProc.write(threadIdentitiesJson())
+    searchProc.write(JSON.stringify({ query: q, threads: JSON.parse(threadIdentitiesJson()) }))
     searchProc.stdinEnabled = false
   }
 
@@ -914,19 +1296,19 @@ FocusScope {
     }
 
     if (draftPath === "" && trimmed === "") return
-    if (sendProc.running || fileSendProc.running) {
-      note = "a message is already sending"
-      return
-    }
     if (!isSendable(root.active)) {
       note = "Read-only — group id unknown — send from your phone"
       return
     }
-    note = "sending…"
-    sendChat = String(root.active.chat)
-    sendText = text
 
     if (draftPath !== "") {
+      if (sendProc.running || fileSendProc.running) {
+        note = "a message is already sending"
+        return
+      }
+      note = "sending…"
+      sendChat = String(root.active.chat)
+      sendText = text
       // send-file.ts owns target resolution (group guid or DM handle).
       sendDraftPath = draftPath
       // caption on stdin — never in this process's argv (audit #4, war room #1/#13)
@@ -939,32 +1321,111 @@ FocusScope {
       return
     }
 
-    // Body on STDIN (--text-stdin), never argv: argv is readable by every
-    // process on this machine and travels through ssh into the Mac's ps.
+    // The bubble appears NOW; the Mac round trip (ssh, osascript, Messages
+    // writing the row) happens behind it. The field clears at once, so a
+    // second message can follow without waiting — sends queue in order.
+    var chat = String(root.active.chat)
+    var stamp = root.localStamp()
     var target = root.activeIsGroup
       ? ["--chat-id", String(root.active.guid)]
-      : ["--to", sendChat]
+      : ["--to", chat]
     // green-bubble (SMS/RCS) threads send on their own service (war room #2)
     var svc = String(root.active.service || "")
     if (!root.activeIsGroup && /^(SMS|RCS)$/i.test(svc)) target = target.concat(["--service", svc.toUpperCase()])
-    sendProc.command = [root.home + "/bin/imsg-send"].concat(target).concat(["--yes", "--text-stdin", "--keep-dashes"])
+    var localId = String(++root.nextSendId)
+    root.pendingRevision++
+    root.pendingSends = root.pendingSends.concat([{ chat: chat, text: text, ts: stamp, localId: localId }])
+    root.bubbles = root.appendPendingBubble(root.bubbles, text, stamp, localId)
+    root.pinToBottom = true
+    composeField.text = ""
+    note = ""
+    root.sendQueue = root.sendQueue.concat([{ chat: chat, text: text, stamp: stamp, localId: localId, target: target }])
+    pumpSend()
+  }
+
+  /** Local wall clock as a chat.db-style stamp; the pending bubble's ts. */
+  function localStamp() {
+    return Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm:ss")
+  }
+
+  /** The instant echo: thread.ts's pendingBubble() in miniature — enough to
+   *  draw the bubble in the right run with the right clock. Every reload
+   *  replaces it with the TypeScript version until the real row lands. */
+  function appendPendingBubble(list, text, stamp, localId) {
+    var out = (list || []).slice()
+    var prev = out.length ? out[out.length - 1] : null
+    var newDay = !prev || String(prev.ts || "").slice(0, 10) !== stamp.slice(0, 10)
+    var gapMin = prev ? (Date.parse(stamp.replace(" ", "T")) - Date.parse(String(prev.ts || "").replace(" ", "T"))) / 60000 : Infinity
+    var start = !prev || newDay || prev.from_me !== true || !(gapMin <= 15)
+    if (!start) { var p = Object.assign({}, prev); p.groupEnd = false; p.time = ""; out[out.length - 1] = p }
+    out.push({ localId: localId, ts: stamp, from_me: true, name: "", text: String(text).trim(), day: newDay ? "Today" : "",
+               groupStart: start, groupEnd: true, time: Qt.formatTime(new Date(), root.timeFormat),
+               receipt: "", tapbacks: [], attachments: [], replyText: "", replyMine: false, edited: false,
+               link: null, retracted: false, effect: "", audio: false, html: "", failed: false, pending: true })
+    return out
+  }
+
+  function failPending(chat, localId, reason, text, stamp) {
+    root.pendingRevision++
+    root.pendingSends = SendState.markSendFailed(root.pendingSends, localId, reason,
+      {chat: chat, localId: localId, text: text, ts: stamp})
+    if (root.inThread && String(root.active.chat) === chat) {
+      if (!root.bubbles.some(function(b) { return b.localId === localId }))
+        root.bubbles = root.appendPendingBubble(root.bubbles, text, stamp, localId)
+      root.bubbles = SendState.markSendFailed(root.bubbles, localId, reason)
+    }
+  }
+
+  /** Start the next queued text send when the wire is free. */
+  function pumpSend() {
+    if (sendProc.running || root.sendQueue.length === 0) return
+    var job = root.sendQueue[0]
+    root.sendQueue = root.sendQueue.slice(1)
+    root.sendChat = job.chat
+    root.sendText = job.text
+    root.sendStamp = job.stamp
+    root.sendLocalId = job.localId
+    sendProc.lastErr = ""
+    root.reloadTries = 0
+    // Body on STDIN (--text-stdin), never argv: argv is readable by every
+    // process on this machine and travels through ssh into the Mac's ps.
+    sendProc.command = [root.home + "/bin/imsg-send"].concat(job.target).concat(["--yes", "--text-stdin", "--keep-dashes"])
     sendProc.stdinEnabled = true
     sendProc.running = true
-    sendProc.write(text)
+    sendProc.write(job.text)
     sendProc.stdinEnabled = false
   }
 
-  Process { id: copyProc }
+  property string copyFeedback: ""
+  Process {
+    id: copyProc
+    onExited: function(code, status) {
+      copyTimeout.stop()
+      root.copyFeedback = code === 0 && status === 0 ? "Copied to clipboard" : "Could not copy to clipboard"
+      copyFeedbackTimer.restart()
+    }
+  }
+  Timer {
+    id: copyTimeout
+    interval: 5000
+    onTriggered: {
+      copyProc.running = false
+      root.copyFeedback = "Could not copy to clipboard"
+      copyFeedbackTimer.restart()
+    }
+  }
+  Timer { id: copyFeedbackTimer; interval: 2200; onTriggered: root.copyFeedback = "" }
   function copyText(t) {
     if (t === "") return
     // stdin, not argv: message text can be long and can start with "-".
-    copyProc.command = ["sh", "-c", "wl-copy"]
+    copyFeedback = ""
+    copyFeedbackTimer.stop()
+    copyTimeout.restart()
+    copyProc.command = ["/usr/bin/wl-copy"]
     copyProc.stdinEnabled = true
     copyProc.running = true
     copyProc.write(t)
     copyProc.stdinEnabled = false
-    note = "copied"
-    noteTimer.restart()
   }
   Timer { id: noteTimer; interval: 1500; onTriggered: if (root.note === "copied" || root.note === "sent to LocalSend") root.note = "" }
 
@@ -997,34 +1458,68 @@ FocusScope {
         // render into a hidden view or mark the thread read unseen.
         var belongsHere = root.surfaceOpen && root.inThread && String(root.active.chat) === root.threadRunningChat
         if (!belongsHere) return
+        // A send or failure happened after this request took its snapshot.
+        // Keep the current bubbles and request a fresh snapshot on exit.
+        if (root.threadPendingRevision !== root.pendingRevision) {
+          root.requestThreadLoad(root.threadRunningChat)
+          return
+        }
         root.loading = false
         try {
           var d = JSON.parse(text.trim())
           if (d.ok === true) {
             var list = Array.isArray(d.bubbles) ? d.bubbles : []
             var j = JSON.stringify(list)
+            // What the eye can now see: the newest ts in THIS snapshot — of
+            // real rows; a pending bubble carries this machine's clock.
+            var seen = ""
+            for (var k = 0; k < list.length; k++) {
+              if (list[k].pending === true) continue
+              var ts = String(list[k].ts || ""); if (ts > seen) seen = ts
+            }
+            // thread.ts hands back the sends it is still waiting on for this
+            // chat; keep asking for a few seconds, then leave it to the next
+            // ordinary reload (the bubble stays up either way).
+            if (Array.isArray(d.pending)) {
+              var chat = root.threadRunningChat
+              root.pendingSends = root.pendingSends.filter(function(p) { return p.chat !== chat }).concat(d.pending)
+              if (d.pending.some(function(p) { return p.failed !== true }) && root.reloadTries < 8) {
+                root.reloadTries++
+                root.reloadChat = chat
+                reloadTimer.restart()
+              } else {
+                root.reloadTries = 0
+              }
+            }
             if (j === root.bubblesJson) {
               // Nothing changed — do NOT rebuild the Repeater (a rebuild
               // resets scroll and re-decodes every image). Push pings mostly
               // produce identical content; this makes them free.
-              if (root.hostWidget && root.readActive) root.hostWidget.markThreadRead(root.threadRunningChat)
+              root.rendered = true
+              root.seenTs = seen
+              root.markRead(root.threadRunningChat, seen)
               return
             }
             root.bubblesJson = j
             root.bubbles = list
+            root.rendered = true
+            root.seenTs = seen
             // Pin only on the thread's FIRST load or when the user was
             // already at the bottom — never while they read history.
             root.pinToBottom = root.firstLoad || flick.stick
             root.firstLoad = false
             Qt.callLater(root.autoFetchImages)
-            // A dot means "looked at", so clear it only after content loaded.
-            if (root.hostWidget && root.readActive) root.hostWidget.markThreadRead(root.threadRunningChat)
+            // A dot means "looked at", so clear it only after content loaded —
+            // and only through what loaded, never the sidebar's newer ts.
+            root.markRead(root.threadRunningChat, seen)
           } else {
             root.bubbles = []
+            root.rendered = false
             root.note = String(d.error || "could not load this thread")
           }
         } catch (e) {
           root.bubbles = []
+          root.rendered = false
           root.note = "could not load this thread"
         }
       }
@@ -1048,27 +1543,31 @@ FocusScope {
     onExited: function(code, status) {
       var completedChat = root.sendChat
       var completedText = root.sendText
+      var completedStamp = root.sendStamp
+      var completedId = root.sendLocalId
       var belongsHere = root.inThread && String(root.active.chat) === completedChat
       root.sendChat = ""
       root.sendText = ""
+      root.sendStamp = ""
+      root.sendLocalId = ""
       if (code === 0) {
-        // A URL you just SHARED opens the sheet too (Fred, 2.3.0): send it,
-        // then offer the QR / LocalSend / copy for the same link.
-        var sentUrl = root.firstUrl(completedText)
-        if (belongsHere && sentUrl !== "") Qt.callLater(function() { root.openShare(sentUrl) })
-        if (belongsHere) {
-          root.note = ""
-          // Never erase a newer draft typed after this send began.
-          if (composeField.text === completedText) composeField.text = ""
-        }
-        // Give Messages.app a beat to write the row, then reload the thread.
+        // The bubble is already up; reload to swap it for the real row.
         root.reloadChat = completedChat
         reloadTimer.restart()
-      } else if (belongsHere) {
-        if (code === 69 || code === 255) root.note = "not sent — Mac unreachable"
-        else root.note = (sendProc.lastErr !== "" ? "send failed: " + sendProc.lastErr : "send failed (exit " + code + ")")
+      } else {
+        // Keep the failed bubble; put the words back in the field (unless a
+        // newer draft is there), and the reason is on the status line.
+        var reason = code === 69 || code === 255 ? "Mac unreachable"
+          : sendProc.lastErr !== "" ? sendProc.lastErr : "Send failed (exit " + code + ")"
+        root.failPending(completedChat, completedId, reason, completedText, completedStamp)
+        if (belongsHere) {
+          if (composeField.text === "") composeField.text = completedText
+          if (code === 69 || code === 255) root.note = "not sent — Mac unreachable"
+          else root.note = (sendProc.lastErr !== "" ? "send failed: " + sendProc.lastErr : "send failed (exit " + code + ")")
+        }
       }
       if (belongsHere) composeField.forceActiveFocus()
+      Qt.callLater(root.pumpSend)
     }
   }
 
@@ -1080,8 +1579,12 @@ FocusScope {
         var id = root.fetchingId
         try {
           var d = JSON.parse(text.trim())
+          // A copy fetches the ORIGINAL for the clipboard; the bubble keeps
+          // the preview it already draws. Swapping its source and metrics
+          // re-decodes and re-lays out the picture under the reader's eyes.
+          var keepInline = root.fetchJobAction === "copy" && !!root.attFiles[id]
           var m = Object.assign({}, root.attFiles)
-          m[id] = d.ok === true ? String(d.url || "") : ""
+          if (!keepInline) m[id] = d.ok === true ? String(d.url || "") : ""
           root.attFiles = m
           var ratio = Number(d.pixelRatio)
           var pixelWidth = Number(d.pixelWidth)
@@ -1089,10 +1592,20 @@ FocusScope {
           if (!isFinite(ratio) || ratio < 1 || ratio > 4) ratio = 1
           if (!isFinite(pixelWidth) || pixelWidth < 1 || pixelWidth > 100000) pixelWidth = 0
           if (!isFinite(pixelHeight) || pixelHeight < 1 || pixelHeight > 100000) pixelHeight = 0
-          var metrics = Object.assign({}, root.attMetrics)
-          metrics[id] = { pixelRatio: ratio, pixelWidth: pixelWidth, pixelHeight: pixelHeight }
-          root.attMetrics = metrics
-          if (d.ok === true && root.fetchJobOpen) {
+          if (!keepInline) {
+            var metrics = Object.assign({}, root.attMetrics)
+            metrics[id] = { pixelRatio: ratio, pixelWidth: pixelWidth, pixelHeight: pixelHeight }
+            root.attMetrics = metrics
+          }
+          if (d.ok === true && root.fetchJobAction === "copy") {
+            // The Mac converts HEIC/HEIF to JPEG on the way (fetch.ts wantsJpeg),
+            // so the clipboard type must say what the bytes are. Path and type
+            // travel as arguments, never interpolated into the script.
+            var mime = root.fetchJobMime === "image/heic" || root.fetchJobMime === "image/heif" ? "image/jpeg" : root.fetchJobMime
+            Quickshell.execDetached(["sh", "-c", 'wl-copy --type "$1" < "$2"', "sh", mime, String(d.path || "")])
+            root.note = "copied"
+            noteTimer.restart()
+          } else if (d.ok === true && root.fetchJobAction === "open") {
             if (root.openableMime(root.fetchJobMime)) {
               Quickshell.execDetached(["xdg-open", String(d.url || "")])
             } else {
@@ -1100,6 +1613,11 @@ FocusScope {
             }
           }
           if (d.ok !== true && d.online === false) root.note = "fetch failed — Mac unreachable"
+          // A click deserves the reason (a photo Messages in iCloud has not
+          // brought to the Mac yet reads as "no such attachment" otherwise);
+          // auto-pulls stay quiet so a scroll through old media is not a toast storm.
+          else if (d.ok !== true && root.fetchJobAction !== "")
+            root.note = "fetch failed — " + String(d.error || "unknown error").replace(/^error:\s*/, "")
         } catch (e) {
           var m2 = Object.assign({}, root.attFiles)
           m2[id] = ""
@@ -1277,22 +1795,134 @@ FocusScope {
       root.runSearch()
     }
   }
+  // A cursor that rests on a row for a beat shows that thread (Messages'
+  // sidebar behaviour). Restarted on every move, so a held arrow key does not
+  // start a load per row; the thread loader's latest-wins queue drops whatever
+  // a fast scroll still managed to start.
+  Timer { id: peekTimer; interval: 250; onTriggered: root.peekCursor() }
   Timer {
     id: reloadTimer
-    interval: 1500
+    // Messages usually has the row within a few hundred ms of osascript
+    // returning; a reload that beats it keeps the pending bubble (thread.ts)
+    // and tries again. No `loading` flag: the bubble is already on screen,
+    // and a "loading…" flash after every send is the thing we are removing.
+    interval: 600
     onTriggered: if (root.inThread && String(root.active.chat) === root.reloadChat) {
-      root.loading = true
       root.requestThreadLoad(root.reloadChat)
     }
   }
 
-  // ---- keyboard navigation (the host's PanelKeyCatcher calls these)
+  // ---- keyboard navigation (the host's PanelKeyCatcher calls these).
+  // The cursor stops at the ends rather than wrapping: with 300 threads a
+  // press past the last row landing at the top reads as a jump, not a loop
+  // (Omarchy's Dropdown clamps the same way).
   function moveCursor(dy) {
-    if (inThread || threads.length === 0 || dy === 0) return
-    cursor = (cursor + dy + threads.length) % threads.length
+    if (contactReview.opened || !listShowing || threads.length === 0 || dy === 0) return
+    // Up from the first row hands focus to the search field above the list,
+    // and Down in an empty field hands it back (Omarchy's SearchableDropdown).
+    if (dy < 0 && cursor <= 0) { startSearch(); return }
+    cursor = Math.max(0, Math.min(threads.length - 1, cursor + dy))
+    cursorMoved()
+  }
+  /** Every way the thread cursor moves ends here: keep the row in view and,
+   *  in split view, arm the preview — arrows, paging and Home/End alike. */
+  function cursorMoved() {
+    scrollCursorIntoView()
+    if (splitView) peekTimer.restart()
+  }
+  // Keep the cursor row inside threadFlick's viewport. The list is a
+  // multi-section Column (pinned grid, headers, three Repeaters), so there is
+  // no ListView.positionViewAtIndex — same helper as Omarchy's audio and
+  // tailscale panels. Synchronous: a cursor move does not touch the model, so
+  // the row is already laid out, and the binding that set cursorRow ran
+  // before the caller reached this line.
+  function scrollCursorIntoView() {
+    var row = cursorRow
+    if (!row) return
+    var margin = Style.space(6)
+    var top = row.mapToItem(threadFlick.contentItem, 0, 0).y
+    var bottom = top + row.height
+    var maxY = Math.max(0, threadFlick.contentHeight - threadFlick.height)
+    if (top < threadFlick.contentY + margin)
+      threadFlick.contentY = Math.max(0, top - margin)
+    else if (bottom > threadFlick.contentY + threadFlick.height - margin)
+      threadFlick.contentY = Math.min(maxY, bottom + margin - threadFlick.height)
   }
   function activateCursor() {
-    if (!inThread && cursor >= 0) openThread(threads[cursor])
+    if (listShowing && cursor >= 0) openThread(threads[cursor])
+  }
+  // ---- paging: PgUp/PgDn select the row at the edge of the viewport, and
+  // page a screen (one row of overlap) when the cursor is already there;
+  // Home/End take the first/last row. Omarchy's menu, clipboard and emoji
+  // lists bind the same four keys. Whichever of the three lists is showing
+  // — new-message hits, search hits, threads — is the one that moves.
+  function repeaterItems(rep) {
+    var out = []
+    for (var i = 0; i < rep.count; i++) out.push(rep.itemAt(i))
+    return out
+  }
+  /** Index into `items` of the topmost (dy < 0) or bottommost (dy > 0) row
+   *  wholly inside `fl`'s viewport; a partly visible row is the fallback
+   *  (a row taller than the view); -1 when nothing is laid out. Wholly, not
+   *  partly: a sliver of the neighbour above the cursor must not count, or
+   *  the next PgUp steps one row instead of paging. */
+  function edgeVisible(fl, items, dy) {
+    var top = fl.contentY, bottom = top + fl.height, partial = -1
+    for (var k = 0; k < items.length; k++) {
+      var i = dy < 0 ? k : items.length - 1 - k
+      var it = items[i]
+      if (!it) continue
+      var y = it.mapToItem(fl.contentItem, 0, 0).y
+      if (y >= bottom || y + it.height <= top) continue
+      if (partial < 0) partial = i
+      if (dy < 0 ? y >= top - 1 : y + it.height <= bottom + 1) return i
+    }
+    return partial
+  }
+  /** The row PgUp/PgDn lands on: the edge row, or — when the cursor already
+   *  sits there — the edge row after paging so the cursor row lands at the
+   *  opposite edge. null when the list has nothing laid out. */
+  function pageTo(fl, items, currentItem, dy) {
+    var edge = edgeVisible(fl, items, dy)
+    if (edge >= 0 && items[edge] === currentItem) {
+      var y = currentItem.mapToItem(fl.contentItem, 0, 0).y, m = Style.space(6)
+      var max = Math.max(0, fl.contentHeight - fl.height)
+      fl.contentY = Math.max(0, Math.min(max, dy < 0 ? y + currentItem.height + m - fl.height : y - m))
+      edge = edgeVisible(fl, items, dy)
+    }
+    return edge >= 0 ? items[edge] : null
+  }
+  function indexOfChat(chat) {
+    for (var i = 0; i < threads.length; i++) if (String(threads[i].chat) === String(chat)) return i
+    return -1
+  }
+  // Which of the three lists the paging keys drive, answered once per press:
+  // its rows, its length, how a landed row maps back to a cursor index
+  // (search/new rows carry their model index; a thread row is found by chat,
+  // since the thread list is two Repeaters), and how its cursor is set.
+  function activeList() {
+    if (newMode) return { items: repeaterItems(newRepeater), count: newResults.length,
+      indexOf: function(it) { return it.index }, set: function(i) { newCursor = i; scrollCursorIntoView() } }
+    if (searchShowing) return { items: repeaterItems(searchRepeater), count: searchResults.length,
+      indexOf: function(it) { return it.index }, set: function(i) { searchCursor = i; scrollCursorIntoView() } }
+    return { items: repeaterItems(pinnedRepeater).concat(repeaterItems(chronologicalRepeater)), count: threads.length,
+      indexOf: function(it) { return indexOfChat(it.modelData.chat) }, set: function(i) { cursor = i; cursorMoved() } }
+  }
+  function pageActive(dy) {
+    var l = activeList(), it = pageTo(threadFlick, l.items, cursorRow, dy)
+    if (it) l.set(l.indexOf(it))
+  }
+  function jumpActive(toEnd) {
+    var l = activeList()
+    if (l.count > 0) l.set(toEnd ? l.count - 1 : 0)
+  }
+  /** PgUp/PgDn/Home/End for whichever list is showing; true if consumed. */
+  function catchPagingKey(key) {
+    if (key === Qt.Key_PageUp) { pageActive(-1); return true }
+    if (key === Qt.Key_PageDown) { pageActive(1); return true }
+    if (key === Qt.Key_Home) { jumpActive(false); return true }
+    if (key === Qt.Key_End) { jumpActive(true); return true }
+    return false
   }
   function handleTextKey(text) {
     if (text === "/") { startSearch(); return true }
@@ -1310,6 +1940,7 @@ FocusScope {
     return false
   }
   function catchNavText(text) {
+    if (contactReview.opened) return false
     var jump = text === "/" || text === "n" || text === "N"
       || (text >= "1" && text <= "9")
     if (!jump) return false
@@ -1317,6 +1948,29 @@ FocusScope {
     if (composeField.activeFocus && (composeField.text.length > 0 || root.draftPath !== ""))
       return false
     return handleTextKey(text) === true
+  }
+  /** Arrow/Enter list navigation for a host without a PanelKeyCatcher (the
+   *  window): true if the key was consumed. A focused editor keeps its arrows
+   *  — the search and new-message fields drive their own cursors. */
+  function catchNavKey(key) {
+    if (editorActive) return false
+    if (key === Qt.Key_Down) { moveCursor(1); return true }
+    if (key === Qt.Key_Up) { moveCursor(-1); return true }
+    if (key === Qt.Key_Return || key === Qt.Key_Enter) { activateCursor(); return true }
+    // Right = into the right pane: focus the compose field of the thread on
+    // screen (which commits a peek). Left in an EMPTY compose field comes back.
+    if (key === Qt.Key_Right && inThread) { composeField.forceActiveFocus(); return true }
+    return listShowing && catchPagingKey(key)
+  }
+  /** List-mode focus holder. The panel's PanelKeyCatcher takes the arrows,
+   *  Enter and letters BEFORE the focused item and lets the rest fall
+   *  through; parking focus here (rather than on the catcher itself) is what
+   *  lets PgUp/PgDn/Home/End reach the list. The window's navCatcher does
+   *  the same job with its own handler. */
+  readonly property alias navigationKeys: navKeys
+  Item {
+    id: navKeys
+    Keys.onPressed: function(event) { if (root.catchNavKey(event.key)) event.accepted = true }
   }
   function catchEscape() {
     if (newField.activeFocus || newMode) { exitNew(); return true }
@@ -1326,13 +1980,15 @@ FocusScope {
   /** Esc semantics for a host without a PanelKeyCatcher (the window): true if
    *  something was unwound, false if the host should close. */
   function unwind() {
+    if (contactReview.opened) { contactReview.back(); return true }
     if (shareUrl !== "") { closeShare(); return true }
     if (catchEscape()) return true
     if (inThread) { back(); return true }
     return false
   }
   function focusDefault() {
-    if (inThread) composeField.forceActiveFocus()
+    if (contactReview.opened) contactReview.forceActiveFocus()
+    else if (inThread) composeField.forceActiveFocus()
     else navigationFocusRequested()
   }
 
@@ -1344,6 +2000,7 @@ FocusScope {
 
   RowLayout {
     anchors.fill: parent
+    visible: !contactReview.opened
     spacing: 0
 
     // ------------------------------------------------------- thread pane
@@ -1362,15 +2019,57 @@ FocusScope {
         anchors.topMargin: root.splitView ? Style.space(10) : 0
         anchors.bottomMargin: root.splitView ? Style.space(10) : 0
         spacing: Style.space(root.splitView ? 14 : 8)
-        PanelHero {
+        RowLayout {
           Layout.fillWidth: true
-          title: "Blip"
-          meta: (!root.online
-                ? "Mac unreachable — bridge offline"
-                : (root.unread > 0 ? root.unread + " unread" : "all caught up"))
-          detail: ""   // Fred: not needed — and it squeezed the title to "B…"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
+          spacing: Style.space(8)
+          Text {
+            text: "Blip"
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: root.fontTitle
+            font.bold: true
+          }
+          Text {
+            Layout.fillWidth: true
+            text: (!root.online ? "Mac unreachable — bridge offline"
+              : root.unread > 0 ? root.unread + " unread" : "all caught up").toUpperCase()
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: root.fontCaption
+            font.bold: true
+            font.letterSpacing: 1.2
+            elide: Text.ElideRight
+          }
+          Text {
+            visible: root.version !== ""
+            text: root.version
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: root.fontCaption
+          }
+          PanelActionButton {
+            visible: root.online && !root.newMode && !root.searchShowing
+            iconText: "＋"
+            tooltipText: "New message (n)"
+            bordered: true
+            foreground: root.foreground
+            hoverColor: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.startNew()
+          }
+          PanelActionButton {
+            visible: root.online && !root.splitView
+            iconText: "⇱"
+            tooltipText: "Open the app window"
+            bordered: true
+            foreground: root.foreground
+            hoverColor: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.openApp()
+          }
         }
 
         PanelSeparator { Layout.fillWidth: true; foreground: root.foreground }
@@ -1415,7 +2114,9 @@ FocusScope {
           ColumnLayout {
             id: listContent
             width: parent.width
-            spacing: root.inThread ? Style.space(2) : Style.space(root.splitView ? 10 : 6)
+            // One spacing in split view: inThread flips there with every preview,
+            // and the sidebar must not shift. The popout tightens up in a thread.
+            spacing: root.splitView ? Style.space(10) : (root.inThread ? Style.space(2) : Style.space(6))
 
             // ------------------------------------------------- OFFLINE
             Text {
@@ -1448,36 +2149,12 @@ FocusScope {
             RowLayout {
               Layout.fillWidth: true
               visible: root.online && root.listShowing
+                && (root.newMode || root.unread > 0 && !root.searchShowing)
               PanelSectionHeader {
                 Layout.fillWidth: true
-                text: root.newMode ? "NEW MESSAGE" : root.searchShowing ? "SEARCH" : "MESSAGES"
+                text: root.newMode ? "NEW MESSAGE" : ""
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-              }
-              // A real button (PanelActionButton = the stock panels' control).
-              // The hand-rolled Text+MouseArea version lost its clicks to the
-              // panel's dismiss layer — clicking it CLOSED the panel.
-              PanelActionButton {
-                visible: !root.newMode && !root.searchShowing && !root.splitView
-                iconText: "＋"
-                tooltipText: "New message (n)"
-                bordered: true
-                foreground: root.foreground
-                hoverColor: root.accent
-                fontFamily: root.fontFamily
-                onClicked: root.startNew()
-              }
-              // Open the full app window. Hidden in the app itself (it IS the
-              // window) and in the split/search/new views, like ＋.
-              PanelActionButton {
-                visible: !root.newMode && !root.searchShowing && !root.splitView
-                iconText: "⇱"
-                tooltipText: "Open the app window (SUPER+M)"
-                bordered: true
-                foreground: root.foreground
-                hoverColor: root.accent
-                fontFamily: root.fontFamily
-                onClicked: root.openApp()
               }
               // Local only: moves readMark/readMarks in state.json so the
               // badge and dots clear. Nothing is written back to the Mac —
@@ -1515,8 +2192,13 @@ FocusScope {
               onAccepted: root.acceptNewField()
               Keys.onEscapePressed: root.exitNew()
               Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Down) { root.moveNewCursor(1); event.accepted = true }
+                if (event.key === Qt.Key_Down) {
+                  if (text === "") root.listFromTop()
+                  else root.moveNewCursor(1)
+                  event.accepted = true
+                }
                 else if (event.key === Qt.Key_Up) { root.moveNewCursor(-1); event.accepted = true }
+                else if (root.catchPagingKey(event.key)) event.accepted = true
               }
               onVisibleChanged: if (visible) {
                 forceActiveFocus()
@@ -1535,15 +2217,19 @@ FocusScope {
             }
 
             Repeater {
+              id: newRepeater
               model: root.online && root.listShowing && root.newMode ? root.newResults : []
               delegate: Rectangle {
+                id: contactHit
                 required property var modelData
                 required property int index
+                readonly property bool hasCursor: root.newCursor === index
+                onHasCursorChanged: if (hasCursor) root.cursorRow = contactHit
                 Layout.fillWidth: true
                 implicitHeight: contactRow.implicitHeight + Style.space(12)
                 radius: Style.cornerRadius
-                color: contactHover.hovered || root.newCursor === index
-                  ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                color: contactHover.hovered || hasCursor
+                  ? root.hoverFill
                   : "transparent"
                 HoverHandler { id: contactHover }
                 TapHandler { onTapped: root.openContact(modelData) }
@@ -1581,7 +2267,32 @@ FocusScope {
               id: searchField
               Layout.fillWidth: true
               visible: root.online && root.listShowing && !root.newMode
-              placeholderText: "name or message"
+              placeholderText: "Search"
+              Accessible.name: "Search"
+              leftPadding: horizontalPadding + searchGlyph.width + Style.space(7)
+              Canvas {
+                id: searchGlyph
+                anchors.left: parent.left
+                anchors.leftMargin: searchField.horizontalPadding
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(16)
+                height: width
+                readonly property color strokeColor: searchField.placeholderTextColor
+                onStrokeColorChanged: requestPaint()
+                onPaint: {
+                  var ctx = getContext("2d")
+                  ctx.reset()
+                  ctx.scale(width / 16, height / 16)
+                  ctx.strokeStyle = strokeColor
+                  ctx.lineWidth = 1.5
+                  ctx.lineCap = "round"
+                  ctx.beginPath()
+                  ctx.arc(6.5, 6.5, 5, 0, Math.PI * 2)
+                  ctx.moveTo(10.1, 10.1)
+                  ctx.lineTo(14.5, 14.5)
+                  ctx.stroke()
+                }
+              }
               foreground: root.foreground
               accent: root.accent
               font.family: root.fontFamily
@@ -1590,8 +2301,13 @@ FocusScope {
               onActiveFocusChanged: if (activeFocus && !root.searching) root.searching = true
               Keys.onEscapePressed: root.exitSearch()
               Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Down) { root.moveSearchCursor(1); event.accepted = true }
+                if (event.key === Qt.Key_Down) {
+                  if (text === "") root.listFromTop()
+                  else root.moveSearchCursor(1)
+                  event.accepted = true
+                }
                 else if (event.key === Qt.Key_Up) { root.moveSearchCursor(-1); event.accepted = true }
+                else if (root.catchPagingKey(event.key)) event.accepted = true
               }
             }
 
@@ -1610,35 +2326,52 @@ FocusScope {
               Layout.bottomMargin: Style.space(8)
 
               Repeater {
+                id: pinnedRepeater
                 model: pinnedGrid.visible ? root.pinnedThreads : []
                 delegate: Rectangle {
+                  id: pinnedTile
                   required property var modelData
+                  // pinned threads sit first in root.threads, so the cursor
+                  // walks these tiles before the rows below
+                  readonly property bool hasCursor: root.cursorChat === String(modelData.chat)
+                  onHasCursorChanged: if (hasCursor) root.cursorRow = pinnedTile
                   Layout.fillWidth: true
                   Layout.preferredWidth: Math.max(1, (pinnedGrid.width - pinnedGrid.columnSpacing * 2) / 3)
-                  implicitHeight: pinnedColumn.implicitHeight + Style.space(4)
+                  implicitHeight: pinnedColumn.implicitHeight + Style.space(12)
                   radius: Style.cornerRadius
-                  // j/k walk root.threads, and pinned threads sort FIRST in it —
-                  // without this the cursor was invisible for those presses.
-                  color: pinnedHover.hovered || root.cursor === root.threadIndex(modelData)
-                    ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                  color: pinnedHover.hovered || (hasCursor && root.cursorShown)
+                    ? root.hoverFill
                     : "transparent"
 
                   HoverHandler { id: pinnedHover }
                   TapHandler { onTapped: root.openThread(modelData) }
+                  TapHandler {
+                    acceptedButtons: Qt.RightButton
+                    onTapped: { root.contactContext = modelData; contactMenu.popup() }
+                  }
 
                   ColumnLayout {
                     id: pinnedColumn
                     anchors.left: parent.left
                     anchors.right: parent.right
-                    anchors.top: parent.top
+                    anchors.leftMargin: Style.space(4)
+                    anchors.rightMargin: Style.space(4)
+                    anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.space(4)
 
                     Rectangle {
                       id: pinnedAvatar
                       Layout.alignment: Qt.AlignHCenter
-                      width: Math.min(88, Math.max(56,
-                        (pinnedGrid.width - pinnedGrid.columnSpacing * 2) / 3 * 0.62))
-                      height: width
+                      // Hidden layouts defer their first measurement. Derive
+                      // the size from the pane's known width and supply both
+                      // implicit size and layout hints before the first open.
+                      readonly property real avatarSize: Math.min(88, Math.max(56,
+                        ((root.splitView ? root.sidebarWidth - Style.space(36) : root.width)
+                          - pinnedGrid.columnSpacing * 2) / 3 * 0.62))
+                      implicitWidth: avatarSize
+                      implicitHeight: avatarSize
+                      Layout.preferredWidth: avatarSize
+                      Layout.preferredHeight: avatarSize
                       radius: width / 2
                       color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
                       readonly property string avatarHandle: root.isGroupId(String(modelData.chat || "")) ? String(modelData.chat) : String(modelData.handle || modelData.chat || "")
@@ -1655,7 +2388,7 @@ FocusScope {
                         sourceSize.width: 192
                         sourceSize.height: 192
                         onStatusChanged: if (status === Image.Error && pinnedAvatar.avatarHandle !== "") {
-                          var m = Object.assign({}, root.avatarFiles); m[pinnedAvatar.avatarHandle] = ""; root.avatarFiles = m
+                          root.setAvatar(pinnedAvatar.avatarHandle, "")
                         }
                       }
                       Item {
@@ -1672,10 +2405,25 @@ FocusScope {
                         maskEnabled: true
                         maskSource: pinnedAvatarMask
                       }
+                      Loader {
+                        id: pinnedAvatarComposite
+                        anchors.fill: parent
+                        active: pinnedAvatarImg.status !== Image.Ready
+                          && root.isGroupId(String(modelData.chat || ""))
+                          && (modelData.participants || []).length > 0
+                        sourceComponent: GroupAvatar {
+                          participants: modelData.participants || []
+                          avatarFiles: root.avatarFiles
+                          foreground: root.foreground
+                          fontFamily: root.fontFamily
+                          onRequestAvatar: handle => root.requestAvatar(handle)
+                        }
+                      }
                       Text {
                         anchors.centerIn: parent
-                        visible: pinnedAvatarImg.status !== Image.Ready
+                        visible: pinnedAvatarImg.status !== Image.Ready && !pinnedAvatarComposite.active
                         text: root.avatarInitials(modelData)
+                        textFormat: Text.PlainText
                         color: root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: root.fontBody
@@ -1737,15 +2485,19 @@ FocusScope {
             }
 
             Repeater {
+              id: searchRepeater
               model: root.online && root.listShowing && root.searchShowing ? root.searchResults : []
               delegate: Rectangle {
+                id: searchHit
                 required property var modelData
                 required property int index
+                readonly property bool hasCursor: root.searchCursor === index
+                onHasCursorChanged: if (hasCursor) root.cursorRow = searchHit
                 Layout.fillWidth: true
                 implicitHeight: hitCol.implicitHeight + Style.space(12)
                 radius: Style.cornerRadius
-                color: hitHover.hovered || root.searchCursor === index
-                  ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                color: hitHover.hovered || hasCursor
+                  ? root.hoverFill
                   : "transparent"
                 HoverHandler { id: hitHover }
                 TapHandler { onTapped: root.openSearchHit(modelData) }
@@ -1808,131 +2560,182 @@ FocusScope {
               wrapMode: Text.WordWrap
             }
 
-            Repeater {
-              model: root.online && root.listShowing && !root.searchShowing && !root.newMode ? root.unpinnedThreads : []
-              delegate: Rectangle {
-                required property var modelData
-                required property int index
+            ColumnLayout {
+              id: chronologicalRows
+              property int hoveredRow: -1
+              Layout.fillWidth: true
+              visible: root.online && root.listShowing && !root.searchShowing && !root.newMode
+              spacing: 0
+              Repeater {
+                id: chronologicalRepeater
+                model: root.online && root.listShowing && !root.searchShowing && !root.newMode ? root.unpinnedThreads : []
+                delegate: Rectangle {
+                  id: threadRow
+                  required property var modelData
+                  required property int index
+                  readonly property bool highlighted: rowHover.hovered || (hasCursor && root.cursorShown)
+                  readonly property bool hasCursor: root.cursorChat === String(modelData.chat)
+                  onHasCursorChanged: if (hasCursor) root.cursorRow = threadRow
 
-                Layout.fillWidth: true
-                implicitHeight: rowRow.implicitHeight + Style.space(root.splitView ? 20 : 12)
-                radius: Style.cornerRadius
-                color: rowHover.hovered || root.cursor === root.threadIndex(modelData)
-                  ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
-                  : "transparent"
+                  Layout.fillWidth: true
+                  implicitHeight: rowRow.implicitHeight + Style.space(root.splitView ? 30 : 18)
+                  radius: Style.cornerRadius
+                  color: highlighted
+                    ? root.hoverFill
+                    : "transparent"
 
-                HoverHandler { id: rowHover }
-                TapHandler { onTapped: root.openThread(modelData) }
-
-                RowLayout {
-                  id: rowRow
-                  anchors.fill: parent
-                  anchors.margins: Style.space(6)
-                  spacing: Style.space(8)
-
-                  // the iMessage blue dot — present only while the thread has
-                  // unread inbound; the slot stays so names line up.
-                  Rectangle {
-                    width: Style.space(9); height: width; radius: width / 2
-                    color: root.mineFill
-                    opacity: modelData.unread > 0 ? 1 : 0
+                  HoverHandler {
+                    id: rowHover
+                    onHoveredChanged: {
+                      if (hovered) chronologicalRows.hoveredRow = index
+                      else if (chronologicalRows.hoveredRow === index) chronologicalRows.hoveredRow = -1
+                    }
                   }
+                  TapHandler { onTapped: root.openThread(modelData) }
+                    TapHandler {
+                      acceptedButtons: Qt.RightButton
+                      onTapped: { root.contactContext = modelData; contactMenu.popup() }
+                    }
 
-                  // avatar circle — the contact's photo when Contacts has one,
-                  // initials otherwise (the iMessage sidebar look)
-                  Rectangle {
-                    id: avatarCircle
-                    // Messages' sidebar avatar is large relative to the row;
-                    // 30 looked like a contact list, not a conversation list.
-                    width: Style.space(34); height: width; radius: width / 2
-                    color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
-                    // A group binds to ITS OWN chat id (its Messages group photo); a DM to
-                    // the person. Binding a group to `handle` showed whoever spoke last —
-                    // their cached contact photo one minute, initials the next.
-                    readonly property string avatarHandle: root.isGroupId(String(modelData.chat || "")) ? String(modelData.chat) : String(modelData.handle || modelData.chat || "")
-                    Component.onCompleted: root.requestAvatar(avatarHandle)
-                    Image {
-                      id: avatarImg
-                      anchors.fill: parent
-                      visible: false
-                      source: root.avatarFiles[avatarCircle.avatarHandle] || ""
-                      asynchronous: true
-                      fillMode: Image.PreserveAspectCrop
-                      autoTransform: true
-                      sourceSize.width: 96
-                      sourceSize.height: 96
-                      // a stale/corrupt cache file → initials, and no retry this session
-                      onStatusChanged: if (status === Image.Error && avatarCircle.avatarHandle !== "") {
-                        var m = Object.assign({}, root.avatarFiles); m[avatarCircle.avatarHandle] = ""; root.avatarFiles = m
+                  RowLayout {
+                    id: rowRow
+                    anchors.fill: parent
+                    anchors.margins: Style.space(6)
+                    spacing: Style.space(8)
+
+                    // the iMessage blue dot — present only while the thread has
+                    // unread inbound; the slot stays so names line up.
+                    Rectangle {
+                      width: Style.space(9); height: width; radius: width / 2
+                      color: root.mineFill
+                      opacity: modelData.unread > 0 ? 1 : 0
+                    }
+
+                    // avatar circle — the contact's photo when Contacts has one,
+                    // initials otherwise (the iMessage sidebar look)
+                    Rectangle {
+                      id: avatarCircle
+                      // Messages' sidebar avatar is large relative to the row;
+                      // Keep ordinary avatars legible beside two preview lines.
+                      width: Style.space(40); height: width; radius: width / 2
+                      color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
+                      // A group binds to ITS OWN chat id (its Messages group photo); a DM to
+                      // the person. Binding a group to `handle` showed whoever spoke last —
+                      // their cached contact photo one minute, initials the next.
+                      readonly property string avatarHandle: root.isGroupId(String(modelData.chat || "")) ? String(modelData.chat) : String(modelData.handle || modelData.chat || "")
+                      Component.onCompleted: root.requestAvatar(avatarHandle)
+                      Image {
+                        id: avatarImg
+                        anchors.fill: parent
+                        visible: false
+                        source: root.avatarFiles[avatarCircle.avatarHandle] || ""
+                        asynchronous: true
+                        fillMode: Image.PreserveAspectCrop
+                        autoTransform: true
+                        sourceSize.width: 96
+                        sourceSize.height: 96
+                        // a stale/corrupt cache file → initials, and no retry this session
+                        onStatusChanged: if (status === Image.Error && avatarCircle.avatarHandle !== "") {
+                          root.setAvatar(avatarCircle.avatarHandle, "")
+                        }
                       }
-                    }
-                    Item {
-                      id: avatarMask
-                      anchors.fill: parent
-                      visible: false
-                      layer.enabled: true
-                      Rectangle { anchors.fill: parent; radius: width / 2 }
-                    }
-                    MultiEffect {
-                      anchors.fill: parent
-                      source: avatarImg
-                      visible: avatarImg.status === Image.Ready
-                      maskEnabled: true
-                      maskSource: avatarMask
-                    }
-                    Text {
-                      anchors.centerIn: parent
-                      visible: avatarImg.status !== Image.Ready
-                      text: root.avatarInitials(modelData)
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fontCaption
-                      font.bold: true
-                    }
-                  }
-
-                  ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: Style.space(1)
-                    RowLayout {
-                      Layout.fillWidth: true
-                      spacing: Style.space(6)
+                      Item {
+                        id: avatarMask
+                        anchors.fill: parent
+                        visible: false
+                        layer.enabled: true
+                        Rectangle { anchors.fill: parent; radius: width / 2 }
+                      }
+                      MultiEffect {
+                        anchors.fill: parent
+                        source: avatarImg
+                        visible: avatarImg.status === Image.Ready
+                        maskEnabled: true
+                        maskSource: avatarMask
+                      }
+                      Loader {
+                        id: avatarCircleComposite
+                        anchors.fill: parent
+                        active: avatarImg.status !== Image.Ready
+                          && root.isGroupId(String(modelData.chat || ""))
+                          && (modelData.participants || []).length > 0
+                        sourceComponent: GroupAvatar {
+                          participants: modelData.participants || []
+                          avatarFiles: root.avatarFiles
+                          foreground: root.foreground
+                          fontFamily: root.fontFamily
+                          onRequestAvatar: handle => root.requestAvatar(handle)
+                        }
+                      }
                       Text {
-                        Layout.fillWidth: true
-                        text: String(modelData.name || modelData.chat)
+                        anchors.centerIn: parent
+                        visible: avatarImg.status !== Image.Ready && !avatarCircleComposite.active
+                        text: root.avatarInitials(modelData)
                         textFormat: Text.PlainText
-                        elide: Text.ElideRight
                         color: root.foreground
                         font.family: root.fontFamily
-                        font.pixelSize: root.fontBodySmall
-                        // Messages keeps the name semibold ALWAYS; unread is
-                        // carried by the dot and the blue timestamp, not by
-                        // the name suddenly changing weight.
-                        font.weight: modelData.unread > 0 ? Font.Bold : Font.DemiBold
+                        font.pixelSize: root.fontCaption
+                        font.bold: true
                       }
+                    }
+
+                    ColumnLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(1)
+                      RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Style.space(6)
+                        Text {
+                          Layout.fillWidth: true
+                          text: String(modelData.name || modelData.chat)
+                          textFormat: Text.PlainText
+                          elide: Text.ElideRight
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: root.fontBodySmall
+                          // Messages keeps the name semibold ALWAYS; unread is
+                          // carried by the dot and the blue timestamp, not by
+                          // the name suddenly changing weight.
+                          font.weight: modelData.unread > 0 ? Font.Bold : Font.DemiBold
+                        }
+                        Text {
+                          text: root.fmtTime(modelData.last_ts)
+                          textFormat: Text.PlainText
+                          color: modelData.unread > 0 ? root.mineFill : root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: root.fontCaption
+                        }
+                      }
+                      // TWO lines, wrapped — the single most recognisable thing
+                      // about the Messages sidebar. One elided line reads like a
+                      // mail client; two lines of preview reads like Messages.
                       Text {
-                        text: root.fmtTime(modelData.last_ts)
+                        Layout.fillWidth: true
+                        text: (modelData.last_from_me ? "You: " : "") + String(modelData.last_text || "")
                         textFormat: Text.PlainText
-                        color: modelData.unread > 0 ? root.mineFill : root.dim
+                        wrapMode: Text.Wrap
+                        elide: Text.ElideRight
+                        maximumLineCount: 2
+                        color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: root.fontCaption
+                        lineHeight: 1.15
                       }
                     }
-                    // TWO lines, wrapped — the single most recognisable thing
-                    // about the Messages sidebar. One elided line reads like a
-                    // mail client; two lines of preview reads like Messages.
-                    Text {
-                      Layout.fillWidth: true
-                      text: (modelData.last_from_me ? "You: " : "") + String(modelData.last_text || "")
-                      textFormat: Text.PlainText
-                      wrapMode: Text.Wrap
-                      elide: Text.ElideRight
-                      maximumLineCount: 2
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fontCaption
-                      lineHeight: 1.15
-                    }
+
+                  }
+                  Rectangle {
+                    anchors.bottom: parent.bottom
+                    anchors.right: parent.right
+                    // Align the hairline with the text, beyond the dot and avatar.
+                    anchors.left: parent.left
+                    anchors.leftMargin: rowRow.x + avatarCircle.x + avatarCircle.width + rowRow.spacing
+                    height: 1
+                    color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+                    visible: !threadRow.highlighted
+                      && chronologicalRows.hoveredRow !== index + 1
+                      && !(root.cursorShown && root.unpinnedThreads[index + 1]
+                        && root.cursorChat === String(root.unpinnedThreads[index + 1].chat))
                   }
 
                 }
@@ -1969,6 +2772,19 @@ FocusScope {
         RowLayout {
           Layout.fillWidth: true
           spacing: Style.space(8)
+          PanelActionButton {
+            visible: root.inThread && !root.splitView
+            Layout.alignment: Qt.AlignTop
+            Layout.topMargin: Style.space(6)
+            iconText: "←"
+            tooltipText: "Back to messages (Esc)"
+            Accessible.name: "Back to messages"
+            focusable: true
+            foreground: root.foreground
+            hoverColor: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.back()
+          }
           PanelHero {
             Layout.fillWidth: true
             title: root.inThread ? String(root.active.name || root.active.chat) : "Select a conversation"
@@ -1977,11 +2793,17 @@ FocusScope {
                   ? (root.isSendable(root.active) ? "group" : "group · read-only (id unknown)")
                   : String(root.active.handle))
               : ""
-            detail: root.inThread
-              ? (root.loading ? "loading…" : (root.splitView ? "" : "Esc = back"))
-              : ""
+            detail: root.inThread && root.loading ? "loading…" : ""
             foreground: root.foreground
             fontFamily: root.fontFamily
+          }
+          PanelActionButton {
+            visible: root.inThread
+            iconText: "⋯"
+            tooltipText: "Review contact"
+            foreground: root.foreground
+            hoverColor: root.accent
+            onClicked: contactReview.review(root.active)
           }
           // The app's NEW button lives up here (where "Esc = back" used to be).
           PanelActionButton {
@@ -2059,15 +2881,25 @@ FocusScope {
             acceptedButtons: Qt.NoButton
             onWheel: function(wheel) {
               var d = wheel.pixelDelta.y !== 0 ? wheel.pixelDelta.y * 3.0 : wheel.angleDelta.y * 4.5
-              var max = Math.max(0, flick.contentHeight - flick.height)
-              flick.contentY = Math.max(0, Math.min(max, flick.contentY - d))
-              // the wheel bypasses Flickable movement signals — maintain the
-              // bottom-stick here too
-              flick.stick = flick.contentY >= max - 4
+              // the wheel bypasses Flickable movement signals — the helper
+              // maintains the bottom-stick too
+              root.scrollConversation(-d)
               wheel.accepted = true
             }
           }
 
+          // The bubble cursor: one translucent band behind the selected row,
+          // the list rows' fill. A sibling of `content`, not a child of the
+          // layout, so no delegate carries a background of its own; the row's
+          // y/height are in `content` space, which sits at the origin here.
+          Rectangle {
+            visible: root.bubbleCursorItem !== null
+            width: content.width
+            y: root.bubbleCursorItem ? root.bubbleCursorItem.y - Style.space(2) : 0
+            height: root.bubbleCursorItem ? root.bubbleCursorItem.height + Style.space(4) : 0
+            radius: Style.cornerRadius
+            color: root.hoverFill
+          }
           ColumnLayout {
             id: content
             width: parent.width
@@ -2078,6 +2910,7 @@ FocusScope {
               Layout.fillWidth: true
               visible: root.inThread && root.loading
               text: "loading…"
+              textFormat: Text.PlainText
               horizontalAlignment: Text.AlignHCenter
               color: root.dim
               font.family: root.fontFamily
@@ -2085,11 +2918,15 @@ FocusScope {
             }
 
             Repeater {
+              id: bubbleRepeater
               model: root.inThread ? root.bubbles : []
               delegate: ColumnLayout {
                 id: bubbleRow
                 required property var modelData
+                required property int index
                 readonly property bool mine: modelData.from_me === true
+                readonly property bool hasCursor: root.bubbleCursor === index
+                onHasCursorChanged: if (hasCursor) root.bubbleCursorItem = bubbleRow
 
                 Layout.fillWidth: true
                 spacing: Style.space(2)
@@ -2099,6 +2936,7 @@ FocusScope {
                   Layout.fillWidth: true
                   visible: String(modelData.day || "") !== ""
                   text: String(modelData.day || "")
+                  textFormat: Text.PlainText
                   horizontalAlignment: Text.AlignHCenter
                   color: root.dim
                   font.family: root.fontFamily
@@ -2116,6 +2954,10 @@ FocusScope {
                   visible: root.activeIsGroup && !bubbleRow.mine && modelData.groupStart === true
                   text: String(modelData.name || "")
                   textFormat: Text.PlainText
+                  // A name is untrusted width: unconstrained, a long one is the
+                  // "delegate wider than the panel" bug (CLAUDE.md) — Astra A#10.
+                  Layout.maximumWidth: Math.max(1, bubbleRow.width - Style.space(40))
+                  elide: Text.ElideRight
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: root.fontCaption
@@ -2130,6 +2972,8 @@ FocusScope {
                   Text {
                     text: (bubbleRow.mine ? "You" : String(modelData.name || "They")) + " unsent a message"
                     textFormat: Text.PlainText
+                    Layout.maximumWidth: Math.max(1, bubbleRow.width - Style.space(40))
+                    elide: Text.ElideRight
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: root.fontCaption
@@ -2199,6 +3043,9 @@ FocusScope {
                         flick.contentY = Math.max(0, flick.contentY + d)
                     }
                     readonly property string attId: String(modelData.id || "")
+                    // the pill lands here when the message has no text bubble to carry it
+                    readonly property bool pillHere: index === 0 && String(bubbleRow.modelData.text || "") === ""
+                                                     && (bubbleRow.modelData.tapbacks || []).length > 0
                     // undefined = not fetched, "" = failed, else file:// url
                     readonly property var fileUrl: root.attFiles[chipRow.attId]
                     readonly property bool failed: chipRow.fileUrl === ""
@@ -2207,13 +3054,15 @@ FocusScope {
                       root.isImageMime(chipRow.modelData.mime) &&
                       chipRow.fileUrl !== undefined && chipRow.fileUrl !== ""
                     Layout.fillWidth: true
-                    Layout.topMargin: index === 0 && bubbleRow.modelData.groupStart ? Style.space(6) : 0
+                    Layout.topMargin: (index === 0 && bubbleRow.modelData.groupStart ? Style.space(6) : 0)
+                                      + (pillHere ? Style.space(12) : 0)
                     spacing: 0
                     Item { Layout.fillWidth: true; visible: bubbleRow.mine }
 
                     // fetched image renders inline, like Messages; click = full view
                     Image {
                       id: attImage
+                      TapbackPill { visible: chipRow.pillHere; mine: bubbleRow.mine; tapbacks: bubbleRow.modelData.tapbacks }
                       visible: chipRow.showImage
                       readonly property real maxW: Math.round(content.width * 0.6)
                       // Retina PNGs carry their density in the header (read by
@@ -2259,6 +3108,7 @@ FocusScope {
                     }
 
                     Rectangle {
+                      TapbackPill { visible: chipRow.pillHere; mine: bubbleRow.mine; tapbacks: bubbleRow.modelData.tapbacks }
                       visible: !chipRow.showImage
                       Layout.preferredWidth: Math.ceil(chipText.implicitWidth) + Style.space(18)
                       Layout.preferredHeight: Math.ceil(chipText.implicitHeight) + Style.space(12)
@@ -2496,29 +3346,7 @@ FocusScope {
                       }
                     }
 
-                    // tapback pill overlapping the corner opposite the tail
-                    Rectangle {
-                      visible: (modelData.tapbacks || []).length > 0
-                      width: Math.ceil(tapbackText.implicitWidth) + Style.space(12)
-                      height: Math.ceil(tapbackText.implicitHeight) + Style.space(8)
-                      radius: height / 2
-                      color: bubbleRow.mine ? Qt.darker(root.mineFill, 2.2) : root.mineFill
-                      border.color: Qt.rgba(0, 0, 0, 0.5)
-                      border.width: 2
-                      anchors.top: parent.top
-                      anchors.topMargin: -Style.space(12)
-                      anchors.right: bubbleRow.mine ? undefined : parent.right
-                      anchors.rightMargin: bubbleRow.mine ? 0 : -Style.space(6)
-                      anchors.left: bubbleRow.mine ? parent.left : undefined
-                      anchors.leftMargin: bubbleRow.mine ? -Style.space(6) : 0
-                      Text {
-                        id: tapbackText
-                        anchors.centerIn: parent
-                        text: root.tapbackRow(modelData.tapbacks)
-                        textFormat: Text.PlainText
-                        font.pixelSize: root.fontCaption
-                      }
-                    }
+                    TapbackPill { mine: bubbleRow.mine; tapbacks: modelData.tapbacks }
                   }
 
                   Item { Layout.fillWidth: true; visible: !bubbleRow.mine }
@@ -2530,14 +3358,17 @@ FocusScope {
                   Layout.fillWidth: true
                   visible: String(modelData.time || "") !== "" ||
                            modelData.edited === true || String(modelData.effect || "") !== "" ||
-                           modelData.failed === true
+                           modelData.failed === true || modelData.pending === true
                   spacing: 0
                   Item { Layout.fillWidth: true; visible: bubbleRow.mine }
                   Text {
                     Layout.rightMargin: bubbleRow.mine ? Style.space(6) : 0
                     Layout.leftMargin: bubbleRow.mine ? 0 : Style.space(6)
+                    Layout.maximumWidth: Math.max(1, content.width * 0.78)
+                    wrapMode: Text.WrapAnywhere
                     text: [modelData.failed === true ? "⚠ Not Delivered" : "",
-                           String(modelData.time || ""),
+                           modelData.failed === true ? String(modelData.failureReason || "")
+                             : modelData.pending === true ? "Sending…" : String(modelData.time || ""),
                            modelData.edited === true ? "Edited" : "",
                            String(modelData.effect || "") !== "" ? "sent with " + modelData.effect : ""]
                           .filter(function(s) { return s !== "" }).join(" · ")
@@ -2624,6 +3455,8 @@ FocusScope {
           Layout.fillWidth: true
           Layout.maximumWidth: parent.width
           visible: root.inThread
+          // Match the popup's bottom inset above the composer as well.
+          Layout.topMargin: root.splitView ? 0 : Math.max(0, Style.spacing.popupPadding - Style.space(8))
           spacing: Style.space(6)
 
           // Width must be assigned by the layout *before* wrap can happen.
@@ -2643,52 +3476,152 @@ FocusScope {
             }
             clip: true
 
-            TextArea {
-              id: composeField
+            // The border belongs to the SLOT, not the field: inside composeFlick
+            // the TextArea is as tall as its text, so a background there would
+            // scroll away and its rounded bottom edge would be clipped off.
+            BorderSurface {
               anchors.fill: parent
-              wrapMode: TextEdit.Wrap
-              // NEVER disabled: this field is the panel's exclusive keyboard-focus
-              // holder, and disabling the focused editor dismisses the whole
-              // panel (0.7.2 postmortem; Codex design review #8). readOnly
-              // instead; send() is the authoritative online/sendability guard.
-              enabled: true
-              readOnly: !root.online || !root.isSendable(root.active)
-              placeholderText: root.draftPath !== ""
-                ? "caption (optional) — Enter sends the file"
-                : root.isSendable(root.active) ? "iMessage" : "Read-only — group id unknown"
-              color: root.foreground
-              placeholderTextColor: Qt.darker(root.foreground, 1.6)
-              selectionColor: Style.selectionFillFor(root.foreground, root.mineFill)
-              selectedTextColor: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: root.fontBodySmall
-              readonly property var _composeBorder: Border.controlSpec(
-                activeFocus ? "focus" : (hovered ? "hover-cursor" : "normal"),
-                root.foreground, root.mineFill)
-              leftPadding: Style.spacing.controlPaddingX + Border.left(_composeBorder)
-              rightPadding: Style.spacing.controlPaddingX + Border.right(_composeBorder)
-              topPadding: Style.spacing.inputPaddingY + Border.top(_composeBorder)
-              bottomPadding: Style.spacing.inputPaddingY + Border.bottom(_composeBorder)
-              background: BorderSurface {
-                color: Style.controlFill(composeField.activeFocus, composeField.hovered, root.foreground, root.mineFill)
-                borderSpec: composeField._composeBorder
-                radius: Style.cornerRadius
+              color: Style.controlFill(composeField.activeFocus, composeField.hovered, root.foreground, root.mineFill)
+              borderSpec: composeField._composeBorder
+              radius: Style.cornerRadius
+            }
+
+            // A long draft reads back with the wheel (#62). The caret keeps what
+            // you type in view; this is for the lines above it. Direct 1:1
+            // MouseArea.onWheel like the conversation. NoButton, so clicks and
+            // selection still reach the field; a draft that fits passes the
+            // wheel on to whatever is behind it.
+            MouseArea {
+              anchors.fill: parent
+              z: 1
+              acceptedButtons: Qt.NoButton
+              onWheel: function(wheel) {
+                var max = Math.max(0, composeFlick.contentHeight - composeFlick.height)
+                if (max === 0) { wheel.accepted = false; return }
+                var line = Math.ceil(composeField.font.pixelSize * 1.35)
+                var d = wheel.pixelDelta.y !== 0 ? wheel.pixelDelta.y : wheel.angleDelta.y / 120 * line
+                composeFlick.contentY = Math.max(0, Math.min(max, composeFlick.contentY - d))
+                wheel.accepted = true
               }
-              Keys.onEscapePressed: root.back()
-              // Ctrl+V goes through paste.ts: an image on the clipboard becomes
-              // a draft chip; text falls through to a manual insert. One process
-              // snapshots types AND data — probing then re-reading races.
-              // Enter sends (iMessage); Shift+Enter inserts a newline.
-              Keys.onPressed: (event) => {
-                if (event.matches(StandardKey.Paste)) {
-                  event.accepted = true
-                  root.startPaste()
-                  return
+            }
+
+            // A TextArea scrolls to its caret ONLY when it lives in a Flickable.
+            // Anchored to fill this clipped slot it did not: past the fifth line
+            // the text was still laid out, just below the visible area, and you
+            // typed blind (Fred, 2026-09-07).
+            Flickable {
+              id: composeFlick
+              anchors.fill: parent
+              contentWidth: width
+              contentHeight: composeField.height
+              // Same reason the conversation's Flickable is not interactive: a
+              // drag here IS text selection. The caret does the scrolling.
+              interactive: false
+              boundsBehavior: Flickable.StopAtBounds
+
+              /** Keep the caret inside the viewport, both directions. */
+              function showCaret() {
+                var c = composeField.cursorRectangle
+                var max = Math.max(0, contentHeight - height)
+                if (c.y < contentY) contentY = Math.max(0, c.y)
+                else if (c.y + c.height > contentY + height)
+                  contentY = Math.min(max, c.y + c.height - height)
+                else if (contentY > max) contentY = max
+              }
+
+              ComposerInput {
+                id: composeField
+                onActiveFocusChanged: if (activeFocus) root.commitPeek()
+                spellingColor: root.urgent
+                width: composeFlick.width
+                // At least the viewport, so a click in empty space still lands in
+                // the field; taller than it once the text outgrows five lines.
+                height: Math.max(composeFlick.height, contentHeight + topPadding + bottomPadding)
+                background: null
+                onCursorRectangleChanged: composeFlick.showCaret()
+                wrapMode: TextEdit.Wrap
+                // Every edit is kept under the open conversation, so switching
+                // threads does not lose it. A send clears the field and with it
+                // the draft; leaving a thread nulls active BEFORE clearing, so the
+                // draft stays. Loading a draft in openThread fires this too and
+                // writes the same text back, which is harmless.
+                onTextChanged: if (root.active) root.drafts[String(root.active.chat)] = text
+                // NEVER disabled: this field is the panel's exclusive keyboard-focus
+                // holder, and disabling the focused editor dismisses the whole
+                // panel (0.7.2 postmortem; Codex design review #8). readOnly
+                // instead; send() is the authoritative online/sendability guard.
+                enabled: true
+                readOnly: !root.online || !root.isSendable(root.active)
+                placeholderText: root.draftPath !== ""
+                  ? "caption (optional) — Enter sends the file"
+                  : root.isSendable(root.active) ? "iMessage" : "Read-only — group id unknown"
+                color: root.foreground
+                placeholderTextColor: root.dim
+                selectionColor: Style.selectionFillFor(root.foreground, root.mineFill)
+                selectedTextColor: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: root.fontBodySmall
+                readonly property var _composeBorder: Border.controlSpec(
+                  activeFocus ? "focus" : (hovered ? "hover-cursor" : "normal"),
+                  root.foreground, root.mineFill)
+                leftPadding: Style.spacing.controlPaddingX + Border.left(_composeBorder)
+                rightPadding: Style.spacing.controlPaddingX + Border.right(_composeBorder)
+                topPadding: Style.spacing.inputPaddingY + Border.top(_composeBorder)
+                bottomPadding: Style.spacing.inputPaddingY + Border.bottom(_composeBorder)
+                // Esc drops a bubble selection first (back to the bottom), then
+                // leaves the thread — the two-step Esc a text selection gets.
+                Keys.onEscapePressed: if (root.shareUrl !== "") root.closeShare(); else if (root.bubbleCursor >= 0) root.leaveBubbles(); else root.back()
+                // Left from the START of the text (or an empty field) hands focus
+                // back to the sidebar (split view); anywhere else it moves the
+                // caret as usual — the arrows' edge rule. Not while the share
+                // sheet is up: a specific-key handler runs before Keys.onPressed
+                // and counts as accepted, and there Left is the sheet's.
+                Keys.onLeftPressed: function(event) {
+                  if (root.splitView && cursorPosition === 0 && root.shareUrl === "") root.navigationFocusRequested()
+                  else event.accepted = false
                 }
-                if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
-                    && !(event.modifiers & Qt.ShiftModifier)) {
-                  event.accepted = true
-                  root.send()
+                // Ctrl+V goes through paste.ts: an image on the clipboard becomes
+                // a draft chip; text falls through to a manual insert. One process
+                // snapshots types AND data — probing then re-reading races.
+                // Enter sends (iMessage); Shift+Enter inserts a newline.
+                Keys.onPressed: (event) => {
+                  if (root.shareKey(event.key)) { event.accepted = true; return }
+                  if (event.matches(StandardKey.Paste)) {
+                    event.accepted = true
+                    root.startPaste()
+                    return
+                  }
+                  var empty = text.length === 0
+                  // Ordinary editing keys belong to the draft, including at
+                  // its boundaries. History selection uses Page Up/Page Down.
+                  if (event.key === Qt.Key_Up || event.key === Qt.Key_Down
+                      || event.key === Qt.Key_Home || event.key === Qt.Key_End) {
+                    root.clearBubbleCursor()
+                    event.accepted = composeField.moveAtBoundary(event.key, event.modifiers)
+                    return
+                  }
+                  // PgUp/PgDn work with a draft in the field (they move no caret):
+                  // a screen at a time, or one bubble at a time with Shift held.
+                  if (event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown) {
+                    event.accepted = true
+                    var dir = event.key === Qt.Key_PageUp ? -1 : 1
+                    if (event.modifiers & Qt.ShiftModifier) root.moveBubbleCursor(dir)
+                    else root.pageBubbles(dir)
+                    return
+                  }
+                  // Actions on the selected bubble. Enter is free here: with no
+                  // text and no queued file, send() would do nothing anyway.
+                  var b = empty && root.draftPath === "" ? root.selectedBubble() : null
+                  if (b) {
+                    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { event.accepted = true; root.openBubble(b); return }
+                    if (event.matches(StandardKey.Copy)) { event.accepted = true; root.copyBubble(b); return }
+                    if (event.key === Qt.Key_R && (event.modifiers & Qt.ControlModifier)) { event.accepted = true; root.quoteBubble(b); return }
+                  }
+                  if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                      && !(event.modifiers & Qt.ShiftModifier)) {
+                    event.accepted = true
+                    root.send()
+                  }
                 }
               }
             }
@@ -2703,6 +3636,7 @@ FocusScope {
             Text {
               anchors.centerIn: parent
               text: "↑"
+              textFormat: Text.PlainText
               color: parent.armed ? "#ffffff" : root.dim
               font.family: root.fontFamily
               font.pixelSize: root.fontBody
@@ -2712,17 +3646,67 @@ FocusScope {
           }
         }
 
+        // No empty status row below the composer. The resize grip overlays
+        // the panel corner independently of this layout.
         Text {
-          Layout.fillWidth: true
           visible: root.note !== ""
+          Layout.fillWidth: true
           text: root.note
           textFormat: Text.PlainText
-          color: root.note === "sending…" ? root.dim : root.urgent
+          readonly property bool calm: root.note === "copied" || root.note === "sending…"
+            || root.note === "sent to LocalSend" || root.note.indexOf("attached") === 0
+          color: calm ? root.dim : root.urgent
           font.family: root.fontFamily
           font.pixelSize: root.fontCaption
           wrapMode: Text.WordWrap
         }
       }
+    }
+  }
+
+  property var contactContext: null
+  Menu {
+    id: contactMenu
+    MenuItem {
+      text: "Review contact"
+      onTriggered: if (root.contactContext) contactReview.review(root.contactContext)
+    }
+  }
+  ContactReview {
+    id: contactReview
+    objectName: "blipContactReview"
+    anchors.fill: parent
+    threads: root.threads
+    foreground: root.foreground
+    accent: root.accent
+    fontFamily: root.fontFamily
+    fontSize: root.fontBodySmall
+    onClosed: root.focusDefault()
+    onCopyRequested: function(text) { root.copyText(text) }
+  }
+
+  // Copy feedback must remain visible above contact review and other subviews.
+  // Only fixed status text is shown; copied contents never enter a notification.
+  Rectangle {
+    objectName: "blipCopyFeedback"
+    visible: root.copyFeedback !== ""
+    z: 1000
+    anchors.horizontalCenter: parent.horizontalCenter
+    anchors.bottom: parent.bottom
+    anchors.bottomMargin: Style.space(56)
+    width: Math.max(0, Math.min(parent.width - Style.space(16), copyFeedbackText.implicitWidth + Style.space(24)))
+    height: copyFeedbackText.implicitHeight + Style.space(16)
+    radius: Style.cornerRadius
+    color: Color.background
+    border.width: 1
+    border.color: root.copyFeedback === "Copied to clipboard" ? root.accent : root.urgent
+    Text {
+      id: copyFeedbackText
+      width: Math.max(0, parent.width - Style.space(24))
+      wrapMode: Text.WordWrap; horizontalAlignment: Text.AlignHCenter
+      anchors.centerIn: parent
+      text: root.copyFeedback; textFormat: Text.PlainText
+      color: root.foreground; font.family: root.fontFamily; font.pixelSize: root.fontCaption
     }
   }
 
@@ -2754,7 +3738,9 @@ FocusScope {
     Rectangle {
       anchors.fill: parent
       color: Qt.rgba(0, 0, 0, 0.45)
-      TapHandler { onTapped: root.closeShare() }
+      // ReleaseWithinBounds takes an exclusive grab on press: the tap ends
+      // here instead of also reaching the row, bubble or link underneath.
+      TapHandler { gesturePolicy: TapHandler.ReleaseWithinBounds; onTapped: root.closeShare() }
     }
     Rectangle {
       id: shareCard
@@ -2765,21 +3751,40 @@ FocusScope {
       color: Color.background
       border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
       border.width: 1
-      TapHandler { }   // swallow clicks on the card so they never reach the scrim
+      TapHandler { gesturePolicy: TapHandler.ReleaseWithinBounds }   // clicks on the card stop here
       ColumnLayout {
         id: shareCol
         anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
         anchors.margins: Style.space(14)
         spacing: Style.space(8)
-        Text {
+        RowLayout {
           Layout.fillWidth: true
-          text: "SHARE LINK"
-          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.6)
-          font.family: root.fontFamily; font.pixelSize: root.fontCaption; font.letterSpacing: 1
+          spacing: Style.space(10)
+          Text {
+            Layout.fillWidth: true
+            text: "SHARE LINK" + (root.shareUrls.length > 1 ? "  ·  " + (root.shareIndex + 1) + " of " + root.shareUrls.length : "")
+            textFormat: Text.PlainText
+            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.6)
+            font.family: root.fontFamily; font.pixelSize: root.fontCaption; font.letterSpacing: 1
+          }
+          // ‹ › step through the message's links (the keyboard's ←/→)
+          Repeater {
+            model: root.shareUrls.length > 1 ? [-1, 1] : []
+            delegate: Text {
+              required property var modelData
+              text: modelData < 0 ? "‹" : "›"
+              textFormat: Text.PlainText
+              color: root.foreground
+              font.family: root.fontFamily; font.pixelSize: root.fontBody; font.bold: true
+              HoverHandler { cursorShape: Qt.PointingHandCursor }
+              TapHandler { gesturePolicy: TapHandler.ReleaseWithinBounds; onTapped: root.shareStep(modelData) }
+            }
+          }
         }
         Text {
           Layout.fillWidth: true
           text: root.linkHost(root.shareUrl)
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily; font.pixelSize: root.fontBody; font.bold: true
           elide: Text.ElideRight
@@ -2787,6 +3792,7 @@ FocusScope {
         Text {
           Layout.fillWidth: true
           text: root.shareUrl
+          textFormat: Text.PlainText
           color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.7)
           font.family: root.fontFamily; font.pixelSize: root.fontCaption
           elide: Text.ElideMiddle
@@ -2799,7 +3805,8 @@ FocusScope {
           width: Style.space(176); height: width
           radius: Style.cornerRadius
           color: "white"
-          visible: root.shareQr !== ""
+          // shown while a code is being made too; hidden only when qrencode failed
+          visible: root.shareQr !== "" || qrProc.running
           Image {
             anchors.fill: parent; anchors.margins: Style.space(8)
             source: root.shareQr
@@ -2816,20 +3823,23 @@ FocusScope {
           ]
           delegate: Rectangle {
             required property var modelData
+            required property int index
             Layout.fillWidth: true
             height: Style.space(40)
             radius: Style.cornerRadius
-            color: shareHover.hovered
+            color: shareHover.hovered || index === root.shareCursor
               ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
               : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
             Text {
               anchors.centerIn: parent
               text: modelData.label
+              textFormat: Text.PlainText
               color: root.foreground
               font.family: root.fontFamily; font.pixelSize: root.fontBodySmall
             }
-            HoverHandler { id: shareHover; cursorShape: Qt.PointingHandCursor }
+            HoverHandler { id: shareHover; cursorShape: Qt.PointingHandCursor; onHoveredChanged: if (hovered) root.shareCursor = index }
             TapHandler {
+              gesturePolicy: TapHandler.ReleaseWithinBounds
               onTapped: {
                 if (modelData.act === "open") root.shareOpen()
                 else if (modelData.act === "copy") root.shareCopy()
@@ -2841,7 +3851,8 @@ FocusScope {
         Text {
           Layout.fillWidth: true
           horizontalAlignment: Text.AlignHCenter
-          text: "Esc closes"
+          text: (root.shareUrls.length > 1 ? "← → link  ·  " : "") + "1–3 or ↑↓ Enter  ·  Esc closes"
+          textFormat: Text.PlainText
           color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.45)
           font.family: root.fontFamily; font.pixelSize: root.fontCaption
         }

@@ -91,6 +91,8 @@ export interface LinkCard { url: string; title: string; summary: string; image_i
 
 export interface Thread {
   chat: string;
+  /** Historical chat identifiers coalesced into this logical conversation. */
+  aliases?: string[];
   /** Full AppleScript chat GUID for groups (""), empty for DMs. Sending to a
    *  group means `imsg-send --chat-id <guid>`; never the bare id. */
   guid: string;
@@ -106,7 +108,13 @@ export interface Thread {
   pinned: boolean;
   /** Position in Messages' pinned section, when pinned. */
   pin_order: number | null;
+  /** Messages-style short label from Contacts' unified-card view. */
+  pin_name?: string;
+  /** Other people in a group, for explicit per-person contact actions. */
+  participants?: GroupParticipant[];
 }
+
+export interface GroupParticipant { handle: string; name: string }
 
 export interface Toast {
   chat: string;
@@ -127,7 +135,13 @@ export interface Toast {
  *               Only moves on --mark-read (panel open, or middle-click).
  */
 /** guid is what AppleScript's `chat id` wants ("any;+;<id>"); chat is the bare id. */
-export interface GroupInfo { name: string; guid: string; participants: string[] }
+export interface GroupInfo {
+  name: string;
+  guid: string;
+  participants: string[];
+  participantNames?: Record<string, string>;
+  participantShortNames?: Record<string, string>;
+}
 
 export interface BlipState {
   watermark: string;
@@ -169,13 +183,18 @@ export interface BlipOutput {
   failures: Toast[];
   /** Links that just arrived — the surface opens the share sheet on the newest. */
   links: IncomingLink[];
-  codes?: SecurityCode[];
+  /** Security codes that just arrived — the widget holds the newest in memory
+   *  for a few minutes, toasts it, and types or copies it on request. */
+  codes: SecurityCode[];
   /** False means models are fresh but state could not be committed. */
   persisted: boolean;
   /** True when `threads` is the complete list (chat list fetched), not the
    *  poll window's rows — the widget overlays a shallow result onto its last
    *  deep one instead of replacing it. */
   deep: boolean;
+  /** Which reads are pushed to the Mac: "off", "all" (the mark-all gesture
+   *  only — the default) or "thread" (also each conversation you open). */
+  readPush: PushRead;
 }
 
 // ---------------------------------------------------------------- state I/O
@@ -188,6 +207,29 @@ export function validPins(raw: unknown): Record<string, number | null> {
       .filter(([chat, v]) => chat !== "" && (v === null || Number.isInteger(v)))
       .map(([chat, v]) => [chat, v === null ? null : Number(v)]),
   );
+}
+
+export function nameMap(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  return Object.fromEntries(Object.entries(raw).slice(0, 64).filter(([handle, name]) =>
+    handle.length <= 320 && typeof name === "string" && name.length <= 160 && name.trim() !== ""));
+}
+
+export function normalizeGroups(raw: unknown): Record<string, GroupInfo> {
+  const out: Record<string, GroupInfo> = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [chat, g] of Object.entries(raw as Record<string, unknown>)) {
+    if (!g || typeof g !== "object") continue;
+    const r = g as Record<string, unknown>;
+    out[chat] = {
+      name: typeof r.name === "string" ? r.name : "",
+      guid: typeof r.guid === "string" ? r.guid : "",
+      participants: Array.isArray(r.participants) ? r.participants.filter((h): h is string => typeof h === "string") : [],
+      ...(Object.keys(nameMap(r.participantNames)).length ? {participantNames:nameMap(r.participantNames)} : {}),
+      ...(Object.keys(nameMap(r.participantShortNames)).length ? {participantShortNames:nameMap(r.participantShortNames)} : {}),
+    };
+  }
+  return out;
 }
 
 export function loadState(path = STATE_PATH): BlipState {
@@ -220,7 +262,10 @@ export function loadState(path = STATE_PATH): BlipState {
         ? s.selfChats.filter((chat): chat is string => typeof chat === "string")
         : [],
       readMarks: s.readMarks && typeof s.readMarks === "object" ? { ...s.readMarks } : {},
-      groups: s.groups && typeof s.groups === "object" ? { ...s.groups } : {},
+      // Every cached group goes through the same shape fetchGroups() enforces:
+      // a participants OBJECT in state.json threw inside groupName() on every
+      // poll until the next deep refresh (Astra B#6).
+      groups: normalizeGroups(s.groups),
       chatAliases: s.chatAliases && typeof s.chatAliases === "object"
         ? Object.fromEntries(Object.entries(s.chatAliases).filter(([, v]) => typeof v === "string" && v !== ""))
         : {},
@@ -299,7 +344,32 @@ export function loadMutelist(path = MUTELIST_PATH): string[] {
 /** Display name for a chat, falling back to the raw handle for unknown numbers. */
 export function displayName(msgs: ImsgMessage[]): string {
   for (const m of msgs) if (m.name) return m.name;
-  return chatKey(msgs[0]);
+  return prettyHandle(chatKey(msgs[0]));
+}
+
+/** Messages' "Filter Unknown Senders" files a stranger's SMS under a chat whose
+ *  id is the number with "(filtered)" appended (`any;-;+1818…(filtered)`). The
+ *  id stays the key — sending and reading need it — but the person is the
+ *  number, so the list shows that. */
+export function prettyHandle(id: string): string {
+  return id.replace(/\(filtered\)$/i, "");
+}
+
+/** Never expose Messages' U+FFFC attachment marker as a dotted OBJ glyph. */
+export function messagePreview(
+  text: unknown,
+  attachment?: { name?: unknown; mime?: unknown } | null,
+): string {
+  const cleaned = String(text ?? "").replace(/\uFFFC/g, "").trim();
+  if (cleaned) return cleaned;
+  if (!attachment) return "";
+  const mime = String(attachment.mime ?? "").toLowerCase();
+  const name = String(attachment.name ?? "").toLowerCase();
+  if (mime.startsWith("image/") || /\.(?:avif|gif|heic|heif|jpe?g|png|webp)$/.test(name)) return "Photo";
+  if (mime.startsWith("video/") || /\.(?:m4v|mov|mp4|webm)$/.test(name)) return "Video";
+  if (mime.startsWith("audio/") || /\.(?:aac|m4a|mp3|wav)$/.test(name)) return "Audio message";
+  if (mime === "text/vcard" || /\.vcf$/.test(name)) return "Contact card";
+  return "Attachment";
 }
 
 /**
@@ -349,6 +419,19 @@ export function detectSelfChats(msgs: ImsgMessage[], minTwins = 1): string[] {
   return [...chats].filter(Boolean);
 }
 
+/** The union of two tapback lists (one entry per emoji + sender); undefined when both are empty. */
+export function mergeTapbacks(a?: Tapback[] | null, b?: Tapback[] | null): Tapback[] | undefined {
+  const all = [...(a ?? []), ...(b ?? [])];
+  if (all.length === 0) return undefined;
+  const seen = new Set<string>();
+  return all.filter((t) => {
+    const k = `${t.emoji}\u0000${t.from_me}\u0000${t.by ?? ""}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 export function dedupeSelfEcho(msgs: ImsgMessage[], knownSelfChats: string[] = []): ImsgMessage[] {
   const contextKey = (m: ImsgMessage) => `${chatKey(m)}\u0000${m.handle || ""}\u0000${m.ts}`;
   const contentKey = (m: ImsgMessage) => `${contextKey(m)}\u0000${m.text}`;
@@ -357,6 +440,17 @@ export function dedupeSelfEcho(msgs: ImsgMessage[], knownSelfChats: string[] = [
   const emptySent = new Set(
     msgs.filter((m) => selfChats.has(chatKey(m)) && m.from_me && m.text === "").map(contextKey),
   );
+  // Messages attaches a tapback to ONE of the two rows of a self-thread
+  // message — whichever the reacting device considers the message. Whatever
+  // is dropped below hands its tapbacks to the row that stays, so a reaction
+  // on your own note is seen no matter which twin carried it.
+  const emptySentTapbacks = new Map<string, Tapback[] | undefined>();
+  for (const m of msgs) {
+    if (selfChats.has(chatKey(m)) && m.from_me && m.text === "") {
+      const k = contextKey(m);
+      emptySentTapbacks.set(k, mergeTapbacks(emptySentTapbacks.get(k), m.tapbacks));
+    }
+  }
   const retractedSent = new Set(
     msgs.filter((m) => selfChats.has(chatKey(m)) && m.from_me && m.retracted === true).map(contextKey),
   );
@@ -383,14 +477,15 @@ export function dedupeSelfEcho(msgs: ImsgMessage[], knownSelfChats: string[] = [
       const key = contentKey(m);
       const idx = selfText.get(key);
       if (idx !== undefined && out[idx]!.from_me !== m.from_me) {
-        if (m.from_me) out[idx] = { ...out[idx]!, from_me: true };
+        const kept = out[idx]!;
+        out[idx] = { ...kept, from_me: kept.from_me || m.from_me, tapbacks: mergeTapbacks(kept.tapbacks, m.tapbacks) };
         continue;
       }
       selfText.set(key, out.length);
     }
 
     if (emptySent.has(context) && !m.from_me) {
-      out.push({ ...m, from_me: true });
+      out.push({ ...m, from_me: true, tapbacks: mergeTapbacks(m.tapbacks, emptySentTapbacks.get(context)) });
       continue;
     }
     out.push(m);
@@ -433,10 +528,29 @@ export function hasIdentity(m: ImsgMessage): boolean {
  * else the members' names. Member names are resolved from whoever has spoken
  * in the fetched window; a silent member falls back to their handle.
  */
+/**
+ * A group "name" that is merely the chat id is NOT a name. `imsg chats`
+ * substitutes the identifier when a group has no display name, so the raw
+ * `3734fc1a…` came back as the name and won every `||` chain ahead of the
+ * participant fallback - the fallback was unreachable for exactly the groups
+ * it exists for (Fred, 2026-09-10). Aliases count too: a re-keyed group's
+ * retired id is just as much not-a-name.
+ */
+export function namedGroup(name: unknown, chat: string, aliases: string[] = []): string {
+  const value = String(name ?? "").trim();
+  if (!value || value === chat || aliases.includes(value)) return "";
+  return value;
+}
+
 export function groupName(chat: string, info: GroupInfo | undefined, byHandle: Map<string, string>): string {
   if (info?.name) return info.name;
-  const members = (info?.participants ?? []).map((h) => byHandle.get(h) || h);
-  return members.length ? members.join(", ") : chat;
+  const members = groupParticipants(info, byHandle).map((member) =>
+    info?.participantShortNames?.[member.handle] || member.name);
+  // A "(filtered)" stranger is not a phone/email shape, so it lands here (the
+  // never-a-DM-target rule stands: nothing sends to it); its label is the number.
+  if (members.length === 0) return prettyHandle(chat);
+  if (members.length === 1) return members[0]!;
+  return members.slice(0, -1).join(", ") + " & " + members[members.length - 1];
 }
 
 export type SendService = "iMessage" | "SMS" | "RCS";
@@ -488,6 +602,23 @@ export function sendServiceForMessages(msgs: ImsgMessage[]): SendService {
   return "iMessage";
 }
 
+/** Bounded, de-duplicated people for a group contact menu. */
+export function groupParticipants(
+  info: GroupInfo | undefined,
+  byHandle: Map<string, string> = new Map(),
+): GroupParticipant[] {
+  const result: GroupParticipant[] = [];
+  const seen = new Set<string>();
+  for (const raw of info?.participants ?? []) {
+    const handle = String(raw || "").trim().slice(0, 320);
+    if (!handle || seen.has(handle) || result.length >= 64) continue;
+    seen.add(handle);
+    const resolved = info?.participantNames?.[handle] || byHandle.get(handle) || handle;
+    result.push({ handle, name: String(resolved).trim().slice(0, 160) || handle });
+  }
+  return result;
+}
+
 export function buildThreads(
   msgs: ImsgMessage[],
   watermark: string,
@@ -522,12 +653,13 @@ export function buildThreads(
       handle: String(last.handle || chat),
       service: isGroupChat(chat) ? last.service : sendServiceForMessages(sorted),
       last_ts: last.ts,
-      last_text: last.text,
+      last_text: messagePreview(last.text, last.attachments?.[0]),
       last_from_me: last.from_me,
       count: sorted.length,
       unread,
       pinned: false,
       pin_order: null,
+      ...(isGroupChat(chat) ? { participants: groupParticipants(groups[chat], byHandle) } : {}),
     });
   }
 
@@ -553,8 +685,9 @@ function digest(value: string): string {
 }
 
 function normalizeToastKey(value: string): string {
-  // "fail:" (selectFailures) and "link:" (selectIncomingLinks) are key
-  // namespaces — keep them verbatim or their dedupe rings reset every load.
+  // "fail:" (selectFailures), "link:" (selectIncomingLinks) and "code:"
+  // (selectCodes) are key namespaces — keep them verbatim or their dedupe
+  // rings reset every load.
   return /^(fail:|link:|code:)?sha256:[0-9a-f]{64}$/.test(value) ? value : digest(value);
 }
 
@@ -657,6 +790,47 @@ export function dropMutedChats(chats: ChatInfo[] | null, mute: string[], muted: 
   });
 }
 
+/** Chat ids the unread ledger may still name: the current window, plus every
+ *  conversation `imsg chats` still lists. hide_spam / mute omit a chat from
+ *  that list; a missing chats fetch leaves only the window. */
+export function visibleLedgerChats(msgs: ImsgMessage[], chats: ChatInfo[] | null): Set<string> {
+  const ids = new Set<string>();
+  for (const m of msgs) {
+    const c = chatKey(m);
+    if (c) ids.add(c);
+  }
+  if (chats) {
+    for (const c of chats) {
+      ids.add(c.id);
+      for (const a of c.aliases) ids.add(a);
+    }
+  }
+  return ids;
+}
+
+/** Astra B#3: a capped window must not zero an unread it never saw. Only
+ *  restore chats that are still visible — otherwise Spam we hid in SQL
+ *  pins catch-up (oldestUnread never appears) and keeps the bar badge. */
+export function keepCappedUnread(
+  exactCounts: Record<string, number>,
+  exactOldest: Record<string, string>,
+  priorCounts: Record<string, number>,
+  priorOldest: Record<string, string>,
+  inWindow: Set<string>,
+  visible: Set<string>,
+): { counts: Record<string, number>; oldest: Record<string, string> } {
+  const counts = { ...exactCounts };
+  const oldest = { ...exactOldest };
+  for (const [c, n] of Object.entries(priorCounts)) {
+    if (n > 0 && !inWindow.has(c) && !(c in counts) && visible.has(c)) {
+      counts[c] = n;
+      if (priorOldest[c]) oldest[c] = priorOldest[c]!;
+    }
+  }
+  return { counts, oldest };
+}
+
+
 /** First http(s) URL in a message, or "". Trailing punctuation that a person
  *  would read as sentence-end is trimmed; a URL inside the text is fine. */
 export function firstUrl(text: string | null | undefined): string {
@@ -665,9 +839,22 @@ export function firstUrl(text: string | null | undefined): string {
   return m[0].replace(/[.,;:!?)\]}'"]+$/, "");
 }
 
+/** Every http(s) URL in a text, in order, trailing punctuation dropped like firstUrl(). */
+export function allUrls(text: string | null | undefined): string[] {
+  const out: string[] = [];
+  for (const m of String(text ?? "").matchAll(/https?:\/\/[^\s<>"']+/gi)) {
+    const u = m[0].replace(/[.,;:!?)\]}'"]+$/, "");
+    if (u && !out.includes(u)) out.push(u);
+  }
+  return out;
+}
+
 export interface IncomingLink {
   chat: string;
+  /** The first link, `urls[0]`. */
   url: string;
+  /** Every link of the message, first included: the share sheet steps through them. */
+  urls: string[];
   ts: string;
   key: string;
 }
@@ -696,15 +883,18 @@ export function selectIncomingLinks(
     if (m.ts <= watermark) continue;
     const chat = chatKey(m);
     if (self.has(chat)) continue;
-    const url = firstUrl(m.text);
-    if (!url) continue;
+    const urls = allUrls(m.text);
+    if (urls.length === 0) continue;
+    const url = urls[0]!;
     const key = "link:" + toastKey(m);
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ chat, url, ts: m.ts, key });
+    out.push({ chat, url, urls, ts: m.ts, key });
   }
   return out.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
 }
+
+// ------------------------------------------------------ security codes
 
 export interface SecurityCode {
   chat: string;
@@ -793,7 +983,6 @@ export function selectCodes(
   return out.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
 }
 
-
 // ------------------------------------------------- pushing reads to the Mac
 
 export const BRIDGE_CONF = `${HOME}/.config/blip/bridge.conf`;
@@ -827,11 +1016,15 @@ export function pushReadPolicy(path = BRIDGE_CONF): PushRead {
 /** What to hand `imsg-read`, or null when this run should tell the Mac nothing. */
 export function pushReadArgs(
   policy: PushRead,
-  opts: { markRead: boolean; readChat: string },
+  opts: { markRead: boolean; readChat: string; clearedUnread?: boolean },
 ): string[] | null {
   if (policy === "off") return null;
   if (opts.markRead) return ["--all"];
   if (policy !== "thread") return null;
+  // Only when this run turned unread into read. A poll that cleared nothing
+  // has nothing to tell the Mac, and telling it anyway opens the conversation
+  // there — once per poll for as long as the thread stays open.
+  if (opts.clearedUnread === false) return null;
   const chat = String(opts.readChat || "");
   // Groups have no imessage:// form, so only a DM can be aimed at.
   if (!/^\+?[0-9]{3,15}$/.test(chat) && !/^[^@\s]+@[^@\s]+$/.test(chat)) return null;
@@ -927,6 +1120,13 @@ export interface FetchResult {
   online: boolean;
   error: string;
   msgs: ImsgMessage[];
+  /** Rows the bridge returned BEFORE hasIdentity filtering. Pagination must
+   *  count these: one dropped orphan in a full page otherwise reads as
+   *  "the bridge ran out", and catch-up stops short of older unread. */
+  fetchedCount: number;
+  /** True when catch-up hit CATCHUP_MAX_ROWS before reaching the cutoff: the
+   *  window does NOT cover every outstanding unread (Astra B#3). */
+  capped?: boolean;
 }
 
 /**
@@ -972,25 +1172,25 @@ export function fetchMessages(limit: number, runner = spawnSync): FetchResult {
 
   if (res.error) {
     // spawn itself failed: ~/bin/imsg missing (run blip-setup) or not executable
-    return { ok: false, online: false, error: `cannot run ~/bin/imsg: ${(res.error as Error).message}`, msgs: [] };
+    return { ok: false, online: false, error: `cannot run ~/bin/imsg: ${(res.error as Error).message}`, msgs: [], fetchedCount: 0 };
   }
   if (res.status === null) {
     // killed by our timeout — a Mac asleep behind a live ControlMaster looks exactly like this
-    return { ok: false, online: false, error: "imsg timed out (Mac asleep?)", msgs: [] };
+    return { ok: false, online: false, error: "imsg timed out (Mac asleep?)", msgs: [], fetchedCount: 0 };
   }
   if (res.status === 69 || res.status === 255) {
-    return { ok: false, online: false, error: "Mac unreachable", msgs: [] };
+    return { ok: false, online: false, error: "Mac unreachable", msgs: [], fetchedCount: 0 };
   }
   if (res.status !== 0) {
     const err = explainBridgeError(res.status, (res.stderr || "").toString());
-    return { ok: false, online: true, error: err, msgs: [] };
+    return { ok: false, online: true, error: err, msgs: [], fetchedCount: 0 };
   }
   try {
     const parsed = JSON.parse(res.stdout as string);
     if (!Array.isArray(parsed)) throw new Error("not an array");
-    return { ok: true, online: true, error: "", msgs: (parsed as ImsgMessage[]).filter(hasIdentity) };
+    return { ok: true, online: true, error: "", msgs: (parsed as ImsgMessage[]).filter(hasIdentity), fetchedCount: parsed.length };
   } catch (e) {
-    return { ok: false, online: true, error: `bad JSON from imsg: ${e}`, msgs: [] };
+    return { ok: false, online: true, error: `bad JSON from imsg: ${e}`, msgs: [], fetchedCount: 0 };
   }
 }
 
@@ -1011,7 +1211,8 @@ export function fetchMessagesAfter(
   while (true) {
     const fetched = fetchMessages(limit, runner);
     // A bridge that keeps returning "full" pages must not grow this forever.
-    if (!fetched.ok || !cutoff || fetched.msgs.length < limit || limit >= CATCHUP_MAX_ROWS) return fetched;
+    if (!fetched.ok || !cutoff || fetched.fetchedCount < limit) return fetched;
+    if (limit >= CATCHUP_MAX_ROWS) return { ...fetched, capped: minTs(fetched.msgs, "") >= cutoff };
     // Fetch beyond the boundary, not merely to it: several rows can share a
     // one-second timestamp and otherwise straddle the window edge.
     if (minTs(fetched.msgs, "") < cutoff) return fetched;
@@ -1081,6 +1282,8 @@ export function unreadOldest(
 /** One row of `imsg --json chats`: a conversation with preview + pin metadata. */
 export interface ChatInfo {
   id: string;
+  /** Canonical id followed by historical ids for this conversation. */
+  aliases: string[];
   name: string | null;
   service: string;
   last: string;
@@ -1091,8 +1294,8 @@ export interface ChatInfo {
   /** Mirrored from Messages' pinning preferences; absent on old bridges. */
   pinned: boolean;
   pin_order: number | null;
-  /** Other chat rows of this same conversation (imsg ≥ 2.3.0). */
-  aliases: string[];
+  last_attachment?: { name: string; mime: string } | null;
+  pin_name: string | null;
 }
 
 /** How many conversations the sidebar lists (chat.db has hundreds). */
@@ -1116,20 +1319,45 @@ export function fetchChats(runner = spawnSync): ChatInfo[] | null {
     const rows = JSON.parse(res.stdout as string);
     if (!Array.isArray(rows)) return null;
     return rows
-      .filter((r) => r && typeof r.id === "string" && r.id !== "")
-      .map((r) => ({
-        id: String(r.id),
-        name: typeof r.name === "string" ? r.name : null,
-        service: String(r.service ?? ""),
-        last: String(r.last ?? ""),
-        last_text: String(r.last_text ?? ""),
-        last_from_me: r.last_from_me === true,
-        last_handle: String(r.last_handle ?? ""),
-        last_name: typeof r.last_name === "string" ? r.last_name : null,
-        pinned: r.pinned === true,
-        pin_order: Number.isInteger(r.pin_order) ? Number(r.pin_order) : null,
-        aliases: Array.isArray(r.aliases) ? r.aliases.filter((a: unknown) => typeof a === "string" && a !== "") : [],
-      }));
+      .filter((r) => r && typeof r.id === "string" && r.id.length > 0 && r.id.length <= 512 &&
+        !/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(r.id))
+      .map((r) => {
+        const id = String(r.id);
+        const aliases = [...new Set([
+          id,
+          ...(Array.isArray(r.aliases) ? r.aliases : []),
+        ].filter((value): value is string =>
+          typeof value === "string" && value.length > 0 && value.length <= 512 &&
+          !/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(value),
+        ))].slice(0, 16);
+        const legacyPinOrder = Number.isInteger(r.pinned_order) ? Number(r.pinned_order) : null;
+        const pinOrder = Number.isInteger(r.pin_order) ? Number(r.pin_order) : legacyPinOrder;
+        const boundedPinOrder = pinOrder !== null && pinOrder >= 0 && pinOrder < 16 ? pinOrder : null;
+        const rawPinName = typeof r.pin_name === "string" ? r.pin_name : r.pinned_name;
+        return {
+          id,
+          aliases,
+          name: typeof r.name === "string" ? r.name : null,
+          service: String(r.service ?? ""),
+          last: String(r.last ?? ""),
+          last_text: messagePreview(
+            r.last_text,
+            r.last_attachment && typeof r.last_attachment === "object"
+              ? { name: r.last_attachment.name, mime: r.last_attachment.mime }
+              : null,
+          ),
+          last_from_me: r.last_from_me === true,
+          last_handle: String(r.last_handle ?? ""),
+          last_name: typeof r.last_name === "string" ? r.last_name : null,
+          last_attachment: r.last_attachment && typeof r.last_attachment === "object"
+            ? { name: String(r.last_attachment.name ?? ""), mime: String(r.last_attachment.mime ?? "") }
+            : null,
+          pinned: r.pinned === true || boundedPinOrder !== null,
+          pin_order: boundedPinOrder,
+          pin_name: typeof rawPinName === "string" && rawPinName.trim() !== ""
+            ? rawPinName.trim().slice(0, 160) : null,
+        };
+      });
   } catch {
     return null;
   }
@@ -1204,6 +1432,16 @@ export function foldThreadAliases(threads: Thread[], aliases: Record<string, str
 }
 
 /** Same fold for a per-chat ledger (unread counts, oldest-unread stamps). */
+/**
+ * The alias rows folded into one canonical conversation. The unread ledger
+ * counts on ORIGINAL chat keys and the fold happens afterwards, so a read of
+ * the canonical must also mark every alias, or an alias's unread survives the
+ * read and reappears under the conversation the user just finished (Astra #9).
+ */
+export function aliasesOf(chatAliases: Record<string, string>, canonical: string): string[] {
+  return Object.entries(chatAliases).filter(([, c]) => c === canonical).map(([a]) => a);
+}
+
 export function foldChatRecord<T>(
   rec: Record<string, T>,
   aliases: Record<string, string>,
@@ -1226,14 +1464,50 @@ export function mergeChats(
   unreadCounts: Record<string, number>,
 ): Thread[] {
   const infoByChat = new Map(chats.map((c) => [c.id, c]));
+  // Every participant name the window already resolved, so a chat that is new
+  // to this run still names its group after people rather than bare handles.
+  const participantNames = new Map<string, string>();
+  for (const thread of threads) {
+    for (const person of thread.participants ?? []) {
+      if (person.name && !participantNames.has(person.handle)) {
+        participantNames.set(person.handle, person.name);
+      }
+    }
+  }
   const applyPin = (thread: Thread): Thread => {
     const info = infoByChat.get(thread.chat);
     if (!info) return thread;
+    const aliases = info.aliases ?? [info.id];
     const pinned = info.pinned === true;
     const pin_order = Number.isInteger(info.pin_order) ? Number(info.pin_order) : null;
-    return thread.pinned === pinned && thread.pin_order === pin_order
-      ? thread
-      : { ...thread, pinned, pin_order };
+    const group = isGroupChat(thread.chat);
+    const groupInfo = groups[thread.chat]
+      ?? aliases.map((alias) => groups[alias]).find((value) => value !== undefined);
+    const knownParticipantNames = new Map<string, string>(
+      (thread.participants ?? []).map((person) => [person.handle, person.name]),
+    );
+    return {
+      ...thread,
+      aliases,
+      guid: group ? groupInfo?.guid ?? thread.guid : "",
+      name: group
+          ? (namedGroup(groupInfo?.name, thread.chat, aliases)
+            || namedGroup(info.name, thread.chat, aliases)
+            || (groupInfo?.participants.length
+              ? groupName(thread.chat, groupInfo, knownParticipantNames)
+              : namedGroup(thread.name, thread.chat, aliases) || thread.chat))
+        : (info.last_name || info.name || thread.name || thread.chat),
+      service: info.service || thread.service,
+      last_text: info.last === thread.last_ts ? info.last_text : messagePreview(thread.last_text),
+      pinned,
+      pin_order,
+      ...(info.pin_name ? { pin_name: info.pin_name } : {}),
+      ...(group ? {
+        participants: groupInfo
+          ? groupParticipants(groupInfo, knownParticipantNames)
+          : thread.participants ?? [],
+      } : {}),
+    };
   };
   const have = new Set(threads.map((t) => t.chat));
   const out = threads.map(applyPin);
@@ -1241,12 +1515,17 @@ export function mergeChats(
     if (have.has(c.id)) continue;
     have.add(c.id);
     const group = isGroupChat(c.id);
+    const aliases = c.aliases ?? [c.id];
+    const groupInfo = groups[c.id]
+      ?? aliases.map((alias) => groups[alias]).find((value) => value !== undefined);
     const name = group
-      ? (groups[c.id]?.name || c.name || c.id)
+        ? (namedGroup(groupInfo?.name, c.id, aliases) || namedGroup(c.name, c.id, aliases)
+          || groupName(c.id, groupInfo, participantNames))
       : (c.last_name || c.name || c.id);
     out.push({
       chat: c.id,
-      guid: group ? groups[c.id]?.guid ?? "" : "",
+      aliases,
+      guid: group ? groupInfo?.guid ?? "" : "",
       name,
       handle: group ? c.last_handle || c.id : c.id,
       service: c.service,
@@ -1254,9 +1533,11 @@ export function mergeChats(
       last_text: c.last_text,
       last_from_me: c.last_from_me,
       count: 0,
-      unread: unreadCounts[c.id] ?? 0,
+      unread: aliases.reduce((sum, alias) => sum + (unreadCounts[alias] ?? 0), 0),
       pinned: c.pinned === true,
       pin_order: Number.isInteger(c.pin_order) ? Number(c.pin_order) : null,
+      ...(c.pin_name ? { pin_name: c.pin_name } : {}),
+      ...(group ? { participants: groupParticipants(groupInfo) } : {}),
     });
   }
   return out.sort(compareThreads);
@@ -1271,12 +1552,22 @@ export function fetchGroups(runner = spawnSync): Record<string, GroupInfo> | nul
     const out: Record<string, GroupInfo> = {};
     for (const r of rows) {
       if (!r || typeof r.chat !== "string") continue;
+      const participantNames = r.participant_names && typeof r.participant_names === "object"
+        && !Array.isArray(r.participant_names)
+        ? Object.fromEntries(Object.entries(r.participant_names)
+          .filter(([handle, name]) => typeof handle === "string" && handle.length <= 320
+            && typeof name === "string" && name.length <= 160)
+          .slice(0, 64)) as Record<string, string>
+        : {};
       out[r.chat] = {
         name: typeof r.name === "string" ? r.name : "",
         guid: typeof r.guid === "string" ? r.guid : "",
         participants: Array.isArray(r.participants)
           ? r.participants.filter((h: unknown) => typeof h === "string")
           : typeof r.participants === "string" ? r.participants.split(",").filter(Boolean) : [],
+        ...(Object.keys(participantNames).length ? { participantNames } : {}),
+        ...(Object.keys(nameMap(r.participant_short_names)).length
+          ? {participantShortNames:nameMap(r.participant_short_names)} : {}),
       };
     }
     return out;
@@ -1287,7 +1578,7 @@ export function fetchGroups(runner = spawnSync): Record<string, GroupInfo> | nul
 
 // ---------------------------------------------------------------- main
 
-export function collect(deep: boolean, markRead = false, readChat = "", seenTs = "", otpAutofill = false): BlipOutput {
+export function collect(deep: boolean, markRead = false, readChat = "", seenTs = ""): BlipOutput {
   const now = new Date().toISOString();
   const state = loadState();
   // On migration, seed the ledger all the way back to what the user last read.
@@ -1314,6 +1605,15 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
       failures: [],
       links: [],
       persisted: true,
+      // Reported on the failure path too: it comes from a local file, needs no
+      // Mac, and "why are reads not reaching my phone" is asked precisely when
+      // something is broken. Without it `status` says read_push=? exactly then.
+      readPush: pushReadPolicy(),
+      // The widget guards both with Array.isArray/=== true, so these were never
+      // a crash — but BlipOutput declares them required and this return did not
+      // carry them, so the type was lying about the failure path.
+      codes: [],
+      deep: false,
     };
   }
 
@@ -1351,6 +1651,7 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
     const own = chatMax[readChat] ?? "";
     readMarks[readChat] = seenTs !== "" ? seenTs : (own > nowTs ? own : nowTs);
   }
+  const readSeen = readChat ? readMarks[readChat]! : "";
   // Group metadata is ~1000 rows; refresh it only on a deep (panel) fetch and
   // keep the last good copy if the lookup fails.
   const groups = (deep ? fetchGroups() : null) ?? state.groups;
@@ -1365,10 +1666,33 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   const msgs = dropMuted(deduped, muted);
   let exactCounts = unreadCounts(msgs, state.readMark, state.readMarks, selfChats);
   let exactOldest = unreadOldest(msgs, state.readMark, state.readMarks, selfChats);
+  // Deep runs complete the sidebar from `imsg chats`. A capped catch-up
+  // needs that list too: otherwise a chat hide_spam dropped in SQL is
+  // restored from the ledger (Astra B#3) and pins every later poll.
+  const listed = (deep || fetched.capped) ? dropMutedChats(fetchChats(), mute, muted) : null;
+  if (fetched.capped) {
+    const inWindow = new Set(msgs.map(chatKey));
+    const kept = keepCappedUnread(
+      exactCounts, exactOldest,
+      state.unreadCounts, state.unreadOldest,
+      inWindow, visibleLedgerChats(msgs, listed),
+    );
+    exactCounts = kept.counts;
+    exactOldest = kept.oldest;
+  }
+  // Did THIS run actually turn unread into read for the chat being viewed?
+  // Every poll while a thread is open carries its readChat (that is what keeps
+  // a message landing in the open conversation from flashing unread), so
+  // without this the Mac was told again on every single poll. Each of those
+  // costs an ssh AND pulls Messages to the front, because aiming its menu at
+  // one conversation means opening it — five pushes in one minute, four of
+  // them "nothing unread" (measured, 2026-09-08).
+  let clearedUnread = false;
   if (markRead) {
     exactCounts = {};
     exactOldest = {};
   } else if (readChat) {
+    clearedUnread = (exactCounts[readChat] ?? 0) > 0;
     delete exactCounts[readChat];
     delete exactOldest[readChat];
   }
@@ -1378,22 +1702,30 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
     if (ts <= readMark) delete readMarks[chat];
   }
   const windowThreads = buildThreads(msgs, readMark, readMarks, groups, exactCounts);
-  // Deep runs (a surface is open) complete the list from `imsg chats`; a
-  // shallow poll returns the window's rows and the widget keeps its last
+  // A shallow poll returns the window's rows; the widget keeps its last
   // complete list in memory (it skips identical assignments anyway).
-  const chats = deep ? dropMutedChats(fetchChats(), mute, muted) : null;
+  const chats = deep ? listed : null;
   // One entry per CONVERSATION. A re-keyed group has several chat rows; the
   // bridge names the older ones as aliases of the live row, and the map is
   // cached so shallow polls fold identically (a conversation must never
   // blink into two between a deep run and the next poll).
   const chatAliases = chats ? aliasesFromChats(chats) : state.chatAliases;
   const pins = chats ? pinsFromChats(chats) : state.pins;
+  if (readChat) {
+    for (const a of aliasesOf(chatAliases, readChat)) {
+      if (readSeen > readMark) readMarks[a] = readSeen;   // same prune rule as the canonical
+      // An alias carrying the unread counts too: reading the canonical row
+      // cleared it, so the Mac is worth telling.
+      if ((exactCounts[a] ?? 0) > 0) clearedUnread = true;
+      delete exactCounts[a];
+      delete exactOldest[a];
+    }
+  }
   exactCounts = foldChatRecord(exactCounts, chatAliases, (a, b) => a + b);
   exactOldest = foldChatRecord(exactOldest, chatAliases, (a, b) => (a < b ? a : b));
   const foldedWindow = foldThreadAliases(windowThreads, chatAliases);
   const threads = chats ? mergeChats(foldedWindow, chats, groups, exactCounts) : applyPins(foldedWindow, pins);
-  const toast = selectToasts(msgs, state.watermark, loadAllowlist(), state.toasted)
-    .filter(t => !otpAutofill || !extractCode(t.text));
+  const toast = selectToasts(msgs, state.watermark, loadAllowlist(), state.toasted);
   const failures = selectFailures(fetched.msgs, state.toasted, nowTs);
   const links = selectIncomingLinks(msgs, state.watermark, state.toasted, selfChats);
   const codes = selectCodes(msgs, state.watermark, state.toasted, selfChats);
@@ -1401,11 +1733,14 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
 
   // Both marks advance only on a good fetch, so an outage cannot silently
   // swallow the messages that arrived during it.
+  // A row dated tomorrow (tz skew) must not become the mark everything is
+  // measured against — nothing would badge or toast until "tomorrow" (Astra B#4).
+  const highestNow = highest <= nowTs ? highest : nowTs;
   const persisted = saveState({
-    watermark: highest,
+    watermark: highestNow,
     // First ever run: adopt the current high-water rather than reporting the
     // whole preview window as unread the moment the plugin is installed.
-    readMark: state.readMark === "" ? highest : readMark,
+    readMark: state.readMark === "" ? highestNow : readMark,
     unreadCounts: exactCounts,
     unreadOldest: exactOldest,
     unreadInitialized: true,
@@ -1420,7 +1755,8 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
 
   // Only after the local state is committed: if the write failed the user
   // will be asked to read these again, and the Mac must agree.
-  if (persisted) pushRead(pushReadArgs(pushReadPolicy(), { markRead, readChat }));
+  const readPush = pushReadPolicy();
+  if (persisted) pushRead(pushReadArgs(readPush, { markRead, readChat, clearedUnread }));
 
   const warning = !persisted
     ? "state write failed; notifications paused"
@@ -1439,6 +1775,12 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
     codes: persisted ? codes : [],
     persisted,
     deep: chats !== null,
+    // Which reads reach the Mac. Surfaced so `status` can say it: the default
+    // ("all") pushes ONLY on the mark-all gesture, so reading a conversation
+    // clears it here and leaves the iPhone's badge alone — correct by design
+    // and impossible to tell apart from a broken push without this (Fred,
+    // 2026-09-08: "they are not marking them read on my iphone").
+    readPush,
   };
 }
 
@@ -1450,7 +1792,7 @@ if (import.meta.main) {
   const si = process.argv.indexOf("--seen");
   const seenTs = si >= 0 ? String(process.argv[si + 1] ?? "") : "";
   try {
-    console.log(JSON.stringify(collect(deep, markRead, readChat, seenTs, process.argv.includes("--otp-autofill"))));
+    console.log(JSON.stringify(collect(deep, markRead, readChat, seenTs)));
   } catch (e) {
     console.log(
       JSON.stringify({

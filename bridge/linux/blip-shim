@@ -8,11 +8,12 @@
 # inherits Full Disk Access + Automation consent (cron does not), which is
 # what makes a plain ssh session a working transport.
 #
-# Config: ~/.config/blip/bridge.conf (written by scripts/blip-setup), sourced
+# Config: ~/.config/blip/bridge.conf (written by scripts/blip-setup), parsed
 # key=value — keys: host (ssh target), key (dedicated identity, default
 # ~/.ssh/blip_ed25519; absent → general ssh), remote_bin (dir on the Mac
 # holding the tools; default ~/.blip/bin), python (default python3),
-# automation (on|off — read by the plugin, not the shim).
+# automation (on|off — read by the plugin, not the shim), hide_spam /
+# hide_unknown (on|off — injected as imsg flags; default off).
 #
 # The connectivity probe MUST be `ssh -n`: a bare probe eats stdin and
 # silently empties `imsg-send --file-stdin` payloads (learned the hard way).
@@ -22,8 +23,8 @@ CONF="${BLIP_BRIDGE_CONF:-$HOME/.config/blip/bridge.conf}"
 # remote_bin is expanded by the MAC's shell, so keep it literal here — a bare
 # ~ or $HOME in bridge.conf would expand to the Linux home (it did).
 host=""; remote_bin='$HOME/.blip/bin'; python="python3"; key="$HOME/.ssh/blip_ed25519"
-# Parsed, not sourced: the file is data. Only the three known keys are read,
-# quotes are stripped, and each value is validated below.
+hide_spam=""; hide_unknown=""
+# Parsed, not sourced: the file is data. Known keys only, quotes stripped.
 if [[ -r "$CONF" ]]; then
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%#*}"; line="${line//[[:space:]]/}"
@@ -35,6 +36,8 @@ if [[ -r "$CONF" ]]; then
       remote_bin) remote_bin="$v" ;;
       python) python="$v" ;;
       key) key="$v" ;;
+      hide_spam) hide_spam="$v" ;;
+      hide_unknown) hide_unknown="$v" ;;
     esac
   done < "$CONF"
 fi
@@ -60,13 +63,23 @@ esac
 # the Mac side can ONLY run the bridge tools, so the remote command is bare and
 # the probe is dispatch's "ping". The key gets its own ControlMaster socket:
 # sharing the general key's master would silently bypass the forced command.
+imsg_flags=()
+if [[ "$tool" == imsg ]]; then
+  case "${hide_spam,,}" in on|yes|true|1) imsg_flags+=(--hide-spam) ;; esac
+  case "${hide_unknown,,}" in on|yes|true|1) imsg_flags+=(--hide-unknown) ;; esac
+fi
+if ((${#imsg_flags[@]})); then
+  quoted_flags=" ${imsg_flags[*]@Q}"
+else
+  quoted_flags=""
+fi
 if [[ -r "$key" ]]; then
   ssh=(ssh -i "$key" -o IdentitiesOnly=yes -o ControlMaster=auto
        -o "ControlPath=$HOME/.ssh/cm-blip-%r@%h:%p" -o ControlPersist=10m)
-  probe="ping"; remote="$tool ${*@Q}"
+  probe="ping"; remote="$tool$quoted_flags ${*@Q}"
 else
   ssh=(ssh)
-  probe="true"; remote="PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH $python $remote_bin/$tool ${*@Q}"
+  probe="true"; remote="PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH $python $remote_bin/$tool$quoted_flags ${*@Q}"
 fi
 if ! err="$("${ssh[@]}" -n -o ConnectTimeout=5 -o BatchMode=yes -- "$host" "$probe" 2>&1 >/dev/null)"; then
   # keep the exit code (69 → Blip greys out) but say why: auth, host key, dispatch refusal…

@@ -227,7 +227,7 @@ def _max_attachment_rowid() -> int:
         return 0
 
 
-def wait_for_copy(staged: str, baseline: int = 0, timeout: float = 20.0) -> tuple[bool, int]:
+def wait_for_copy(staged: str, baseline: int = 0, timeout: float = 20.0, chat_ident: str | None = None) -> tuple[bool, int]:
     """After `send POSIX file`, Messages copies the staged file into its own
     Attachments store — but for a REMOTE recipient that copy (and the upload
     that reads it) can lag several seconds. Deleting the staged file the
@@ -249,12 +249,18 @@ def wait_for_copy(staged: str, baseline: int = 0, timeout: float = 20.0) -> tupl
         try:
             con = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
             row = con.execute(
+                # Correlated with THIS send's conversation: two overlapping sends
+                # of image.png used to read each other's rows, and one deleted
+                # the other's staged file on a stray error=25 (Astra C#3).
                 """SELECT a.filename, m.error FROM attachment a
                    JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
                    JOIN message m ON m.ROWID = maj.message_id
+                   JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+                   JOIN chat c ON c.ROWID = cmj.chat_id
                    WHERE a.transfer_name = ? AND m.is_from_me = 1 AND a.ROWID > ?
+                     AND (? IS NULL OR c.chat_identifier = ?)
                    ORDER BY a.ROWID DESC LIMIT 1""",
-                (base, baseline),
+                (base, baseline, chat_ident, chat_ident),
             ).fetchone()
             con.close()
             if row:
@@ -558,7 +564,8 @@ def main() -> None:
             # osascript returning 0 proves NOTHING for files — failures
             # surface later in chat.db. Wait for Messages' own copy before
             # touching the staged file, and surface a delivery error loudly.
-            copied, msg_err = wait_for_copy(staged, baseline)
+            chat_ident = (args.chat_id.split(";+;")[-1] if args.chat_id else args.to) or None
+            copied, msg_err = wait_for_copy(staged, baseline, chat_ident=chat_ident)
             if msg_err:
                 unstage(staged)
                 parts_failed.append(f"file (Messages error {msg_err} — not delivered)")

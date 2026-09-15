@@ -35,6 +35,7 @@ import {
   renameSync, utimesSync, writeSync,
 } from "node:fs";
 import { join } from "node:path";
+import { sweepStale } from "./avatar";
 import { pathToFileURL } from "node:url";
 
 const HOME = process.env.HOME ?? homedir();
@@ -203,7 +204,7 @@ function writeAtomic(path: string, bytes: Uint8Array | string): void {
   renameSync(tmp, path);
 }
 
-async function get(url: string, timeout: number): Promise<Response | null> {
+async function get(url: string, timeout: number): Promise<{ res: Response; timer: ReturnType<typeof setTimeout> } | null> {
   let current = url;
   for (let hop = 0; hop <= MAX_HOPS; hop++) {
     const why = await safeUrl(current);
@@ -217,14 +218,19 @@ async function get(url: string, timeout: number): Promise<Response | null> {
         signal: ctl.signal,
         headers: { "user-agent": UA, accept: "text/html,application/xhtml+xml,image/*;q=0.8,*/*;q=0.5" },
       });
-    } catch { return null; } finally { clearTimeout(timer); }
+    } catch { clearTimeout(timer); return null; }
     if (res.status >= 300 && res.status < 400) {
+      clearTimeout(timer);
       const loc = res.headers.get("location");
       if (!loc) return null;
       try { current = new URL(loc, current).href; } catch { return null; }
       continue;                       // re-checked against the private ranges next loop
     }
-    return res.ok ? res : null;
+    if (!res.ok) { clearTimeout(timer); return null; }
+    // The deadline stays armed until the BODY is consumed: a server that sends
+    // headers promptly and then holds the stream open used to park this process
+    // forever, and the widget's preview queue behind it (Astra #20).
+    return { res, timer };
   }
   return null;
 }
@@ -236,14 +242,16 @@ async function readCapped(res: Response, cap: number): Promise<Uint8Array | null
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    total += value.length;
-    if (total > cap) { await reader.cancel().catch(() => {}); return null; }
-    chunks.push(value);
-  }
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.length;
+      if (total > cap) { await reader.cancel().catch(() => {}); return null; }
+      chunks.push(value);
+    }
+  } catch { return null; }            // the deadline fired mid-body
   const out = new Uint8Array(total);
   let at = 0;
   for (const c of chunks) { out.set(c, at); at += c.length; }
@@ -261,25 +269,30 @@ export async function fetchPreview(url: string): Promise<Preview> {
   const metaFile = `${base}.json`;
   const noneFile = `${base}.none`;
   if (fresh(metaFile, PREVIEW_TTL_MS)) {
-    try { return { ...(JSON.parse(readFileSync(metaFile, "utf8")) as Preview), error: "" }; } catch { /* refetch */ }
+    try { return { ...(JSON.parse(readFileSync(metaFile, "utf8")) as Preview), url: u, error: "" }; } catch { /* refetch */ }
   }
   if (fresh(noneFile, PREVIEW_NONE_TTL_MS)) return fail(u, "no card");
 
-  const res = await get(u, FETCH_TIMEOUT_MS);
+  const got = await get(u, FETCH_TIMEOUT_MS);
+  const res = got?.res ?? null;
   const ctype = (res?.headers.get("content-type") ?? "").toLowerCase();
-  if (!res || !/^(text\/html|application\/xhtml)/.test(ctype)) {
+  if (!res || !got || !/^(text\/html|application\/xhtml)/.test(ctype)) {
+    if (got) clearTimeout(got.timer);
     writeAtomic(noneFile, "");
     return fail(u, "no card");
   }
   const body = await readCapped(res, HTML_MAX_BYTES);
+  clearTimeout(got.timer);
   if (!body) { writeAtomic(noneFile, ""); return fail(u, "no card"); }
   const card = parseCard(new TextDecoder("utf-8", { fatal: false }).decode(body), res.url || u);
 
   let image = "";
   if (card.image) {
-    const ires = await get(card.image, FETCH_TIMEOUT_MS);
+    const igot = await get(card.image, FETCH_TIMEOUT_MS);
+    const ires = igot?.res ?? null;
     if (ires && (ires.headers.get("content-type") ?? "").toLowerCase().startsWith("image/")) {
-      const bytes = await readCapped(ires, IMAGE_MAX_BYTES);
+      const bytes = await readCapped(ires!, IMAGE_MAX_BYTES);
+      if (igot) clearTimeout(igot.timer);
       const ext = bytes ? sniffImage(bytes) : "";
       if (bytes && ext) {
         const file = `${base}.${ext}`;
@@ -293,7 +306,10 @@ export async function fetchPreview(url: string): Promise<Preview> {
     return fail(u, "no card");
   }
   const out: Preview = { ok: true, url: u, host: hostOf(u), title: card.title, summary: card.summary, image, error: "" };
-  writeAtomic(metaFile, JSON.stringify(out));
+  // The URL came out of a message; the cache file is named by its hash so the
+  // URL itself never lands on disk. The caller re-attaches it (Astra #6).
+  writeAtomic(metaFile, JSON.stringify({ ...out, url: "" }));
+  sweepStale(PREVIEW_DIR, PREVIEW_TTL_MS * 2);   // bounded: expired cards, images and markers go (Astra B#8)
   const now = new Date();
   utimesSync(metaFile, now, now);
   return out;
@@ -301,7 +317,10 @@ export async function fetchPreview(url: string): Promise<Preview> {
 
 if (import.meta.main) {
   try {
-    console.log(JSON.stringify(await fetchPreview(process.argv[2] ?? "")));
+    // `--stdin`: the URL is message content and never rides argv (BlipView).
+    const arg = process.argv[2] ?? "";
+    const url = arg === "--stdin" ? (await Bun.stdin.text()).trim() : arg;
+    console.log(JSON.stringify(await fetchPreview(url)));
   } catch (e) {
     console.log(JSON.stringify(fail(process.argv[2] ?? "", String(e))));
   }

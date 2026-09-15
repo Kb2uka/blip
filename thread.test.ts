@@ -13,9 +13,13 @@ import {
   loadThread,
   localToday,
   minutesBetween,
+  parsePendingSends,
+  pendingBubble,
   receiptLabel,
   selectThread,
+  withPendingSends,
 } from "./thread";
+import type { Bubble, PendingSend } from "./thread";
 import { cliChatArg } from "./thread";
 
 function msg(over: Partial<ImsgMessage> = {}): ImsgMessage {
@@ -419,6 +423,22 @@ describe("selectThread", () => {
     expect(out.map((m) => m.text)).toEqual(["early", "late"]);
   });
 
+  test("a re-keyed group keeps its alias rows' history (Astra #8)", () => {
+    // `thread --chat` on the Mac already expands to the whole cluster; the
+    // alias rows arrive with their OWN chat ids. Filtering on the requested id
+    // threw them away: 9 rows from the Mac, 6 bubbles here.
+    const alias = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    const out = selectThread(
+      [
+        msg({ chat: guid, ts: "2026-08-30 12:05:00", text: "new row" }),
+        msg({ chat: alias, ts: "2026-08-30 12:00:00", text: "old row, before the re-key" }),
+        msg({ chat: "+15550000000", ts: "2026-08-30 12:04:00", text: "a DM, never" }),
+      ],
+      guid, true, 80,
+    );
+    expect(out.map((m) => m.text)).toEqual(["old row, before the re-key", "new row"]);
+  });
+
   test("keeps only the newest `limit` messages", () => {
     const raw = Array.from({ length: 5 }, (_, i) => msg({ chat: guid, ts: `2026-08-30 12:0${i}:00`, text: `m${i}` }));
     expect(selectThread(raw, guid, true, 2).map((m) => m.text)).toEqual(["m3", "m4"]);
@@ -440,6 +460,21 @@ describe("selectThread", () => {
   test("a DM window passes through untouched apart from ordering", () => {
     const out = selectThread([msg({ ts: "2026-08-30 12:01:00" }), msg({ ts: "2026-08-30 12:00:00" })], "+15551234567", false, 80);
     expect(out[0]!.ts).toBe("2026-08-30 12:00:00");
+  });
+
+  test("a merged DM keeps rows from every alias handle, in either direction", () => {
+    const phone = "+15550100001";
+    const email = "pat@example.com";
+    const raw = [
+      msg({ chat: phone, handle: phone, ts: "2026-09-04 21:32:29", text: "sms" }),
+      msg({ chat: email, handle: email, ts: "2026-09-05 17:24:01", text: "imessage" }),
+      msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-09-05 18:00:00", text: "other" }),
+    ];
+    const aliases = { [phone]: email };
+    expect(selectThread(raw, email, false, 80, [], aliases).map((m) => m.text))
+      .toEqual(["sms", "imessage"]);
+    expect(selectThread(raw, phone, false, 80, [], aliases).map((m) => m.text))
+      .toEqual(["sms", "imessage"]);
   });
 
   test("loadThread loads a group by EXACT chat id via thread --chat", () => {
@@ -580,5 +615,107 @@ describe("cliChatArg (CLI / IPC bare-digit convenience)", () => {
     expect(cliChatArg("someone@example.com")).toBe("someone@example.com");
     expect(cliChatArg("ce5a593a78af408282d61461ade89135")).toBe("ce5a593a78af408282d61461ade89135");
     expect(cliChatArg("chat123456")).toBe("chat123456");
+  });
+});
+
+describe("pending sends (the bubble drawn before the Mac writes the row)", () => {
+  const today = "2026-08-30";
+  const now = Date.parse("2026-08-30T12:00:30");
+  const real = (over: Partial<Bubble> = {}): Bubble =>
+    ({ ...decorate([msg({ from_me: true, text: "on my way", ts: "2026-08-30 11:59:00" })], today)[0]!, ...over });
+  const send = (over: Partial<PendingSend> = {}): PendingSend => ({ chat: "+15551234567", text: "see you soon", ts: "2026-08-30 12:00:00", ...over });
+
+  test("an unresolved send is appended as a pending bubble that joins your run", () => {
+    const r = withPendingSends([real()], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(2);
+    const [prev, mine] = r.bubbles;
+    expect(mine!.pending).toBe(true);
+    expect(mine!.from_me).toBe(true);
+    expect(mine!.text).toBe("see you soon");
+    expect(mine!.time).toBe("12:00 PM");
+    expect(mine!.day).toBe("");                  // same day as the bubble before it
+    expect(mine!.groupStart).toBe(false);
+    expect(prev!.groupEnd).toBe(false);          // the run continues, so the older bubble loses its time
+    expect(prev!.time).toBe("");
+    expect(r.pending).toEqual([send()]);
+  });
+
+  test("the first bubble of an empty thread opens the day", () => {
+    const r = withPendingSends([], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles[0]!.day).toBe("Today");
+    expect(r.bubbles[0]!.groupStart).toBe(true);
+  });
+
+  test("a reply from them starts a new run", () => {
+    const theirs = decorate([msg({ from_me: false, text: "where are you", ts: "2026-08-30 11:59:00" })], today)[0]!;
+    const r = withPendingSends([theirs], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles[1]!.groupStart).toBe(true);
+    expect(r.bubbles[0]!.time).toBe("11:59 AM");
+  });
+
+  test("the real row resolves the send and nothing is appended", () => {
+    const landed = real({ text: "see you soon", ts: "2026-08-30 12:00:01" });
+    const r = withPendingSends([real(), landed], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(2);
+    expect(r.bubbles.some((b) => b.pending)).toBe(false);
+    expect(r.pending).toEqual([]);
+  });
+
+  test("the same text sent twice waits for two rows", () => {
+    const landed = real({ text: "ok", ts: "2026-08-30 12:00:01" });
+    const twice = [send({ text: "ok", ts: "2026-08-30 12:00:00" }), send({ text: "ok", ts: "2026-08-30 12:00:05" })];
+    const r = withPendingSends([landed], twice, today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(2);
+    expect(r.bubbles[1]!.pending).toBe(true);
+    expect(r.pending).toEqual([twice[1]]);
+  });
+
+  test("an identical message from yesterday does not resolve today's send", () => {
+    const old = real({ text: "see you soon", ts: "2026-08-29 12:00:00" });
+    const r = withPendingSends([old], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(2);
+    expect(r.bubbles[1]!.pending).toBe(true);
+  });
+
+  test("a Mac timestamp a little behind the Linux clock still resolves", () => {
+    const landed = real({ text: "see you soon", ts: "2026-08-30 11:58:30" });
+    const r = withPendingSends([landed], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.pending).toEqual([]);
+  });
+
+  test("a send two minutes old without a row is given up on, quietly", () => {
+    const stale = send({ ts: "2026-08-30 11:58:00" });
+    const r = withPendingSends([real()], [stale], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(1);
+    expect(r.pending).toEqual([]);
+  });
+
+  test("a retracted or already-pending bubble never resolves a send", () => {
+    const gone = real({ text: "see you soon", ts: "2026-08-30 12:00:01", retracted: true });
+    const r = withPendingSends([gone], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.pending).toHaveLength(1);
+    const again = withPendingSends(r.bubbles, [send()], today, DEFAULT_FORMATS, now);
+    expect(again.bubbles.filter((b) => b.pending)).toHaveLength(2);   // the old pending bubble is not a row
+  });
+
+  test("a URL in a pending bubble is already clickable", () => {
+    const { bubble } = pendingBubble(undefined, send({ text: "look https://example.com" }), today);
+    expect(bubble.html).toContain('<a href="https://example.com">');
+  });
+
+  test("parsePendingSends accepts only well-formed entries", () => {
+    expect(parsePendingSends("nope")).toEqual([]);
+    expect(parsePendingSends(JSON.stringify([{ chat: "a", text: "b", ts: "c" }, { chat: 1 }, null]))).toEqual([{ chat: "a", text: "b", ts: "c" }]);
+  });
+
+  test("loadThread --pending-stdin runs end to end through the CLI", async () => {
+    const proc = Bun.spawn(["bun", "thread.ts", "+15550100001", "5", "--pending-stdin"], {
+      stdin: new TextEncoder().encode(JSON.stringify([{ chat: "+15550100001", text: "hi", ts: localToday() + " 00:00:00" }])),
+      env: { ...process.env, HOME: "/nonexistent-blip-home" },   // no ~/bin/imsg: offline, pending echoed back
+      stdout: "pipe",
+    });
+    const out = JSON.parse(await new Response(proc.stdout).text());
+    expect(out.ok).toBe(false);
+    expect(out.pending).toEqual([{ chat: "+15550100001", text: "hi", ts: localToday() + " 00:00:00" }]);
   });
 });

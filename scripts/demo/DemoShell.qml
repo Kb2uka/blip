@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
 import qs.Commons
 
 // Screenshot harness. Renders the REAL BlipView against the fake bridge, in a
@@ -24,6 +25,9 @@ ShellRoot {
     property int unread: 0
     property bool healthy: true
     property string lastError: ""
+    property var draftCache: ({})
+    // The version, from the same manifest.json the shipped widget reads.
+    property string version: ""
     // Clock and date patterns, as BarWidget would supply them (README defaults);
     // BLIP_DEMO_TIME_FORMAT etc. override, so a shot can show them configured.
     property string timeFormat: Quickshell.env("BLIP_DEMO_TIME_FORMAT") || "h:mm AP"
@@ -33,6 +37,11 @@ ShellRoot {
     function markAllRead() { }
     function markThreadRead(chat) { }
     function showApp() { }
+  }
+
+  FileView {
+    path: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
+    onLoaded: { try { host.version = String(JSON.parse(text()).version || "") } catch (e) { host.version = "" } }
   }
 
   Process {
@@ -62,6 +71,12 @@ ShellRoot {
   PanelWindow {
     id: win
     color: "transparent"
+    // OVERLAY, above every panel and desk: a full-screen Infomarchy desk on
+    // the "top" layer sat over this surface and four README screenshots
+    // captured the desktop instead of Blip (2026-09-05). The crop is fixed;
+    // what is under it must be ours.
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.namespace: "blip-demo"
     exclusionMode: ExclusionMode.Ignore
     anchors { top: true; left: true }
     margins { top: win.originY; left: win.originX }

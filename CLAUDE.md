@@ -12,10 +12,12 @@ treating a Mac as the gateway. Read this before touching anything.
               blip-dispatch         forced-command gate for ~/.ssh/blip_ed25519: only the five tools run.
                                     imsg: sqlite read of chat.db, `--rich` (tapbacks/read_at/reply_to/
                                     attachments/error), `watch`, `attachment`, `chats`; Recently Deleted hidden.
-(Linux side)  bridge/linux/blip-shim installed as ~/bin/{imsg,imsg-send,contacts} by scripts/blip-setup;
+(Linux side)  bridge/linux/blip-shim installed as ~/bin/{imsg,imsg-send,imsg-read,contacts} by scripts/blip-setup;
                                     reads ~/.config/blip/bridge.conf (host=, remote_bin='$HOME/.blip/bin'
                                     — single-quoted, expands on the MAC). `ssh -n` preflight; exit 69 offline.
                                     Blip only ever calls ~/bin/imsg*. No hostnames in code, ever.
+contact-review.ts                   bounded read-only contact broker, view models, fingerprint cache.
+ContactReview.qml                   compact review and scan, opened from conversations.
 collector.ts                        poll → {threads, unread, toast}. Pure functions + one spawn.
 thread.ts                           one conversation → decorated bubbles. Pure + one spawn.
 fetch.ts                            attachment id → ~/.cache/blip/att (0700/0600, 500MB LRU).
@@ -23,7 +25,10 @@ send-file.ts                        local file + caption → imsg-send --file-st
                                     (caption ahead of the bytes; NO message text in argv anywhere). Resolves
                                     group guid from state; REFUSES unknown groups.
 avatar.ts                           handle → ~/.cache/blip/avatars (imsg avatar; JPEG/PNG magic
-                                    checked; .none negative marker; 7-day TTL).
+                                    checked; .none negative marker; 7-day TTL). `--batch`: handles on
+                                    stdin, one JSON line each, disk before Mac. `--retry` trusts a .none
+                                    for 15 min, never skips it (skipping cost ~45 s per window open).
+                                    The url map lives in BarWidget.avatarCache: the window is rebuilt.
 paste.ts                            clipboard snapshot → draft image in $XDG_RUNTIME_DIR/blip or text.
 BarWidget.qml                       the single poller, badge, toasts, IPC.
 Panel.qml                           list view + conversation view + compose. Renders only.
@@ -61,6 +66,19 @@ what it is handed. Keep it that way.
   inbound exists. Refreshes carry `activeReadChat()` so a message landing in
   the conversation being READ is counted read in the same run — never
   flashed. Same-chat read refreshes coalesce in the queue.
+- **Sends are optimistic.** `send()` draws the bubble (`pending: true`,
+  "Sending…") and clears the field BEFORE imsg-send runs; text sends queue.
+  `pendingSends` (BarWidget memory, never disk) rides every thread reload on
+  stdin (`--pending-stdin`) and `withPendingSends()` in thread.ts keeps each
+  bubble until a real from-me row with the same text lands, resolving one
+  send per row. The read watermark (`--seen`) skips pending bubbles: their ts
+  is THIS machine's clock. A failed send retains its bubble with a failure reason in memory. Never go back to "wait 1.5 s, then reload".
+- **A peeked thread is not read.** In the window, the sidebar cursor resting on
+  a row shows that thread (`peeking`); focus stays in the list and neither
+  read path fires — `markRead()` in BlipView (the only caller of the host's
+  `markThreadRead`) and `readingSurface()` in BarWidget both check it. Focus
+  entering the compose field (Enter, click, typing) is the commit. Split view
+  only.
 - **Unread is ledger-backed.** `unreadCounts` and `unreadOldest` persist per-chat
   metadata without message bodies. Catch-up fetches cover new arrivals and the
   oldest outstanding unread so deletions are reconciled; never derive the total
@@ -77,17 +95,69 @@ what it is handed. Keep it that way.
   dash scrubbing is a claude-on-mac house rule, not Blip's).
 - **`tcc-check` is not reachable through the confined key** (it drives four
   other apps' Automation prompts); `blip-check` is what the wizard runs.
+  **Never cut a consent-triggering probe short.** macOS gives the Automation
+  Allow prompt ~2 minutes; a prompt nobody answers is recorded in TCC as a
+  DENIAL (`auth_value 0, auth_reason 9` = Prompt Timeout), and on macOS 26 the
+  Settings switch for that record may refuse to turn on (#36, 26.5.2 and
+  26.6.2). `blip-check` waits 150 s and warns first; `blip-setup` sends the
+  user to the Mac's screen before the check. Recovery: `tccutil reset
+  AppleEvents` (Apple's tool, SIP intact; it clears every app's Automation
+  grants — a path-identified client like sshd-keygen-wrapper cannot be reset
+  alone), then re-run and click Allow in time.
 - **Cache file extensions follow the gated MIME**, never the sender's name —
   `xdg-open` dispatches on extension (war room #49).
-- **Pass `--` before message text** to `notify-send`.
+- **Pass `--` before message text** to `notify-send`. Two documented argv
+  exceptions: a toast's preview (the daemon's API) and a link the user CLICKS
+  (`xdg-open` and the browser take it as an argument; nothing else opens one).
+- **Security codes remain ephemeral and expire after five minutes.** With
+  `otp_autofill=on`, `noteCode()` hands each new code to `OtpAutofill.qml` and
+  its private-pipe helper; the legacy toast/clipboard/typecode path receives
+  no copy. `otp-policy.ts` owns lifetime, field policy and click tokens;
+  `otp-desktop.py` reads native OS metadata and inserts on a click. Focus
+  changes preserve the original deadline. `BlipAppearance.qml` is the shared
+  appearance policy for the main view and the field-attached prompt. With
+  autofill off, upstream's legacy path is unchanged:
+  **A security code lives five minutes in BarWidget memory, nowhere else.**
+  `selectCodes()` (collector) spots it; `noteCode()` holds the newest and
+  toasts THAT A CODE ARRIVED — never the digits. Omarchy's daemon persists
+  every displayed toast's body to `~/.local/state/omarchy/notifications/
+  history/`; its `transient` hint only decides whether a DND-silenced one is
+  recorded (Service.qml says so itself). 2.3.3 put the code in the body on
+  the strength of that hint and was wrong. The message's ordinary preview
+  toast is dropped for the same reason;
+  `copycode` hands it to wl-copy on STDIN — never an env var: wl-copy stays
+  resident to serve the selection, so the digits would outlive the copy in
+  `/proc/<wl-copy>/environ`, past the five minutes. `typecode` sends
+  it to the focused window as `send_key_state` events over Hyprland's socket.
+  Never argv. NEVER wtype for this: Hyprland merges a virtual keyboard's keys
+  with the physical modifiers still held from the hotkey, and the digits
+  fired Super+Shift+<digit> binds (found the hard way, 2026-09-04). Never a
+  group, never the self-thread, once per message through the `code:` ring.
+- **A per-thread read push fires on the TRANSITION, not on the poll.** Every
+  poll while a thread is open carries its `readChat` (that is what stops a
+  message landing in the open conversation from flashing unread), so
+  `pushReadArgs` gates `--chat` on `clearedUnread` — did THIS run turn unread
+  into read? Without it the Mac was told once per poll, and each telling opens
+  the conversation there, because aiming Messages' menu at one chat means
+  opening it: five ssh round trips a minute, four of them "nothing unread"
+  (measured 2026-09-08). Consequence to keep in mind: a conversation Blip
+  already considers read but Apple still counts unread is never pushed
+  per-thread; `--all` is what clears those. `push_read` defaults to `all`,
+  which pushes ONLY on the mark-all gesture — reading a thread then leaves the
+  iPhone badge alone, which looks exactly like a broken push, so `status`
+  reports the live policy as `read_push=`. The watcher field beside it is
+  `watch=`; it was called `push=` until 2.4.0 and the collision sent a
+  diagnosis the wrong way.
 - **No message content in state.json.** `~/.local/state/blip/state.json` holds
   timestamps, counts, opaque SHA-256 toast keys, self-chat ids, and group
   metadata. It is atomic and `0600`; no message bodies are allowed. EXCEPTION
   (Fred, 2026-08-31): fetched MEDIA caches as plain files in
   `~/.cache/blip/att` (0700/0600, 500 MB LRU) — the Linux box's disk is LUKS-encrypted
-  at rest. Message text still never lands on disk. `push-read.log` beside
-  state.json records each read-push's exit code and `imsg-read`'s status
-  line — never content.
+  at rest. Message text still never lands on disk — unsent drafts included:
+  `BarWidget.draftCache` keeps them in memory only, so a shell restart drops
+  them by design; do not persist them. `push-read.log` beside state.json
+  records each read-push's exit code and `imsg-read`'s status line — never
+  content.
 - **The Linux shims' ssh preflight must use `ssh -n`.** A bare
   `ssh <mac> true` connectivity probe EATS STDIN, which silently empties
   `imsg-send --file-stdin` payloads. Fixed 2026-08-31.
@@ -132,10 +202,20 @@ what it is handed. Keep it that way.
   store, flagged `isChildDelegate` in the same Accounts db. Contacts.app hides
   those from All Contacts; `_ab_sources()` drops them entirely, or two sons'
   "Mom" cards outvote your own "Monica Gamble" for the same number.
+- **Contact review is read-only and separate from configuration.**
+  `ContactReview.qml` opens from a conversation and renders models supplied by
+  `contact-review.ts`. Only candidates, audit, fingerprint, exact-card open, and exact-card details
+  `contact-review.ts`. Only candidates, audit, fingerprint, exact-card open, and exact-card vCard export
+  cross the Mac protocol. Handles and opaque tokens travel on bounded stdin;
+  no display-name choices or appearance preferences are saved. A group offers
+  its participants, never the last speaker as a stand-in for the group.
+  Duplicate scans include named conversations and short codes. The private
+  `audit-cache.json` holds contact summaries only and is reused only after
+  validating the handle-set and current Mac store fingerprints.
 - **Configuration is `bridge.conf` keys, not a settings system.** Blip has one
   config file (`~/.config/blip/bridge.conf`, parsed not sourced) carrying
   `host`, `remote_bin`, `automation`, `ui_font_size`, `ui_font_theme`,
-  `link_previews`, `push_read`, plus the mute list. Anything worth configuring
+  `link_previews`, `push_read`, `hide_spam`, `hide_unknown`, plus the mute list. Anything worth configuring
   becomes another key. Settled 2026-09-04 against PR #21, which proposed a
   `preferences.json` with eleven knobs and a ~1300-line settings panel: it was
   careful work (atomic, 0600, ownership and size validated) and was still the
@@ -154,6 +234,20 @@ what it is handed. Keep it that way.
   sentence Messages itself shows when it cannot render the app, then the
   caption, then the app name (`_app_card_text`). Link cards are the one
   balloon that is not an app; they stay links.
+- **A read of a canonical conversation covers its aliases.** The unread
+  ledger counts on ORIGINAL chat keys and `foldChatRecord` merges afterwards,
+  so `--read <canonical>` also marks every alias (`aliasesOf`), or an alias's
+  unread survives the read and reappears under the conversation just read.
+  Likewise `thread.ts` keeps every group row the bridge returns for a
+  `thread --chat` — the bridge scoped it to the cluster, and the alias rows
+  keep their own ids (9 rows from the Mac, 6 bubbles shown, until 2.3.4).
+- **Pins and merged 1:1s use the whole conversation cluster.** A re-keyed
+  group's pin stays on a retired row's `group_id`; matching only the live
+  row drops it from Favorites. Messages also merges a phone SMS row with an
+  email iMessage row under one `group_id` while keeping two chat_identifiers.
+  `_group_cluster_map` folds those like re-keyed groups, `pin_order_for`
+  sees every id in the cluster, and `selectThread` keeps alias DM rows the
+  way it already keeps group alias rows.
 - **`chat:null` exists.** Use `chatKey()`; never `String(m.chat)`. A row with
   neither chat nor handle is a leftover of a deleted conversation (iCloud keeps
   the row, the chat and the join are gone); `fetchMessages` drops it
@@ -190,7 +284,10 @@ what it is handed. Keep it that way.
   without logging: async image growth ABOVE the viewport cancels wheel motion
   (chipRow compensates contentY by its own height delta), and model
   reassignment rebuilds Repeaters and resets scroll (skip identical
-  assignments; restore contentY after a list rebuild).
+  assignments; restore contentY after a list rebuild). Every writer of the
+  conversation's `contentY` — wheel, arrows, paging, Esc — goes through
+  `scrollConversation()`, the one owner of the bottom-stick that gates the
+  deferred push reload.
 - **The app window is RECREATED on show, never re-mapped.** Quickshell does
   not re-map a `FloatingWindow` after `visible` has been false once: the
   property flips true, no client appears (SUPER+M "did nothing", 1.8.3).
@@ -232,7 +329,7 @@ what it is handed. Keep it that way.
 bun test                                   # 90+ tests, ~40 ms
 bun collector.ts --deep | jq .unread       # live against the Mac
 bun thread.ts <chat-id> 40 | jq .bubbles   # one conversation
-cp *.qml *.ts manifest.json ~/.config/omarchy/plugins/nixfred.blip/
+cp *.qml *.ts *.mjs manifest.json ~/.config/omarchy/plugins/nixfred.blip/
 omarchy-restart-shell                      # ALWAYS restart (hot-reload leaves IPC on a zombie)
 # MANDATORY after every deploy — a QML syntax error kills BOTH surfaces silently (2.1.4 shipped one):
 qs log /run/user/1000/quickshell/by-id/$(basename $(readlink /run/user/1000/quickshell/by-pid/$(pgrep -x quickshell)))/log.qslog -t 400 | grep -iE 'nixfred.blip.*(error|warn|unavailable|token)'
@@ -257,7 +354,12 @@ to whatever has focus otherwise.
 - Tapbacks, edits, typing indicators out. Needs SIP-off code injection; rejected.
 - Selecting a GROUP on the Mac from Linux. `imessage://` addresses a handle;
   a group's `chat<digits>` id has no URL form. So per-conversation read-push
-  is DMs only; groups clear through `--all`.
+  is DMs only; groups clear through `--all`. NOT closed for good: Bluetooth MAP
+  marks a message read by setting `Read` on an `org.bluez.obex.Message1`
+  object, which needs no Mac and no URL, and might cover groups. Untested here
+  — dex's Realtek radio will not stay up long enough to pair (ROADMAP, Prior
+  art, 2026-09-09). Do not lift BlueFerry's code to try it: it is GPL and Blip
+  is MIT.
 
 ## Things that ARE possible (verified)
 
@@ -290,8 +392,12 @@ to whatever has focus otherwise.
     mark-all does. Conversations read in Blip stay unread on the phone until
     the next mark-all. Documented trade-off, not a bug.
   - Needs **Accessibility** for `/usr/libexec/sshd-keygen-wrapper`, on top of
-    the Full Disk Access it already has. Optional: `blip-check` reports it as
-    a ➖ rather than failing.
+    the Full Disk Access it already has. Optional AND opt-in: `blip-check`
+    reports it as a ➖ rather than failing, and does not probe it at all unless
+    you pass `--markread`. The probe talks to System Events, which pops a
+    SECOND Automation prompt, and a grant nobody asked for could not be
+    switched back off in System Settings on macOS 26.6.2 (#36). Never fire a
+    consent prompt the user did not ask for.
   - The menu item is disabled when nothing is unread, and the per-conversation
     item is NAMED for what it will do ("Mark as Read" only appears while the
     chat is unread) — treat an absent item as success, not an error.
@@ -301,3 +407,14 @@ to whatever has focus otherwise.
 - **Attachments out.** `send POSIX file` works on Sequoia IF the file is staged
   in `~/Pictures/` — from anywhere else Messages fails silently (`error=25`,
   "Not Delivered"). Verified delivered for PNG and PDF. See ROADMAP.md.
+
+Local text-send failures retain their optimistic bubble and a bounded reason
+in memory, including across thread reloads. `send-state.ts` builds the QML
+module `SendState.mjs`; regenerate it with the command in its header. Local
+send IDs distinguish same-second sends. A reload started before a local send
+or failure is discarded and retried, so it cannot erase the new state. Failed
+local bubbles remain provisional and never advance read marks.
+The composer keeps arrow/Home/End keys for native text editing; PageUp/PageDown
+select history bubbles. `ComposerInput.qml` exposes the editable accessibility
+field and draws spelling ranges supplied by `spellcheck.ts`. Draft text stays
+on bounded stdin, never argv or disk; the helper emits only UTF-16 ranges.

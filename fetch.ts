@@ -79,8 +79,11 @@ export function cacheFileName(id: string, name: string, mime: string, preview = 
   // (war room #49).
   const transform = preview ? "prev" : wantsJpeg(mime) ? "jpg" : "orig";
   let base = sanitizeName(name);
-  const ext = preview ? "jpg" : MIME_EXT[String(mime || "").toLowerCase()];
-  if (ext) base = base.replace(/\.[^.]{1,8}$/, "") + "." + ext;
+  // The extension is ALWAYS ours. An unmapped type (image/svg+xml, anything
+  // exotic) used to keep the sender's name — "evil.desktop" with an image MIME
+  // passed the opening gate and reached xdg-open by extension (Astra B#1).
+  const ext = preview ? "jpg" : (MIME_EXT[String(mime || "").toLowerCase()] ?? "bin");
+  base = base.replace(/\.[^.]{1,8}$/, "") + "." + ext;
   return `${id}-${transform}-${base}`;
 }
 
@@ -196,10 +199,14 @@ function cachedImageMetrics(path: string, mime: string): ImageMetrics {
 function evict(keep: string): void {
   let entries: { name: string; bytes: number; mtimeMs: number }[] = [];
   try {
-    entries = readdirSync(CACHE_DIR).map((name) => {
-      const st = statSync(join(CACHE_DIR, name));
-      return { name, bytes: st.size, mtimeMs: st.mtimeMs };
-    });
+    entries = [];
+    for (const name of readdirSync(CACHE_DIR)) {
+      // per entry: one dangling symlink used to abort the whole pass (Astra B#9)
+      try {
+        const st = lstatSync(join(CACHE_DIR, name));
+        if (st.isFile()) entries.push({ name, bytes: st.size, mtimeMs: st.mtimeMs });
+      } catch { /* vanished or unreadable: not ours to count */ }
+    }
   } catch {
     return;
   }

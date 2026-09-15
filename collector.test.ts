@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  aliasesOf,
+  normalizeGroups,
   pushReadCommand,
   pushReadLogPath,
   buildThreads,
@@ -14,8 +17,10 @@ import {
   fetchGroups,
   groupName,
   dedupeSelfEcho,
+  mergeTapbacks,
   isGroupChat,
   displayName,
+  messagePreview,
   fetchMessages,
   loadAllowlist,
   loadMutelist,
@@ -23,6 +28,8 @@ import {
   mutedChats,
   dropMuted,
   dropMutedChats,
+  visibleLedgerChats,
+  keepCappedUnread,
   loadState,
   validPins,
   pinsFromChats,
@@ -66,6 +73,16 @@ describe("buildThreads", () => {
     expect(threads[0]!.chat).toBe("A");          // newest thread first
     expect(threads[0]!.last_text).toBe("newer");
     expect(threads[0]!.count).toBe(2);
+  });
+
+  test("attachment previews never expose the object-replacement glyph", () => {
+    expect(messagePreview("\uFFFC", { name: "IMG_0042.HEIC", mime: "image/heic" })).toBe("Photo");
+    expect(messagePreview("\uFFFC", { name: "clip.mov", mime: "video/quicktime" })).toBe("Video");
+    expect(messagePreview("caption \uFFFC", { name: "clip.mov", mime: "video/quicktime" })).toBe("caption");
+    const threads = buildThreads([
+      msg({ text: "\uFFFC", attachments: [{ name: "IMG_1.png", mime: "image/png", bytes: 5 }] }),
+    ], "");
+    expect(threads[0]!.last_text).toBe("Photo");
   });
 
   test("orders threads newest-first regardless of input order", () => {
@@ -169,8 +186,12 @@ describe("isGroupChat", () => {
     expect(r.online).toBe(false);
   });
   test("groups JSON with an array of participants (claude-on-mac 1.4)", () => {
-    const g = fetchGroups((() => ({ status: 0, stdout: JSON.stringify([{ chat: "chat1", guid: "any;+;chat1", name: "", participants: ["+1", "+2"], last: null }]), stderr: "" })) as never);
+    const g = fetchGroups((() => ({ status: 0, stdout: JSON.stringify([{
+      chat: "chat1", guid: "any;+;chat1", name: "", participants: ["+1", "+2"],
+      participant_names: { "+1": "Alex", "+2": "Pat" }, last: null,
+    }]), stderr: "" })) as never);
     expect(g!.chat1.participants).toEqual(["+1", "+2"]);
+    expect(g!.chat1.participantNames).toEqual({ "+1": "Alex", "+2": "Pat" });
   });
 });
 
@@ -184,6 +205,36 @@ describe("self-echo in the thread list", () => {
     const threads = buildThreads(msgs, "2026-08-30 10:00:00");
     expect(threads[0]!.unread).toBe(0);
     expect(threads[0]!.last_from_me).toBe(true);
+  });
+
+  test("a tapback on either twin of a self-thread message survives the dedupe", () => {
+    // Messages attaches the tapback to whichever row the reacting device
+    // considers the message; the dedupe used to keep one row and lose the
+    // other's tapbacks, so a reaction on your own note never showed.
+    const love = [{ emoji: "❤️", from_me: true, by: null }];
+    const base = { chat: "SELF", handle: "SELF", ts: "2026-09-05 17:00:00", text: "note" };
+    for (const order of [[true, false], [false, true]]) {
+      const msgs = dedupeSelfEcho([
+        msg({ ...base, from_me: order[0]!, tapbacks: order[0] ? love : null }),
+        msg({ ...base, from_me: order[1]!, tapbacks: order[1] ? love : null }),
+      ], ["SELF"]);
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]!.from_me).toBe(true);
+      expect(msgs[0]!.tapbacks).toEqual(love);
+    }
+    // the empty-outbound shape (an attachment) hands its tapback to the echo it promotes
+    const empty = dedupeSelfEcho([
+      msg({ chat: "SELF", handle: "SELF", ts: "2026-09-05 17:01:00", from_me: true, text: "", tapbacks: love }),
+      msg({ chat: "SELF", handle: "SELF", ts: "2026-09-05 17:01:00", from_me: false, text: "" }),
+    ], ["SELF"]);
+    expect(empty).toHaveLength(1);
+    expect(empty[0]!.tapbacks).toEqual(love);
+    // the same tapback on both twins is one tapback
+    const both = dedupeSelfEcho([
+      msg({ ...base, ts: "2026-09-05 17:02:00", from_me: true, tapbacks: love }),
+      msg({ ...base, ts: "2026-09-05 17:02:00", from_me: false, tapbacks: love }),
+    ], ["SELF"]);
+    expect(both[0]!.tapbacks).toEqual(love);
   });
 
   test("the same text in two different chats at one ts is two messages", () => {
@@ -244,7 +295,21 @@ describe("self-echo in the thread list", () => {
       "", {},
       { [guid]: { name: "", guid: "any;+;" + guid, participants: ["+15550100004", "+15550100005"] } },
     );
-    expect(threads[0]!.name).toBe("Jordan Blake, +15550100005");
+    expect(threads[0]!.name).toBe("Jordan Blake & +15550100005");
+  });
+
+  test("group threads expose named participants for explicit contact actions", () => {
+    const guid = "053856bb0d9a40e392db59eace1c56d1";
+    const groups = {
+      [guid]: { name: "Friends", guid: "any;+;" + guid,
+        participants: ["+15550100004", "+15550100005"],
+        participantNames: { "+15550100004": "Jordan", "+15550100005": "Casey" } },
+    };
+    const thread = buildThreads([msg({ chat: guid, handle: "+15550100004" })], "", {}, groups)[0]!;
+    expect(thread.participants).toEqual([
+      { handle: "+15550100004", name: "Jordan" },
+      { handle: "+15550100005", name: "Casey" },
+    ]);
   });
 
   test("a group with no metadata at all falls back to its id, never one member", () => {
@@ -261,6 +326,12 @@ describe("displayName", () => {
   test("falls back to the chat id when nobody is named", () => {
     // `imsg chats` returns name:null, and unknown numbers never resolve.
     expect(displayName([msg({ name: null, chat: "878478" })])).toBe("878478");
+  });
+  test("a filtered stranger's SMS shows the number, not the chat suffix", () => {
+    expect(displayName([msg({ name: null, chat: "+18184632606(filtered)", handle: "+18184632606(filtered)" })])).toBe("+18184632606");
+    // isGroupChat() files that shape as not-a-DM, so the list labels it through groupName.
+    expect(isGroupChat("+18184632606(filtered)")).toBe(true);
+    expect(groupName("+18184632606(filtered)", undefined, new Map())).toBe("+18184632606");
   });
 });
 
@@ -570,6 +641,29 @@ describe("adaptive unread catch-up", () => {
     expect(limits).toEqual([2, 4]);
   });
 
+  test("a dropped orphan row in a full page does not end the catch-up early (Astra #7)", () => {
+    // Page 1 (limit 2) is FULL from the bridge's point of view, but one row has
+    // neither chat nor handle and is dropped. Counting survivors read that as
+    // "the bridge ran out" and stopped before the older unread.
+    const all = [
+      msg({ ts: "2026-08-30 12:03:00", handle: "+15550000001" }),
+      msg({ ts: "2026-08-30 12:02:00", chat: null as unknown as string, handle: null as unknown as string }),
+      msg({ ts: "2026-08-30 12:01:00", handle: "+15550000002" }),
+      msg({ ts: "2026-08-30 11:59:00", handle: "+15550000003" }),
+    ];
+    const limits: number[] = [];
+    const fake = ((_cmd: string, args: string[]) => {
+      const limit = Number(args[2]);
+      limits.push(limit);
+      return { status: 0, stdout: JSON.stringify(all.slice(0, limit)), stderr: "" };
+    }) as never;
+    const r = fetchMessagesAfter("2026-08-30 12:00:00", 2, fake);
+    expect(r.ok).toBe(true);
+    expect(limits).toEqual([2, 4]);
+    expect(r.fetchedCount).toBe(4);
+    expect(r.msgs).toHaveLength(3);
+  });
+
   test("catch-up stops doubling at CATCHUP_MAX_ROWS even if every page is full (Codex audit #12)", () => {
     const limits: number[] = [];
     const fake = ((_cmd: string, args: string[]) => {
@@ -770,6 +864,14 @@ describe("a link that just arrived opens the share sheet", () => {
     expect(out.every((l) => l.key.startsWith("link:"))).toBe(true);
   });
 
+  test("every link of a message rides along; url stays the first", () => {
+    const out = selectIncomingLinks([
+      msg({ ts: "2026-09-02 12:30:00", from_me: false, text: "two: https://a.test/1, and https://b.test/2." }),
+    ], WM, []);
+    expect(out[0]!.url).toBe("https://a.test/1");
+    expect(out[0]!.urls).toEqual(["https://a.test/1", "https://b.test/2"]);
+  });
+
   test("a link fires once — its key suppresses the next poll", () => {
     const m = msg({ ts: "2026-09-02 12:30:00", from_me: false, text: "https://a.test/1" });
     const first = selectIncomingLinks([m], WM, []);
@@ -837,6 +939,20 @@ describe("a re-keyed group is ONE conversation", () => {
       (a, b) => (a < b ? a : b),
     )).toEqual({ chat2244: "2026-02-26 22:26:56" });
   });
+
+  test("a merged DM (phone + email) folds onto the live handle", () => {
+    const phone = "+15550100001";
+    const email = "pat@example.com";
+    const out = foldThreadAliases(
+      [
+        thread(phone, "2026-09-04 21:32:29", 40, 0),
+        thread(email, "2026-09-05 17:24:01", 12, 1),
+      ],
+      { [phone]: email },
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ chat: email, last_ts: "2026-09-05 17:24:01", unread: 1 });
+  });
 });
 
 describe("complete conversation list (mergeChats)", () => {
@@ -848,12 +964,59 @@ describe("complete conversation list (mergeChats)", () => {
   };
   const chats = [
     { id: "+15551234567", name: null, service: "iMessage", last: "2026-08-31 20:00:00",
-      last_text: "hi", last_from_me: false, last_handle: "+15551234567", last_name: "Pat", pinned: false, pin_order: null },
+      last_text: "hi", last_from_me: false, last_handle: "+15551234567", last_name: "Pat",
+      pinned: false, pin_order: null, aliases: ["+15551234567"], pin_name: null },
     { id: "ce5a593a78af408282d61461ade89135", name: "Lunch Crew", service: "iMessage", last: "2026-08-31 19:00:00",
-      last_text: "Nice", last_from_me: false, last_handle: "+15550001111", last_name: "Sam", pinned: false, pin_order: null },
+      last_text: "Nice", last_from_me: false, last_handle: "+15550001111", last_name: "Sam",
+      pinned: false, pin_order: null, aliases: ["ce5a593a78af408282d61461ade89135"], pin_name: null },
     { id: "+15559990000", name: null, service: "SMS", last: "2026-08-20 09:00:00",
-      last_text: "old news", last_from_me: true, last_handle: "+15559990000", last_name: "Quiet Q", pinned: false, pin_order: null },
+      last_text: "old news", last_from_me: true, last_handle: "+15559990000", last_name: "Quiet Q",
+      pinned: false, pin_order: null, aliases: ["+15559990000"], pin_name: null },
   ];
+
+  test("unnamed groups use resolved participants in both list merge paths", () => {
+    const chat = {...chats[1]!, name:null};
+    const info = {name:"", guid:"any;+;"+chat.id,
+      participants:["+15551234567", "+15550001111"],
+      participantNames:{"+15551234567":"Pat", "+15550001111":"Sam"}};
+    const groups = {[chat.id]:info};
+    const quiet = mergeChats([], [chat], groups, {})[0]!;
+    expect(quiet.name).toBe("Pat & Sam");
+    const existing = {...quiet, name:chat.id};
+    expect(mergeChats([existing], [chat], groups, {})[0]!.name).toBe("Pat & Sam");
+    expect(mergeChats([], [{...chat,name:"Custom title"}], groups, {})[0]!.name).toBe("Custom title");
+    expect(mergeChats([], [chat], {[chat.id]:{...info,name:"Group title"}}, {})[0]!.name).toBe("Group title");
+    const aliasChat = {...chat,id:"chat123456",aliases:["chat123456",chat.id]};
+    const aliased = mergeChats([], [aliasChat], groups, {})[0]!;
+    expect(aliased.name).toBe("Pat & Sam");
+    expect(aliased.guid).toBe(info.guid);
+    expect(mergeChats([], [chat], {}, {})[0]!.name).toBe(chat.id);
+  });
+
+    test("a group whose only name IS its chat id still names itself after people", () => {
+      // The real shape, and the one the case above missed by using name:null.
+      // `imsg chats` substitutes the identifier when a group has no display
+      // name, so `name` came back as "3734fc1a..." and won the || chain ahead
+      // of the participant fallback - unreachable for exactly the groups it is
+      // for. Found live (Fred, 2026-09-10): 26 groups showed a raw hex id.
+      const id = "ce5a593a78af408282d61461ade89135";
+      const idChat = {...chats[1]!, id, name: id, aliases: [id]};
+      const info = {name: "", guid: "any;+;" + id,
+        participants: ["+15551234567", "+15550001111"],
+        participantNames: {"+15551234567": "Pat", "+15550001111": "Sam"}};
+      const groups = {[id]: info};
+      expect(mergeChats([], [idChat], groups, {})[0]!.name).toBe("Pat & Sam");
+      // and through the applyPin path, where an existing thread carries the id
+      const existing = {...windowThread, chat: id, name: id, guid: "",
+        participants: [{handle: "+15551234567", name: "Pat"},
+                       {handle: "+15550001111", name: "Sam"}]};
+      expect(mergeChats([existing], [idChat], groups, {})[0]!.name).toBe("Pat & Sam");
+      // a retired alias id is just as much not-a-name
+      const rekeyed = {...idChat, id: "chat9999", name: id, aliases: ["chat9999", id]};
+      expect(mergeChats([], [rekeyed], {chat9999: info}, {})[0]!.name).toBe("Pat & Sam");
+      // a real title still wins over the participants
+      expect(mergeChats([], [{...idChat, name: "Lunch Crew"}], groups, {})[0]!.name).toBe("Lunch Crew");
+    });
 
   test("quiet conversations outside the window appear, newest first", () => {
     const out = mergeChats([windowThread], chats, { ce5a593a78af408282d61461ade89135: { name: "Lunch Crew", guid: "any;+;ce5a", participants: [] } }, { ce5a593a78af408282d61461ade89135: 2 });
@@ -867,7 +1030,18 @@ describe("complete conversation list (mergeChats)", () => {
 
   test("a chat already covered by the window keeps the window's richer row", () => {
     const out = mergeChats([windowThread], chats, {}, {});
-    expect(out[0]).toBe(windowThread);
+    expect(out[0]!.count).toBe(windowThread.count);
+    expect(out[0]!.unread).toBe(windowThread.unread);
+  });
+
+  test("pinned rows receive Messages-style names and cleaned latest previews", () => {
+    const namedChats = chats.map((chat, index) => index === 0
+      ? { ...chat, pin_name: "Pat", last_text: "Photo" }
+      : chat);
+    const matchingWindow = { ...windowThread, last_text: "\uFFFC" };
+    const out = mergeChats([matchingWindow], namedChats, {}, {});
+    expect(out[0]!.pin_name).toBe("Pat");
+    expect(out[0]!.last_text).toBe("Photo");
   });
 
   test("DM rows are named from the contact, groups from the group cache", () => {
@@ -921,6 +1095,40 @@ describe("pinned conversation metadata", () => {
     expect(out[0]!.pin_order).toBe(0);
     expect(out[1]!.pinned).toBe(false);
     expect(out[1]!.pin_order).toBe(null);
+  });
+
+  test("migrated named groups combine alias history, unread counts, and pin state", () => {
+    const oldId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const newId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const baseThread = {
+      chat: newId, guid: "", name: "Project Team", handle: "+15550000001",
+      service: "iMessage", last_ts: "2026-09-02 19:29:00", last_text: "",
+      last_from_me: false, count: 0, unread: 0, pinned: false, pin_order: null,
+    };
+    const source = [{
+      id: newId, aliases: [newId, oldId], name: "Project Team", service: "iMessage",
+      last: "2026-09-02 19:29:00", last_text: "new side", last_from_me: false,
+      last_handle: "+15550000001", last_name: "Eric", pinned: true, pin_order: 1,
+      pin_name: "Project Team",
+    }];
+    const rich = [
+      { ...baseThread, chat: oldId, name: "Project Team", count: 5, unread: 2,
+        last_ts: "2026-09-01 09:00:00", last_text: "old side" },
+      { ...baseThread, chat: newId, name: "Project Team", count: 3, unread: 1,
+        last_ts: "2026-09-02 19:29:00", last_text: "new side" },
+    ];
+    const { foldThreadAliases, mergeChats } = require("./collector") as typeof import("./collector");
+    const folded = foldThreadAliases(rich as never, { [oldId]: newId });
+    const out = mergeChats(folded, source, {
+      [newId]: { name: "Project Team", guid: `any;+;${newId}`, participants: ["+1", "+2"] },
+    }, {});
+    expect(out).toHaveLength(1);
+    expect(out[0]!.chat).toBe(newId);
+    expect(out[0]!.aliases).toEqual([newId, oldId]);
+    expect(out[0]!.count).toBe(8);
+    expect(out[0]!.unread).toBe(3);
+    expect(out[0]!.pinned).toBe(true);
+    expect(out[0]!.guid).toBe(`any;+;${newId}`);
   });
 });
 
@@ -1238,6 +1446,44 @@ describe("mute list", () => {
   });
 });
 
+describe("capped unread keep vs hidden chats", () => {
+  const row = (id: string, aliases: string[] = []): ChatInfo => ({
+    id, name: id, service: "SMS", last: "2026-08-30 10:00:00", last_text: "",
+    last_from_me: false, last_handle: id, last_name: null, pinned: false, pin_order: null, aliases,
+  });
+
+  test("a capped window still keeps an inbox unread the fetch never saw", () => {
+    const windowMsgs = [msg({ chat: "A" })];
+    const visible = visibleLedgerChats(windowMsgs, [row("A"), row("B")]);
+    const kept = keepCappedUnread(
+      { A: 1 }, {},
+      { A: 1, B: 3 }, { B: "2026-08-01 09:00:00" },
+      new Set(["A"]), visible,
+    );
+    expect(kept.counts).toEqual({ A: 1, B: 3 });
+    expect(kept.oldest).toEqual({ B: "2026-08-01 09:00:00" });
+  });
+
+  test("Spam missing from imsg chats is not restored onto the badge", () => {
+    const windowMsgs = [msg({ chat: "A" })];
+    const visible = visibleLedgerChats(windowMsgs, [row("A")]); // hide_spam omitted B
+    const kept = keepCappedUnread(
+      { A: 1 }, {},
+      { A: 1, B: 3 }, { B: "2026-08-01 09:00:00" },
+      new Set(["A"]), visible,
+    );
+    expect(kept.counts).toEqual({ A: 1 });
+    expect(kept.oldest).toEqual({});
+  });
+
+  test("an alias of a listed chat still counts as visible", () => {
+    const visible = visibleLedgerChats([], [row("LIVE", ["OLD"])]);
+    expect(visible.has("LIVE")).toBe(true);
+    expect(visible.has("OLD")).toBe(true);
+  });
+});
+
+
 describe("the mute list can catch a person (documented caveat, #27)", () => {
   const { matchesMute, mutedChats } = require("./collector") as typeof import("./collector");
 
@@ -1284,4 +1530,228 @@ describe("pushRead breadcrumb", () => {
   test("the log lives beside state.json, never in the cache", () => {
     expect(pushReadLogPath("/home/u")).toBe("/home/u/.local/state/blip/push-read.log");
   });
+});
+
+describe("security codes: detect, hold once, never from a group", () => {
+  const { extractCode, selectCodes } = require("./collector") as typeof import("./collector");
+  const WM = "2026-09-02 12:00:00";
+  const code = (text: string) => extractCode(text)?.code ?? null;
+
+  test("the usual shapes", () => {
+    expect(code("Your verification code is 483920")).toBe("483920");
+    expect(code("483920 is your Amazon OTP. Don't share it with anyone.")).toBe("483920");
+    expect(code("Your Venmo code: 837-291")).toBe("837291");
+    expect(code("Use 123 456 to sign in to Acme")).toBe("123456");
+    expect(code("Use code 4821 to log in")).toBe("4821");
+    expect(code("Your Uber code: 8271. Expires in 10 minutes.")).toBe("8271");
+    expect(code("Enter 482913 in the next 5 minutes to confirm your number")).toBe("482913");
+    expect(code("G-482913 is your Google verification code.")).toBe("482913");
+    expect(code("Your Apple Account code is: 128 433. Do not share it.")).toBe("128433");
+    expect(code("613400 is your Link verification code.")).toBe("613400");
+  });
+
+  test("origin-bound codes carry their domain and win outright", () => {
+    expect(extractCode("Your code is 111111\n\n@example.com #493857")).toEqual({ code: "493857", domain: "example.com" });
+    expect(extractCode("@login.acme.co #AB12-CD")).toEqual({ code: "AB12-CD", domain: "login.acme.co" });
+  });
+
+  test("no trigger word, no code", () => {
+    expect(code("Order #12345 shipped, arriving 09/04")).toBeNull();
+    expect(code("Thank you for your Taco Bell order! Track it at https://t.co/48291034")).toBeNull();
+    expect(code("Call me at 555-0100")).toBeNull();
+    expect(code("")).toBeNull();
+    expect(code(null)).toBeNull();
+  });
+
+  test("money, percentages, phone numbers and urls are not codes", () => {
+    expect(code("Your security deposit of $1234.56 was charged")).toBeNull();
+    expect(code("Verification complete, 100% done and 12345.67 credited")).toBeNull();
+    expect(code("To confirm call +1 (555) 010-0199")).toBeNull();
+    expect(code("Confirm at https://a.test/verify/48291034")).toBeNull();
+  });
+
+  test("the token nearest the trigger word wins; longer breaks a tie", () => {
+    expect(code("Your code is 1234. Expires in 10 minutes, ref 987654321")).toBe("1234");
+    expect(code("Reservation 20260904: your PIN is 5521")).toBe("5521");
+  });
+
+  test("selectCodes: inbound, new, DM only, once", () => {
+    const m = msg({ ts: "2026-09-02 12:30:00", from_me: false, chat: "77029", handle: "77029", name: null, text: "Your code is 483920" });
+    const out = selectCodes([
+      m,
+      msg({ ts: "2026-09-02 11:00:00", from_me: false, text: "old code 111111" }),                 // before watermark
+      msg({ ts: "2026-09-02 12:40:00", from_me: true, text: "my code is 222222" }),                 // outbound
+      msg({ ts: "2026-09-02 12:45:00", from_me: false, chat: "e98633ecd4e84723b69d142cd721b2b9", text: "code 333333" }), // group
+      msg({ ts: "2026-09-02 12:50:00", from_me: false, chat: "+15550001111", handle: "+15550001111", name: "Eli", text: "Enter passcode 444444" }),
+    ], WM, []);
+    expect(out.map((c) => [c.code, c.name])).toEqual([["483920", "77029"], ["444444", "Eli"]]);
+    expect(out.every((c) => c.key.startsWith("code:"))).toBe(true);
+    expect(selectCodes([m], WM, [out[0]!.key])).toEqual([]);           // the ring suppresses a repeat
+    expect(selectCodes([m], "", [])).toEqual([]);                        // never the first-run backlog
+    expect(selectCodes([m], WM, [], ["77029"])).toEqual([]);            // never the self-thread
+  });
+});
+
+describe("reads and aliases (Astra #9)", () => {
+  test("aliasesOf lists every row folded into a canonical conversation", () => {
+    expect(aliasesOf({ a1: "B", a2: "B", x: "Y" }, "B").sort()).toEqual(["a1", "a2"]);
+    expect(aliasesOf({ a1: "B" }, "Z")).toEqual([]);
+  });
+});
+
+describe("security codes: labelled numbers are not the code (Astra #13)", () => {
+  const { extractCode } = require("./collector") as typeof import("./collector");
+  test("the card number next to the trigger loses to the code", () => {
+    expect(extractCode("Your security code for card 1234 is 987654")?.code).toBe("987654");
+    expect(extractCode("Your account ending 4821 has a new login. Verification code: 556677")?.code).toBe("556677");
+    expect(extractCode("Ref 20260904: your PIN is 5521")?.code).toBe("5521");
+  });
+  test("an unlabelled code still wins as before", () => {
+    expect(extractCode("Use code 4821 to log in")?.code).toBe("4821");
+    expect(extractCode("Your Uber code: 8271. Expires in 10 minutes.")?.code).toBe("8271");
+  });
+});
+
+describe("cached groups are normalised on load (Astra B#6)", () => {
+  test("a participants object cannot poison every poll", () => {
+    const g = normalizeGroups({ chat123: { name: "", guid: "", participants: {} }, ok: { name: "Trail", guid: "any;+;x", participants: ["+1", 2, "+3"] }, junk: 5 });
+    expect(g.chat123).toEqual({ name: "", guid: "", participants: [] });
+    expect(g.ok).toEqual({ name: "Trail", guid: "any;+;x", participants: ["+1", "+3"] });
+    expect(g.junk).toBeUndefined();
+    expect(normalizeGroups(null)).toEqual({});
+  });
+});
+
+describe("search stdin payload (Astra B#2)", () => {
+  const { parseStdinPayload } = require("./search") as typeof import("./search");
+  test("legacy array = identities only; object carries the query", () => {
+    expect(parseStdinPayload('[{"chat":"+1"}]', true)).toEqual({ query: "", threads: [{ chat: "+1" }] });
+    expect(parseStdinPayload('{"query":" hello ","threads":[]}', true)).toEqual({ query: "hello", threads: [] });
+    expect(parseStdinPayload('{"query":"x"}', false).query).toBe("");
+    expect(parseStdinPayload("garbage", true)).toEqual({ query: "", threads: [] });
+  });
+});
+
+describe("the read-push policy is reported, not just applied", () => {
+  const { pushReadArgs } = require("./collector.ts");
+  test("the default pushes only on mark-all, never on opening a conversation", () => {
+    // This is why reads did not reach the phone: correct by design, and
+    // invisible until collect() started reporting the policy (Fred, 2026-09-08).
+    expect(pushReadArgs("all", { markRead: false, readChat: "+15550100001" })).toBeNull();
+    expect(pushReadArgs("all", { markRead: true, readChat: "" })).toEqual(["--all"]);
+  });
+  test("thread pushes a DM you open, but never a group", () => {
+    expect(pushReadArgs("thread", { markRead: false, readChat: "+15550100001" }))
+      .toEqual(["--chat", "+15550100001"]);
+    expect(pushReadArgs("thread", { markRead: false, readChat: "pat@example.com" }))
+      .toEqual(["--chat", "pat@example.com"]);
+    // 32-hex and chat<digits> have no imessage:// form
+    expect(pushReadArgs("thread", { markRead: false, readChat: "ce5a593a78af408282d61461ade89135" })).toBeNull();
+    expect(pushReadArgs("thread", { markRead: false, readChat: "chat224479848698394295" })).toBeNull();
+  });
+  test("the failure path still reports the policy and the guarded arrays", () => {
+    // status says read_push=? exactly when something is broken, unless the
+    // offline return carries it too — and BlipOutput declares codes/deep
+    // required, which that return did not satisfy (found by typechecking,
+    // 2026-09-08; the widget's Array.isArray guards meant it never crashed).
+    const src = readFileSync(new URL("./collector.ts", import.meta.url), "utf8");
+    const offline = src.slice(src.indexOf("if (!fetched.ok) {"), src.indexOf("const highest = maxTs("));
+    expect(offline).toContain("readPush: pushReadPolicy()");
+    expect(offline).toContain("codes: []");
+    expect(offline).toContain("deep: false");
+  });
+
+  test("off pushes nothing at all", () => {
+    expect(pushReadArgs("off", { markRead: true, readChat: "" })).toBeNull();
+  });
+
+  test("a poll that cleared nothing does not re-open the conversation on the Mac", () => {
+    // Every poll while a thread is open carries its readChat, so this gate is
+    // the difference between one push and one per poll — and each push pulls
+    // Messages to the front, because aiming its menu at one conversation means
+    // opening it. Measured before the gate: five pushes in a minute, four of
+    // them "nothing unread".
+    const dm = { markRead: false, readChat: "+15550100001" };
+    expect(pushReadArgs("thread", { ...dm, clearedUnread: true })).toEqual(["--chat", "+15550100001"]);
+    expect(pushReadArgs("thread", { ...dm, clearedUnread: false })).toBeNull();
+    // absent means "caller did not say" — push, so an old caller keeps working
+    expect(pushReadArgs("thread", dm)).toEqual(["--chat", "+15550100001"]);
+    // mark-all is never gated: it is an explicit gesture, not a side effect
+    expect(pushReadArgs("all", { markRead: true, readChat: "", clearedUnread: false })).toEqual(["--all"]);
+  });
+});
+
+// The dedicated key is confined to blip-dispatch AND, over Tailscale, pinned to
+// the enrolling machine's addresses: a leaked private key is useless from
+// anywhere else. blip_key_from() runs for real (PATH without tailscale).
+describe("blip-setup: the key's from= pin", () => {
+  const setup = new URL("./scripts/blip-setup", import.meta.url).pathname;
+  const keyFrom = (seen: string) => spawnSync("bash",
+    ["-c", 'source <(sed -n "/^blip_key_from()/,/^}/p" "$1"); blip_key_from "$2"', "_", setup, seen],
+    { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } }).stdout;
+  test("a Tailscale address is pinned, IPv4 and IPv6", () => {
+    expect(keyFrom("100.64.7.8")).toBe('from="100.64.7.8",');
+    expect(keyFrom("100.127.255.1")).toBe('from="100.127.255.1",');
+    expect(keyFrom("fd7a:115c:a1e0::1")).toBe('from="fd7a:115c:a1e0::1",');
+  });
+  test("anything else is left unpinned rather than stranded", () => {
+    for (const seen of ["192.168.1.5", "100.63.1.1", "100.128.0.1", "10.0.0.2", "", "mac.local"]) expect(keyFrom(seen)).toBe("");
+  });
+  test("a re-run replaces the key's line; the tool count is gone from the prose", () => {
+    const src = readFileSync(setup, "utf8");
+    expect(src).toContain("grep -vF -- '$pub' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.blip.tmp");
+    expect(src).not.toContain("five bridge tools");
+    expect(src).not.toContain("key_from=");   // no config knob: the pin follows the transport
+  });
+});
+
+// blip-setup pauses twice for a `read -r -p`. An ssh that runs a remote command
+// inherits the script's stdin and drains it, so with stdin from a pipe or a
+// redirect those reads hit EOF and `set -e` kills the script at the "Press
+// Enter" prompt — AFTER the Mac install and the key enrolment have already
+// run, which is the confusing part. `-n` is what keeps stdin for the prompts;
+// the first reachability probe already had it.
+describe("blip-setup: ssh never eats the script's stdin", () => {
+  const src = readFileSync(new URL("./scripts/blip-setup", import.meta.url), "utf8");
+  // Executable lines only: comments and echoed prose mention ssh as text.
+  const runnable = src.split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .filter((l) => !/^\s*echo\s/.test(l));
+
+  test("every ssh that runs a remote command passes -n", () => {
+    const offenders = runnable.filter((l) => {
+      const m = l.match(/(?:^|[;&|(]|\$\()\s*(?:(?:if|elif|while|until|then|else|do)\s+)?!?\s*ssh\s+(.*)$/);
+      if (!m) return false;
+      const args = m[1];
+      if (/^-O\s/.test(args)) return false;        // control command: runs nothing remote
+      return !/(^|\s)-n(\s|$)/.test(args);
+    });
+    expect(offenders).toEqual([]);
+  });
+
+  test("the prompts that would starve are still there", () => {
+    expect(src).toContain("Press Enter to run the permission check");
+    expect(src).toContain("then press Enter to re-check");
+  });
+});
+
+test("group labels prefer short names while participant details retain full names", () => {
+ const {groupName,groupParticipants,normalizeGroups,fetchGroups} = require('./collector');
+ const info={name:"",guid:"any;+;chat123",participants:["+15551234567"],participantNames:{"+15551234567":"Mary Jane Example"},participantShortNames:{"+15551234567":"Mary Jane"}};
+ expect(groupName('chat123',info,new Map())).toBe('Mary Jane');
+ expect(groupParticipants(info)[0].name).toBe('Mary Jane Example');
+ expect(groupName('chat123',{...info,name:'Custom group'},new Map())).toBe('Custom group');
+ expect(normalizeGroups({chat123:info}).chat123).toEqual(info);
+ const fetched=fetchGroups(()=>({status:0,stdout:JSON.stringify([{chat:'chat123',name:'',guid:info.guid,participants:info.participants,participant_names:info.participantNames,participant_short_names:info.participantShortNames}])}));
+ expect(fetched.chat123).toEqual(info);
+ expect(normalizeGroups({chat123:{...info,participantShortNames:[]}}).chat123.participantShortNames).toBeUndefined();
+});
+
+test("generated group labels join the last short name with an ampersand", () => {
+ const {groupName} = require('./collector');
+ const info={name:"",guid:"",participants:["a","b","c"],participantShortNames:{a:"Pat",b:"Sam",c:"Alex"}};
+ expect(groupName('chat123',info,new Map())).toBe('Pat, Sam & Alex');
+ expect(groupName('chat123',{...info,participants:['a','b']},new Map())).toBe('Pat & Sam');
+ expect(groupName('chat123',{...info,participants:['a']},new Map())).toBe('Pat');
+ expect(groupName('chat123',{...info,name:'Custom, title'},new Map())).toBe('Custom, title');
 });

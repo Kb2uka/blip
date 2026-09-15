@@ -2,8 +2,14 @@
 """
 blip-check: the three Mac permissions Blip needs, checked the way Blip uses them.
 
-  python3 ~/.blip/bin/blip-check          # human lines, exit 0 when all pass
-  python3 ~/.blip/bin/blip-check --json   # {"chatdb", "automation", "contacts", "markread": bool, ...}
+  python3 ~/.blip/bin/blip-check             # human lines, exit 0 when all pass
+  python3 ~/.blip/bin/blip-check --json      # {"chatdb", "automation", "contacts", "markread": bool, ...}
+  python3 ~/.blip/bin/blip-check --markread  # ALSO test the optional read-push grant
+
+--markread is opt-in because that probe is consent-triggering in its own right:
+it talks to System Events, which pops a second Automation prompt, and on
+macOS 26 a grant the user never asked for could not be switched back off in
+System Settings (#36). Only read-push needs it.
 
 Run it OVER SSH — that is the context that matters (sshd's grants, not the
 Terminal's). The Automation check deliberately talks to Messages.app, which
@@ -27,8 +33,10 @@ AB_GLOB = os.path.join(AB_DIR, "Sources", "*", "AddressBook-v22.abcddb")
 FIX = {
     "chatdb": "System Settings → Privacy & Security → Full Disk Access → add "
               "/usr/libexec/sshd-keygen-wrapper (⌘⇧G in the picker), then reconnect ssh.",
-    "automation": "Click Allow on the Mac's screen when Messages asks, or: System Settings → "
-                  "Privacy & Security → Automation → sshd-keygen-wrapper → Messages.",
+    "automation": "Click Allow on the Mac's screen when Messages asks (within ~2 minutes), or: "
+                  "System Settings → Privacy & Security → Automation → sshd-keygen-wrapper → Messages. "
+                  "If that switch will not stay on, a timed-out prompt was recorded as a denial: run "
+                  "`tccutil reset AppleEvents` on the Mac, re-run, and click Allow in time.",
     "contacts": "Same Full Disk Access grant as chat.db (names/avatars come from the AddressBook DB).",
     "markread": "System Settings → Privacy & Security → Accessibility → add "
                 "/usr/libexec/sshd-keygen-wrapper. OPTIONAL: without it everything works "
@@ -46,16 +54,27 @@ def check_chatdb() -> tuple[bool, str]:
         return False, str(e)
 
 
+# macOS gives the Allow prompt about two minutes. If nobody clicks, TCC records a
+# DENIAL (auth_reason 9, "Prompt Timeout") — and on macOS 26 the System Settings
+# switch for that record may refuse to flip back on (#36). So this probe waits
+# longer than the prompt does, and says so first: the person running blip-setup
+# is at the LINUX box, and the prompt appears on the Mac's screen.
+PROMPT_WAIT = 150
+
+
 def check_automation() -> tuple[bool, str]:
     # Touching Messages via AppleScript is what needs the grant — and what
     # triggers the prompt when it is missing. Listing services is harmless.
+    print("  … asking Messages (if an Allow prompt appears on the Mac's screen, click it — "
+          "it expires in about two minutes)", file=sys.stderr, flush=True)
     try:
         r = subprocess.run(
             ["osascript", "-e", 'tell application "Messages" to get count of services'],
-            capture_output=True, text=True, timeout=25,
+            capture_output=True, text=True, timeout=PROMPT_WAIT,
         )
     except subprocess.TimeoutExpired:
-        return False, "osascript timed out — the Allow prompt is probably waiting on the Mac's screen"
+        return False, ("no answer from Messages in %ds — the Allow prompt on the Mac's screen was not "
+                       "clicked in time. macOS records that as a denial; see the fix." % PROMPT_WAIT)
     if r.returncode == 0:
         return True, f"Messages responds ({r.stdout.strip()} services)"
     err = r.stderr.strip()
@@ -144,12 +163,17 @@ def check_contacts() -> tuple[bool, str]:
 def check_markread() -> tuple[bool, str]:
     """Can we drive Messages' menu bar? That is how a read is pushed back
     (imsg-read). Optional: reading and sending work without it."""
+    # This is the first System Events call this Mac may ever see from sshd: it
+    # can pop an Automation prompt of its own, so it gets the same patience as
+    # the Messages probe (Astra C#8).
+    print("  … asking System Events (an Allow prompt for System Events may appear on the Mac's screen — click it)",
+          file=sys.stderr, flush=True)
     try:
         r = subprocess.run(
             ["osascript", "-e",
              'tell application "System Events" to tell process "Messages" to '
              'name of menu bar item "Conversation" of menu bar 1'],
-            capture_output=True, timeout=20,
+            capture_output=True, timeout=PROMPT_WAIT,
         )
     except subprocess.TimeoutExpired:
         return False, "System Events timed out"
@@ -166,9 +190,24 @@ def check_markread() -> tuple[bool, str]:
 def main() -> None:
     results = {"chatdb": check_chatdb(), "automation": check_automation(), "contacts": check_contacts()}
     # Optional: its absence costs only mark-as-read, so it must not fail the run.
-    optional = {"markread": check_markread()}
+    # Opt-IN as well as optional, because the probe itself asks macOS for a
+    # permission: it pops a System Events Automation prompt, and on macOS 26 a
+    # grant nobody wanted could not be switched back off in System Settings
+    # afterwards (#36, 26.6.2). Asking for consent the user did not request is
+    # the exact failure this file exists to warn about, so it must not do it
+    # uninvited. Read-push is the only thing that needs it.
+    want_markread = "--markread" in sys.argv
+    optional = {"markread": check_markread() if want_markread else
+                (False, "not checked — only read-push needs it; re-run with --markread to test it")}
+
+    def fix_for(key: str, ok: bool) -> str:
+        """No fix line for a probe that never ran: nothing is wrong with it."""
+        if ok or (key == "markread" and not want_markread):
+            return ""
+        return FIX[key]
+
     if "--json" in sys.argv:
-        print(json.dumps({k: {"ok": v[0], "detail": v[1], "fix": "" if v[0] else FIX[k]}
+        print(json.dumps({k: {"ok": v[0], "detail": v[1], "fix": fix_for(k, v[0])}
                           for k, v in {**results, **optional}.items()}))
     else:
         for k, (ok, detail) in results.items():
@@ -177,7 +216,7 @@ def main() -> None:
                 print(f"      fix: {FIX[k]}")
         for k, (ok, detail) in optional.items():
             print(f"  {'✅' if ok else '➖'}  {k:<10} {detail}")
-            if not ok:
+            if fix_for(k, ok):
                 print(f"      fix: {FIX[k]}")
     sys.exit(0 if all(v[0] for v in results.values()) else 1)
 

@@ -16,8 +16,13 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dest="$HOME/.blip/bin"
+# --no-check: blip-setup passes this and runs blip-check itself, AFTER telling
+# the user to be at the Mac's screen. The check here fires the Automation
+# prompt; fired before that warning it expired unanswered and macOS recorded a
+# denial (#36, Astra #11).
+check=1; for a in "$@"; do [[ $a == --no-check ]] && check=0; done
 mkdir -p "$dest"
-for t in imsg imsg-send imsg-read contacts tcc-check blip-check blip-dispatch calling_codes.py; do
+for t in imsg imsg-send imsg-read contacts contact-repair.js tcc-check blip-check blip-dispatch calling_codes.py; do
   if [[ -f "$here/$t" ]]; then
     install -m 0755 "$here/$t" "$dest/$t"
   else
@@ -53,4 +58,8 @@ Two permissions must be granted by hand (macOS will not let a script do it):
 
 Then check:
 EOF
-python3 "$dest/blip-check" || true
+if [[ $check == 1 ]]; then
+  python3 "$dest/blip-check" || true
+else
+  echo "(permission check skipped here — blip-setup runs it once you are at the Mac's screen)"
+fi

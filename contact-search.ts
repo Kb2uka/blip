@@ -49,7 +49,7 @@ export function normalizeHandle(s: string, cc: string = defaultCountryCode()): s
   const t = String(s || "").trim();
   if (t.includes("@")) return t.toLowerCase();
   // Extensions can't be messaged; stripping them would change the number.
-  if (/(ext|x)\.?\s*\d+\s*$/i.test(t)) return "";
+  if (/(ext|x)\.?\s*=?\s*\d+\s*$/i.test(t) || /[;,]/.test(t)) return "";   // ";ext=89" too (Astra B#10)
   if (t.startsWith("+")) return "+" + t.slice(1).replace(/\D/g, "");
   const digits = t.replace(/\D/g, "");
   if (cc === "1") {

@@ -80,13 +80,17 @@ export function messageMatchScore(query: string, text: string): number {
  *  rows are dropped. Self-thread echo twins collapse to one hit. */
 export function shapeResults(raw: ImsgMessage[], query: string, limit: number): SearchHit[] {
   const out: (SearchHit & { score: number })[] = [];
-  const seen = new Set<string>();
+  const seen = new Map<string, boolean>();
   for (const m of raw) {
     const body = (m.text ?? "").replace(/\uFFFC/g, "").trim();
     if (body === "") continue;
+    // A twin is the self-thread ECHO: same chat, second and text, OPPOSITE
+    // direction. Two members answering "yes" in the same second are two
+    // messages (Astra B#7).
     const twinKey = `${chatKey(m)}\0${m.ts}\0${body}`;
-    if (seen.has(twinKey)) continue;
-    seen.add(twinKey);
+    const prior = seen.get(twinKey);
+    if (prior !== undefined && prior !== Boolean(m.from_me)) continue;
+    seen.set(twinKey, Boolean(m.from_me));
     out.push({
       chat: chatKey(m),
       name: m.name ?? m.handle ?? chatKey(m),
@@ -165,9 +169,12 @@ export function runSearch(
   if (q === "") return fail("empty query");
 
   // "--" so a query starting with "-" is a query, not a flag.
-  const res = runner(`${HOME}/bin/imsg`, ["--json", "search", "--", q, String(limit * 2)], {
+  // The query is message text the moment someone pastes a sentence into the
+  // box: stdin to the bridge, never argv on either machine (Astra B#2).
+  const res = runner(`${HOME}/bin/imsg`, ["--json", "search", "--stdin", String(limit * 2)], {
     encoding: "utf8",
     timeout: 20000,
+    input: q,
   });
   if (res.status === 69 || res.status === 255) return fail("Mac unreachable", false);
   if (res.status !== 0) {
@@ -187,24 +194,32 @@ export function runSearch(
   }
 }
 
-function threadsFromStdin(): Parameters<typeof matchConversations>[0] {
-  if (process.stdin.isTTY) return [];
+/** ONE stdin payload: either the legacy array of sidebar identities, or
+ *  `{ query, threads }` — the query is message text the moment a sentence is
+ *  pasted into the box, so with `--stdin` it travels here, never argv
+ *  (Astra B#2). Read exactly once. */
+export function parseStdinPayload(raw: string, wantQuery: boolean): { query: string; threads: Parameters<typeof matchConversations>[0] } {
   try {
-    const raw = readFileSync(0, "utf8").trim();
-    if (raw === "") return [];
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed as Parameters<typeof matchConversations>[0];
-  } catch {
-    return [];
-  }
+    const parsed = JSON.parse(raw.trim() || "null") as unknown;
+    if (Array.isArray(parsed)) return { query: "", threads: parsed as Parameters<typeof matchConversations>[0] };
+    if (parsed && typeof parsed === "object") {
+      const o = parsed as { query?: unknown; threads?: unknown };
+      return {
+        query: wantQuery ? String(o.query ?? "").trim() : "",
+        threads: Array.isArray(o.threads) ? o.threads as Parameters<typeof matchConversations>[0] : [],
+      };
+    }
+  } catch { /* not ours */ }
+  return { query: "", threads: [] };
 }
 
 if (import.meta.main) {
-  const query = process.argv[2] ?? "";
+  const arg = process.argv[2] ?? "";
   const limit = Number(process.argv[3] ?? 40) || 40;
+  const payload = process.stdin.isTTY ? { query: "", threads: [] } : parseStdinPayload(readFileSync(0, "utf8"), arg === "--stdin");
+  const query = arg === "--stdin" ? payload.query : arg;
   try {
-    console.log(JSON.stringify(runSearch(query, limit, spawnSync, threadsFromStdin())));
+    console.log(JSON.stringify(runSearch(query, limit, spawnSync, payload.threads)));
   } catch (e) {
     console.log(JSON.stringify({ ok: false, online: true, error: String(e), results: [] }));
   }
