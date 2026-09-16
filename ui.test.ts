@@ -206,12 +206,12 @@ describe("QML safety invariants", () => {
     expect(scaleFontPx(10, 14, 11)).toBe(13);
   });
 
-  test("share sheet: right-click a link, URL on stdin, never argv", () => {
+  test("message menu retains share sheet: URL on stdin, never argv", () => {
     expect(panel).toContain("function openShare(u, auto)");
     expect(panel).toContain("qrProc.write(u)");
     expect(panel).toContain("sendShareProc.write(u)");
     expect(panel).toContain('localsend --headless send "$2"');
-    expect(panel).toContain('onTapped: root.openShare(String(linkCard.link.url || ""))');
+    expect(panel).toContain('onTapped: root.openMessageMenu(modelData, String(linkCard.link.url || ""))');
     expect(panel).toContain('if (shareUrl !== "") { closeShare(); return true }');
     expect(widget).toContain('function share(url: string): string { if (!root.automationOn) return root.automationOff;');
     // never the URL as an argv element of qrencode / localsend

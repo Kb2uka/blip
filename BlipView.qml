@@ -1,4 +1,5 @@
 import "SendState.mjs" as SendState
+import "MessageActions.mjs" as MessageActions
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -100,7 +101,7 @@ FocusScope {
   readonly property color dim: Qt.alpha(foreground, 0.66)
   /** An editor owns the keyboard — the host's key catcher must stand down. */
   readonly property bool editorActive:
-    contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
+    messageMenu.visible || contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
   readonly property alias composeEditor: composeField
   readonly property real contentHeightHint: listContent.implicitHeight
   /** The view wants keyboard navigation focus back (list mode). */
@@ -525,6 +526,7 @@ FocusScope {
    *  load still in flight is ignored when it lands, and a share sheet over it
    *  goes too (it belonged to the link you were looking at). */
   function clearThread() {
+    messageMenu.close()
     closeShare()
     peekTimer.stop()
     peeking = false
@@ -606,6 +608,7 @@ FocusScope {
     if (hostWidget && readActive && !peeking) hostWidget.markThreadRead(chat, seen)
   }
   function showThread(t) {
+    messageMenu.close()
     active = t
     activeLastTs = String(t.last_ts || "")
     bubbles = []
@@ -744,9 +747,10 @@ FocusScope {
    *  inline reply is not reachable through the bridge (no message GUID leaves
    *  the Mac and AppleScript has no reply-to), so this is a plain "> quote". */
   function quoteBubble(b) {
-    composeField.text = "> " + String(b.text || "").replace(/\s+/g, " ").slice(0, 200) + "\n"
+    composeField.text = MessageActions.quotedDraft(b, composeField.text)
     composeField.cursorPosition = composeField.length
     leaveBubbles()
+    Qt.callLater(function() { composeField.forceActiveFocus() })
   }
   function markAllRead() {
     if (!root.hostWidget || root.unread === 0) return
@@ -3483,7 +3487,7 @@ FocusScope {
                     }
                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                     TapHandler { onTapped: root.openLink(String(linkCard.link.url || "")) }
-                    TapHandler { acceptedButtons: Qt.RightButton; onTapped: root.openShare(String(linkCard.link.url || "")) }
+                    TapHandler { acceptedButtons: Qt.RightButton; onTapped: root.openMessageMenu(modelData, String(linkCard.link.url || "")) }
                   }
                   Item { Layout.fillWidth: true; visible: !bubbleRow.mine }
                 }
@@ -3576,14 +3580,13 @@ FocusScope {
                       }
                     }
 
-                    // right-click on a LINK = share sheet; anywhere else = copy the whole message
+                    // Right-click offers message actions or actions for the clicked link.
                     TapHandler {
                       acceptedButtons: Qt.RightButton
                       onTapped: function(eventPoint) {
                         var p = bubbleText.mapFromItem(bubble, eventPoint.position.x, eventPoint.position.y)
                         var l = bubbleText.hasLink ? bubbleText.linkAt(p.x, p.y) : ""
-                        if (l && l !== "") root.openShare(String(l))
-                        else root.copyText(String(modelData.text || ""))
+                        root.openMessageMenu(modelData, String(l || ""))
                       }
                     }
 
@@ -3918,6 +3921,35 @@ FocusScope {
         }
       }
     }
+  }
+
+  property var messageContext: null
+  function openMessageMenu(message, url) {
+    messageContext = message
+    messageMenu.linkUrl = url
+    messageMenu.popup()
+  }
+  MessageMenu {
+    id: messageMenu
+    objectName: "blipMessageMenu"
+    font.family: root.fontFamily
+    font.pixelSize: root.fontBodySmall
+    palette.window: Color.background
+    palette.base: Color.background
+    palette.text: root.foreground
+    palette.windowText: root.foreground
+    palette.buttonText: root.foreground
+    palette.highlight: root.accent
+    palette.highlightedText: "#ffffff"
+    canQuote: root.messageContext !== null && MessageActions.quoteText(root.messageContext) !== ""
+              && root.online && root.isSendable(root.active)
+    canCopy: root.messageContext !== null && String(root.messageContext.text || "") !== ""
+    onQuoteRequested: if (root.messageContext) root.quoteBubble(root.messageContext)
+    onCopyRequested: if (root.messageContext) root.copyBubble(root.messageContext)
+    onOpenRequested: function(url) { root.openLink(url) }
+    onCopyLinkRequested: function(url) { root.copyText(url) }
+    onShareRequested: function(url) { root.openShare(url) }
+    onClosed: root.messageContext = null
   }
 
   property var contactContext: null
