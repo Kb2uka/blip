@@ -751,6 +751,12 @@ export function selectToasts(
   for (const m of msgs) {
     if (m.from_me) continue;
     if (m.ts <= watermark) continue;
+    // Already read on the iPhone. The badge ignores these (isUnread), so a
+    // toast would announce something with nothing behind it to click -- and
+    // after a suspend the watermark is hours old, so it is a whole night of
+    // them at once on wake (#89). An older bridge omits `read`; undefined
+    // keeps the pre-1.9.0 behaviour of trusting the watermark alone.
+    if (m.read === true) continue;
     if (open.has(chatKey(m))) continue;
     if (!allowed.has(chatKey(m)) && !allowed.has(m.handle)) continue;
     const key = toastKey(m);
