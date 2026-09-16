@@ -33,6 +33,9 @@ LAST X POST: CONTRIBUTORS-X-POST.md (2026-09-11). Everything below the
 marker for Post 2 is in the Post 2 draft in X-POSTS.md.
 ------------------------------------------------------------------------
 
+2026-09-16  (direct)  Blip's Mac-side fixes upstreamed as claude-on-mac v2.0.0; contact names rank the owner's book first, then the
+                 largest source within a rank (reconciles claude-on-mac #5). tcc-check says 2 minutes, not 60s.
+                 Fred Nix / Larry, X https://x.com/nixfred
 2026-09-16  (direct)  A waiting Send Later message shows "Scheduled for <time>", not sent; never the newest
                  message, never moves a read mark. Found checking fnix after its macOS 27 upgrade.
                  Fred Nix / Larry, X https://x.com/nixfred
