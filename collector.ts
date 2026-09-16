@@ -590,13 +590,17 @@ export function normalizeSendService(raw: string | undefined | null): SendServic
  *   1. the newest row is a FAILED iMessage of ours to a phone → they are not
  *      on iMessage; send SMS. (AppleScript does not fall back the way the
  *      Messages GUI does — the send just dies with error 22.)
- *   2. otherwise the last INBOUND service: that is what they actually reach
+ *   2. `prefer_imessage=on` in bridge.conf: a successful iMessage anywhere in
+ *      the loaded window (in or out) → iMessage. Last-inbound RCS/SMS in a
+ *      mixed 1:1 otherwise makes the next send green, and the Mac records SMS
+ *      error 4 while the iPhone still delivers. Off by default.
+ *   3. otherwise the last INBOUND service: that is what they actually reach
  *      us on, and a failed outbound must never override it.
- *   3. no inbound at all → the last outbound that SUCCEEDED.
- *   4. nothing to go on → iMessage, like a fresh conversation.
+ *   4. no inbound at all → the last outbound that SUCCEEDED.
+ *   5. nothing to go on → iMessage, like a fresh conversation.
  * Groups send `--chat-id` and ignore all of this.
  */
-export function sendServiceForMessages(msgs: ImsgMessage[]): SendService {
+export function sendServiceForMessages(msgs: ImsgMessage[], preferImessage = false): SendService {
   if (!msgs.length) return "iMessage";
   const sorted = [...msgs].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   const failed = (m: ImsgMessage) => typeof m.error === "number" && m.error !== 0;
@@ -607,6 +611,11 @@ export function sendServiceForMessages(msgs: ImsgMessage[]): SendService {
       && normalizeSendService(newest.service) === "iMessage"
       && /^\+?[0-9]{3,15}$/.test(chat)) {
     return "SMS";
+  }
+  if (preferImessage) {
+    for (const m of sorted) {
+      if (!failed(m) && normalizeSendService(m.service) === "iMessage") return "iMessage";
+    }
   }
   for (let i = sorted.length - 1; i >= 0; i--) {
     if (!sorted[i]!.from_me) return normalizeSendService(sorted[i]!.service);
@@ -640,6 +649,7 @@ export function buildThreads(
   readMarks: Record<string, string> = {},
   groups: Record<string, GroupInfo> = {},
   unreadCounts?: Record<string, number>,
+  preferImessage = false,
 ): Thread[] {
   const byHandle = new Map<string, string>();
   for (const m of msgs) if (m.name && m.handle && !byHandle.has(m.handle)) byHandle.set(m.handle, m.name);
@@ -666,7 +676,7 @@ export function buildThreads(
       guid: isGroupChat(chat) ? groups[chat]?.guid ?? "" : "",
       name: isGroupChat(chat) ? groupName(chat, groups[chat], byHandle) : displayName(sorted),
       handle: String(last.handle || chat),
-      service: isGroupChat(chat) ? last.service : sendServiceForMessages(sorted),
+      service: isGroupChat(chat) ? last.service : sendServiceForMessages(sorted, preferImessage),
       last_ts: last.ts,
       last_text: messagePreview(last.text, last.attachments?.[0]),
       last_from_me: last.from_me,
@@ -1023,6 +1033,26 @@ export const BRIDGE_CONF = `${HOME}/.config/blip/bridge.conf`;
 /** off = never tell the Mac · all = only the explicit mark-all-read gesture
  *  · thread = also each conversation you open. */
 export type PushRead = "off" | "all" | "thread";
+
+/**
+ * `prefer_imessage=on` in bridge.conf (parsed, never sourced).
+ *
+ * Default off: last inbound still wins, so a green thread stays green.
+ * On: a DM that has a successful iMessage in the loaded window sends
+ * iMessage even if the latest inbound was RCS/SMS. The failed-iMessage →
+ * SMS lock still runs first.
+ */
+export function preferImessagePolicy(path = BRIDGE_CONF): boolean {
+  try {
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+      const m = /^\s*prefer_imessage\s*=\s*([A-Za-z0-9]+)\s*$/.exec(line);
+      if (!m) continue;
+      const v = m[1]!.toLowerCase();
+      return v === "on" || v === "true" || v === "1" || v === "yes";
+    }
+  } catch { /* no conf: the default */ }
+  return false;
+}
 
 /**
  * `push_read=` in bridge.conf (parsed, never sourced).
@@ -1535,6 +1565,7 @@ export function mergeChats(
   chats: ChatInfo[],
   groups: Record<string, GroupInfo>,
   unreadCounts: Record<string, number>,
+  preferImessage = false,
 ): Thread[] {
   const infoByChat = new Map(chats.map((c) => [c.id, c]));
   // Every participant name the window already resolved, so a chat that is new
@@ -1570,7 +1601,9 @@ export function mergeChats(
               ? groupName(thread.chat, groupInfo, knownParticipantNames)
               : namedGroup(thread.name, thread.chat, aliases) || thread.chat))
         : (info.last_name || info.name || thread.name || thread.chat),
-      service: info.service || thread.service,
+      service: (!group && preferImessage && normalizeSendService(thread.service) === "iMessage")
+        ? thread.service
+        : (info.service || thread.service),
       last_text: info.last === thread.last_ts ? info.last_text : messagePreview(thread.last_text),
       pinned,
       pin_order,
@@ -1777,7 +1810,8 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   for (const [chat, ts] of Object.entries(readMarks)) {
     if (ts <= readMark) delete readMarks[chat];
   }
-  const windowThreads = buildThreads(msgs, readMark, readMarks, groups, exactCounts);
+  const preferImessage = preferImessagePolicy();
+  const windowThreads = buildThreads(msgs, readMark, readMarks, groups, exactCounts, preferImessage);
   // A shallow poll returns the window's rows; the widget keeps its last
   // complete list in memory (it skips identical assignments anyway).
   const chats = deep ? listed : null;
@@ -1800,7 +1834,7 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   exactCounts = foldChatRecord(exactCounts, chatAliases, (a, b) => a + b);
   exactOldest = foldChatRecord(exactOldest, chatAliases, (a, b) => (a < b ? a : b));
   const foldedWindow = foldThreadAliases(windowThreads, chatAliases);
-  const threads = chats ? mergeChats(foldedWindow, chats, groups, exactCounts) : applyPins(foldedWindow, pins);
+  const threads = chats ? mergeChats(foldedWindow, chats, groups, exactCounts, preferImessage) : applyPins(foldedWindow, pins);
   // The conversation on screen covers its alias rows, exactly as the read
   // marks above do: a message arriving under a retired chat row is the same
   // conversation you are looking at.

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`prefer_imessage=on` keeps mixed 1:1s on iMessage.** Last-inbound RCS/SMS
+  in a DM that already had iMessage made the next send green. The Mac then
+  often stamps SMS error 4 ("Not Delivered") while the iPhone still delivers
+  the RCS/iMessage. Opt in with `prefer_imessage=on` in `bridge.conf`: a
+  successful iMessage anywhere in the loaded window wins, a never-iMessage
+  green thread stays green, and a failed iMessage to a phone still flips to
+  SMS. Off by default. Groups still send by chat id.
+
 - **Right-click a message to quote it.** Replying to something further up the
   conversation used to be hidden behind Shift+Page Up, then Ctrl+R. Right-click
   on a message now offers Quote and reply and Copy message; right-click on a
