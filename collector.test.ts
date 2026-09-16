@@ -430,6 +430,47 @@ describe("selectToasts", () => {
     expect(out).toHaveLength(1);
   });
 
+  // The badge already honours the Apple side (isUnread), so a toast for a
+  // message read on the iPhone announces something the bar says is not there.
+  test("does not toast a message already read on another device", () => {
+    const out = selectToasts(
+      [msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30T11:00:00Z", read: true })],
+      "2026-08-30T10:00:00Z",
+      allow,
+      [],
+    );
+    expect(out).toEqual([]);
+  });
+
+  // Waking from suspend hands the collector everything that arrived while the
+  // watermark stood still -- a night of messages, most of them read on the
+  // phone hours ago, drained one notify-send at a time (#89).
+  test("a wake-up backlog toasts only what is still unread", () => {
+    const out = selectToasts(
+      [
+        msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30T23:00:00Z", text: "read on the phone", read: true }),
+        msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30T23:30:00Z", text: "also read", read: true }),
+        msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-31T07:00:00Z", text: "still unread", read: false }),
+      ],
+      "2026-08-30T22:00:00Z",
+      allow,
+      [],
+    );
+    expect(out.map((t) => t.text)).toEqual(["still unread"]);
+  });
+
+  // `read` arrives from imsg >= 1.9.0. An older bridge omits it, and undefined
+  // must not read as "already seen" or that setup would never toast at all.
+  test("a bridge that reports no read state toasts as before", () => {
+    const out = selectToasts(
+      [msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30T11:00:00Z" })],
+      "2026-08-30T10:00:00Z",
+      allow,
+      [],
+    );
+    expect(out).toHaveLength(1);
+  });
+
   test("drops senders that are not allowlisted", () => {
     // Bank alerts and 2FA codes are the reason this gate exists.
     const out = selectToasts(

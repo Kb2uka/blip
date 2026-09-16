@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Waking the laptop no longer replays the night's messages as toasts.** Nothing
+  polls while the machine sleeps, so the watermark stood still and every
+  allowlisted message that arrived meanwhile toasted on wake, one
+  `notify-send` at a time, up to twenty, even ones already read on the iPhone.
+  The badge already ignored those (`isUnread` honours Apple's read flag);
+  `selectToasts` now does too. A bridge too old to report `read` toasts as
+  before. Reported by @mwhuss (#89), fixed by @ianswope (#95).
 - **The app window stays on its workspace after idle.** Walking away used to
   remap Blip onto whichever workspace was on screen. A user move is still the
   new home; a screensaver or display-off remap is sent back quietly.
