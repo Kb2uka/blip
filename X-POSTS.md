@@ -76,6 +76,5 @@ github.com/nixfred/blip
 ----- end -----
 
 Handle notes for Fred before posting:
-- @jefehoser (Danny Cecil): same unique login as his GitHub, and the X account posts about Omarchy, but he never published it himself. Confirm before tagging.
 - Ian Swope: an @IanSwope account exists with his name, but it is dormant (school supply tweets, no Linux, no GitHub link). Not tagged. If you know his handle, add it to CHANGE.log and here.
 - cjoh: no handle found.
