@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Super+M no longer closes the wrong window.** The shortcut picked the first
+  window whose title merely started with "Blip", so a focused browser tab or
+  editor called "Blip documentation" got closed instead of Blip opening. It now
+  matches only the real app, the way the window already identifies itself.
+  If you copied the Super+M binding from the README, replace it with the
+  updated example; updating the plugin does not change your Hyprland config.
+  Thanks @jefehoser (#93).
 - **Waking the laptop no longer replays the night's messages as toasts.** Nothing
   polls while the machine sleeps, so the watermark stood still and every
   allowlisted message that arrived meanwhile toasted on wake, one
