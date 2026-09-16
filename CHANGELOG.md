@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Fill a security code beside the field.** `otp_autofill=on` offers incoming
+  codes through a Blip prompt using native Linux accessibility, including
+  separate digit boxes. The prompt shares Blip's fonts and colors, falls back
+  to the top right when field bounds are unavailable, and expires after five
+  minutes. No browser extension or clipboard is needed.
 - **Right-click a message to quote it.** Replying to something further up the
   conversation used to be hidden behind Shift+Page Up, then Ctrl+R. Right-click
   on a message now offers Quote and reply and Copy message; right-click on a

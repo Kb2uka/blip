@@ -463,7 +463,8 @@ describe("QML safety invariants", () => {
     expect(panel).toContain("color: calm ? root.dim : root.urgent");
     // secondary text dims by alpha, which reads right on light and dark themes alike;
     // Qt.darker on the foreground only works on a dark one
-    expect(panel).toContain("readonly property color dim: Qt.alpha(foreground, 0.66)");
+    expect(panel).toContain("readonly property color dim: appearance.muted");
+    expect(readFileSync(new URL("./BlipAppearance.qml", import.meta.url), "utf8")).toContain("readonly property color muted: Qt.alpha(foreground, 0.66)");
     expect(panel).not.toMatch(/Qt\.darker\((root\.)?foreground/);
   });
 
@@ -613,15 +614,16 @@ test("a pinned tile shows the unread dot", () => {
 // the theme accent, which on several Omarchy themes is red — a red dot on a
 // messaging icon reads as an error, and red is reserved for alerts anyway.
 test("the icon's unread dot is always iMessage blue", () => {
-  expect(widget).toContain('readonly property color blipAccent: "#0a84ff"');
+  expect(widget).toContain('readonly property color blipAccent: blipAppearance.accent');
   expect(widget).not.toContain("blipAccent:\n    Color.accent");
 });
 
 // Bubbles are iMessage blue on every theme, white text on them, like Messages.
 // They followed the theme accent until 2.3.3 — red on several Omarchy themes.
 test("outgoing bubbles are always iMessage blue with white text", () => {
-  expect(panel).toContain('readonly property color accent: "#0a84ff"');
-  expect(panel).toContain('readonly property color mineText: "#ffffff"');
+  expect(panel).toContain('readonly property color accent: appearance.accent');
+  expect(readFileSync(new URL('./BlipAppearance.qml', import.meta.url), 'utf8')).toContain('readonly property color accent: "#0a84ff"');
+  expect(panel).toContain('readonly property color mineText: appearance.accentText');
   expect(panel).not.toContain("themeHasAccent");
 });
 
