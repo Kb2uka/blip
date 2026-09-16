@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Right-click a message to quote it.** Replying to something further up the
+  conversation used to be hidden behind Shift+Page Up, then Ctrl+R. Right-click
+  on a message now offers Quote and reply and Copy message; right-click on a
+  link or its preview offers Open in browser, Copy link and Share link. Quoting
+  puts the quote above whatever you had already typed and never sends. It is a
+  plain "> quote", not an Apple inline reply thread. Right-click on text no
+  longer copies instantly; Copy message is one item away. Thanks @jefehoser (#94).
 - **Super+M no longer closes the wrong window.** The shortcut picked the first
   window whose title merely started with "Blip", so a focused browser tab or
   editor called "Blip documentation" got closed instead of Blip opening. It now

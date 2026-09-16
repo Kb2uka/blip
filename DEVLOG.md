@@ -15,6 +15,31 @@
   correction. No real conversations were opened or messages sent for testing;
   no layout changes or live shell restart were needed.
 
+## 2026-09-15 — Message context menu and quotation replies
+
+- Right-clicking plain message text offers Quote and reply and Copy message.
+  Right-clicking a link or link preview offers only Open in browser, Copy link
+  and Share link; the existing QR code and LocalSend sheet is retained.
+- Quoting preserves the current draft, returns typing focus to the composer,
+  and does not send. The keyboard shortcut uses the same formatter. Empty or
+  withdrawn messages cannot be quoted; link-only messages use the URL. Long
+  excerpts show an ellipsis and do not split Unicode code points.
+- Link and message menus were visually rechecked after separating their actions;
+  hidden actions are disabled so keyboard navigation skips them.
+- Menu focus blocks the panel navigation catcher. Changing conversations
+  closes the menu so actions cannot target a previous conversation.
+- Verification: 532 source tests pass; the menu passes qmllint. Synthetic
+  Quickshell checks and grim screenshots cover wide/narrow menus, keyboard
+  selection, quotation with an existing draft, restored composer focus, and
+  the existing share sheet. No real messages were read or sent for testing.
+- Deployed only the menu changes onto the existing installed code, preserving
+  unrelated local changes. After shell restart IPC reports online and healthy,
+  and recent shell logs contain no Blip warnings/errors. Installed-copy tests:
+  489 pass, four pre-existing failures involving old installer files and
+  release-documentation versions, reproduced with this patch reversed.
+- Limitation: quotation replies are ordinary messages, not Apple inline reply
+  threads. The change is deployed locally and prepared for upstream review.
+
 ## 2026-09-14 — Stay on the last workspace after a walk-away
 
 - Idle, screensaver and display-off remake the shell window on the focused
