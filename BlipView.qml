@@ -1617,7 +1617,7 @@ FocusScope {
             // real rows; a pending bubble carries this machine's clock.
             var seen = ""
             for (var k = 0; k < list.length; k++) {
-              if (list[k].pending === true) continue
+              if (list[k].pending === true || list[k].scheduled === true) continue
               var ts = String(list[k].ts || ""); if (ts > seen) seen = ts
             }
             // thread.ts hands back the sends it is still waiting on for this
@@ -3562,7 +3562,8 @@ FocusScope {
                   Layout.fillWidth: true
                   visible: String(modelData.time || "") !== "" ||
                            modelData.edited === true || String(modelData.effect || "") !== "" ||
-                           modelData.failed === true || modelData.pending === true
+                           modelData.failed === true || modelData.pending === true ||
+                           modelData.scheduled === true
                   spacing: 0
                   Item { Layout.fillWidth: true; visible: bubbleRow.mine }
                   Text {
@@ -3572,7 +3573,9 @@ FocusScope {
                     wrapMode: Text.WrapAnywhere
                     text: [modelData.failed === true ? "⚠ Not Delivered" : "",
                            modelData.failed === true ? String(modelData.failureReason || "")
-                             : modelData.pending === true ? "Sending…" : String(modelData.time || ""),
+                             : modelData.pending === true ? "Sending…"
+                             : modelData.scheduled === true ? "Scheduled for " + String(modelData.scheduledFor || "")
+                             : String(modelData.time || ""),
                            modelData.edited === true ? "Edited" : "",
                            String(modelData.effect || "") !== "" ? "sent with " + modelData.effect : ""]
                           .filter(function(s) { return s !== "" }).join(" · ")

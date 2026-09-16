@@ -135,7 +135,7 @@ describe("QML safety invariants", () => {
     expect(panel).toContain("root.failPending(completedChat, completedId, reason, completedText, completedStamp)");
     expect(panel).toContain('modelData.pending === true ? "Sending…"');
     // the read watermark never takes a pending bubble's local-clock stamp
-    expect(panel).toContain("if (list[k].pending === true) continue");
+    expect(panel).toContain("if (list[k].pending === true || list[k].scheduled === true) continue");
   });
 
   test("message text leaves this machine on stdin, never in argv (audit #4)", () => {
