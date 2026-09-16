@@ -25,6 +25,22 @@ def load_imsg():
 imsg = load_imsg()
 
 
+class MessageIdentityTests(unittest.TestCase):
+    def test_rich_message_json_preserves_the_original_identity(self):
+        row = {"ROWID": 42, "date": 1, "is_from_me": 0, "handle": "+15551234567",
+               "chat_identifier": "chat12345", "room_name": "room12345", "service": "iMessage",
+               "text": "Synthetic message", "attributedBody": None, "is_read": 0,
+               "date_edited": None, "date_retracted": None, "message_summary_info": None,
+               "assoc_type": 0, "error": 0, "balloon_bundle_id": None,
+               "guid": "11111111-2222-4333-8444-555555555555"}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            imsg.render([row], as_json=True, with_names=False, rich=True)
+        result = json.loads(output.getvalue())[0]
+        self.assertEqual((result["id"], result["guid"], result["chat"]),
+                         (42, row["guid"], "room12345"))
+
+
 class ShortNameTests(unittest.TestCase):
     def test_structured_short_names_preserve_multiword_names_and_safe_fallbacks(self):
         original = imsg.name_for
