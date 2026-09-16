@@ -48,7 +48,7 @@ const tmp = () => mkdtempSync(join(tmpdir(), "blip-test-"));
 
 function msg(over: Partial<ImsgMessage> = {}): ImsgMessage {
   return {
-    ts: "2026-08-30 12:00:00",
+    ts: "2026-08-30T12:00:00Z",
     from_me: false,
     handle: "+15551234567",
     name: "Test Person",
@@ -63,9 +63,9 @@ describe("buildThreads", () => {
   test("groups by chat and keeps the newest message as the preview", () => {
     const threads = buildThreads(
       [
-        msg({ chat: "A", ts: "2026-08-30 10:00:00", text: "older" }),
-        msg({ chat: "A", ts: "2026-08-30 11:00:00", text: "newer" }),
-        msg({ chat: "B", ts: "2026-08-30 09:00:00", text: "b only" }),
+        msg({ chat: "A", ts: "2026-08-30T10:00:00Z", text: "older" }),
+        msg({ chat: "A", ts: "2026-08-30T11:00:00Z", text: "newer" }),
+        msg({ chat: "B", ts: "2026-08-30T09:00:00Z", text: "b only" }),
       ],
       "",
     );
@@ -88,9 +88,9 @@ describe("buildThreads", () => {
   test("orders threads newest-first regardless of input order", () => {
     const threads = buildThreads(
       [
-        msg({ chat: "old", ts: "2026-01-01 00:00:00" }),
-        msg({ chat: "new", ts: "2026-08-30 23:59:59" }),
-        msg({ chat: "mid", ts: "2026-05-05 12:00:00" }),
+        msg({ chat: "old", ts: "2026-01-01T00:00:00Z" }),
+        msg({ chat: "new", ts: "2026-08-30T23:59:59Z" }),
+        msg({ chat: "mid", ts: "2026-05-05T12:00:00Z" }),
       ],
       "",
     );
@@ -98,24 +98,24 @@ describe("buildThreads", () => {
   });
 
   test("first run reports zero unread — an empty watermark must not flag the backlog", () => {
-    const threads = buildThreads([msg({ ts: "2026-08-30 10:00:00" })], "");
+    const threads = buildThreads([msg({ ts: "2026-08-30T10:00:00Z" })], "");
     expect(threads[0]!.unread).toBe(0);
   });
 
   test("counts only inbound messages newer than the watermark", () => {
     const threads = buildThreads(
       [
-        msg({ ts: "2026-08-30 09:00:00" }),                     // old inbound
-        msg({ ts: "2026-08-30 11:00:00" }),                     // new inbound  ✓
-        msg({ ts: "2026-08-30 12:00:00", from_me: true }),      // new outbound ✗
+        msg({ ts: "2026-08-30T09:00:00Z" }),                     // old inbound
+        msg({ ts: "2026-08-30T11:00:00Z" }),                     // new inbound  ✓
+        msg({ ts: "2026-08-30T12:00:00Z", from_me: true }),      // new outbound ✗
       ],
-      "2026-08-30 10:00:00",
+      "2026-08-30T10:00:00Z",
     );
     expect(threads[0]!.unread).toBe(1);
   });
 
   test("a message exactly at the watermark is not unread", () => {
-    const threads = buildThreads([msg({ ts: "2026-08-30 10:00:00" })], "2026-08-30 10:00:00");
+    const threads = buildThreads([msg({ ts: "2026-08-30T10:00:00Z" })], "2026-08-30T10:00:00Z");
     expect(threads[0]!.unread).toBe(0);
   });
 
@@ -138,17 +138,17 @@ describe("buildThreads", () => {
   });
 
   test("handles an empty window", () => {
-    expect(buildThreads([], "2026-01-01 00:00:00")).toEqual([]);
+    expect(buildThreads([], "2026-01-01T00:00:00Z")).toEqual([]);
   });
 
   test("a per-thread read mark clears only that thread", () => {
     const threads = buildThreads(
       [
-        msg({ chat: "A", handle: "A", ts: "2026-08-30 11:00:00" }),
-        msg({ chat: "B", handle: "B", ts: "2026-08-30 11:00:00" }),
+        msg({ chat: "A", handle: "A", ts: "2026-08-30T11:00:00Z" }),
+        msg({ chat: "B", handle: "B", ts: "2026-08-30T11:00:00Z" }),
       ],
-      "2026-08-30 10:00:00",
-      { A: "2026-08-30 11:00:00" },
+      "2026-08-30T10:00:00Z",
+      { A: "2026-08-30T11:00:00Z" },
     );
     const byChat = Object.fromEntries(threads.map((t) => [t.chat, t.unread]));
     expect(byChat).toEqual({ A: 0, B: 1 });
@@ -156,9 +156,9 @@ describe("buildThreads", () => {
 
   test("a stale per-thread mark never resurrects unread below the global mark", () => {
     const threads = buildThreads(
-      [msg({ chat: "A", handle: "A", ts: "2026-08-30 09:30:00" })],
-      "2026-08-30 10:00:00",
-      { A: "2026-08-30 09:00:00" },
+      [msg({ chat: "A", handle: "A", ts: "2026-08-30T09:30:00Z" })],
+      "2026-08-30T10:00:00Z",
+      { A: "2026-08-30T09:00:00Z" },
     );
     expect(threads[0]!.unread).toBe(0);
   });
@@ -181,6 +181,24 @@ describe("isGroupChat", () => {
   test("email = DM", () => expect(isGroupChat("someone@icloud.com")).toBe(false));
   test("chat<digits> = group (seen live)", () => expect(isGroupChat("chat640665907856941413")).toBe(true));
   test("an unknown shape is a group, never a DM target", () => expect(isGroupChat("weird-id")).toBe(true));
+  // A carrier short code is a SENDER, not a group. 5+ digits already worked
+  // (2.2.1); 3-4 digits fell through to "not a phone" and opened read-only
+  // with "group id unknown". E.164 caps a real number at 15 digits, so that
+  // is the upper bound -- and anything longer stays a group, which is the
+  // safe direction: an unknown shape must never become a DM target.
+  test("a 3-4 digit short code is a DM, not a group", () => {
+    expect(isGroupChat("2536")).toBe(false);     // T-Mobile, seen live
+    expect(isGroupChat("611")).toBe(false);      // carrier care
+    expect(isGroupChat("99123")).toBe(false);    // 5-digit, already worked
+  });
+  test("beyond E.164's 15 digits it is a group again, never a DM", () => {
+    expect(isGroupChat("1".repeat(15))).toBe(false);
+    expect(isGroupChat("1".repeat(16))).toBe(true);
+  });
+  test("a 1-2 digit id is still a group, never a DM target", () => {
+    expect(isGroupChat("1")).toBe(true);
+    expect(isGroupChat("42")).toBe(true);
+  });
   test("exit 255 (ssh failure via claude-on-mac shim) reads as offline", () => {
     const r = fetchMessages(10, (() => ({ status: 255, stdout: "", stderr: "ssh: connect" })) as never);
     expect(r.online).toBe(false);
@@ -199,10 +217,10 @@ describe("self-echo in the thread list", () => {
   test("a message Fred sends himself does not count as unread", () => {
     // Without this every panel send to the self-thread re-lit the dot.
     const msgs = dedupeSelfEcho([
-      msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30 11:00:00", from_me: true, text: "note" }),
-      msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30 11:00:00", from_me: false, text: "note" }),
+      msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30T11:00:00Z", from_me: true, text: "note" }),
+      msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30T11:00:00Z", from_me: false, text: "note" }),
     ], ["+15550100001"]);
-    const threads = buildThreads(msgs, "2026-08-30 10:00:00");
+    const threads = buildThreads(msgs, "2026-08-30T10:00:00Z");
     expect(threads[0]!.unread).toBe(0);
     expect(threads[0]!.last_from_me).toBe(true);
   });
@@ -239,16 +257,16 @@ describe("self-echo in the thread list", () => {
 
   test("the same text in two different chats at one ts is two messages", () => {
     const msgs = dedupeSelfEcho([
-      msg({ chat: "A", handle: "A", ts: "2026-08-30 11:00:00", text: "ok" }),
-      msg({ chat: "B", handle: "B", ts: "2026-08-30 11:00:00", text: "ok" }),
+      msg({ chat: "A", handle: "A", ts: "2026-08-30T11:00:00Z", text: "ok" }),
+      msg({ chat: "B", handle: "B", ts: "2026-08-30T11:00:00Z", text: "ok" }),
     ]);
     expect(msgs).toHaveLength(2);
   });
 
   test("an empty self row cannot reclassify another chat at the same second", () => {
     const msgs = dedupeSelfEcho([
-      msg({ chat: "SELF", handle: "SELF", from_me: true, text: "", ts: "2026-08-30 11:00:00" }),
-      msg({ chat: "OTHER", handle: "OTHER", from_me: false, text: "urgent", ts: "2026-08-30 11:00:00" }),
+      msg({ chat: "SELF", handle: "SELF", from_me: true, text: "", ts: "2026-08-30T11:00:00Z" }),
+      msg({ chat: "OTHER", handle: "OTHER", from_me: false, text: "urgent", ts: "2026-08-30T11:00:00Z" }),
     ], ["SELF"]);
     expect(msgs).toHaveLength(1);
     expect(msgs[0]!.chat).toBe("OTHER");
@@ -340,8 +358,8 @@ describe("selectToasts", () => {
 
   test("a null-chat toast carries the handle, never the string null", () => {
     const out = selectToasts(
-      [msg({ chat: null as unknown as string, handle: "+15550100002", ts: "2026-08-30 11:00:00" })],
-      "2026-08-30 10:00:00",
+      [msg({ chat: null as unknown as string, handle: "+15550100002", ts: "2026-08-30T11:00:00Z" })],
+      "2026-08-30T10:00:00Z",
       allow,
       [],
     );
@@ -350,8 +368,8 @@ describe("selectToasts", () => {
 
   test("toasts an allowlisted inbound message", () => {
     const out = selectToasts(
-      [msg({ chat: "+15550100002", handle: "+15550100002", name: "Alex Rivera", ts: "2026-08-30 11:00:00" })],
-      "2026-08-30 10:00:00",
+      [msg({ chat: "+15550100002", handle: "+15550100002", name: "Alex Rivera", ts: "2026-08-30T11:00:00Z" })],
+      "2026-08-30T10:00:00Z",
       allow,
       [],
     );
@@ -359,11 +377,64 @@ describe("selectToasts", () => {
     expect(out[0]!.name).toBe("Alex Rivera");
   });
 
+  // A toast for the conversation already open in front of you is noise, and
+  // the same run suppresses its badge -- so without this gate the two
+  // disagree: a notification fires saying there is something to read, and
+  // there is nothing to click through to.
+  test("does not toast the conversation being read", () => {
+    const out = selectToasts(
+      [msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30 11:00:00" })],
+      "2026-08-30 10:00:00",
+      allow,
+      [],
+      ["+15550100002"],
+    );
+    expect(out).toEqual([]);
+  });
+
+  test("still toasts every OTHER conversation while one is open", () => {
+    const out = selectToasts(
+      [
+        msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30 11:00:00" }),
+        msg({ chat: "+15550100003", handle: "+15550100003", ts: "2026-08-30 11:00:01" }),
+      ],
+      "2026-08-30 10:00:00",
+      [...allow, "+15550100003"],     // both allowlisted: gate 4 is what differs
+      [],
+      ["+15550100002"],
+    );
+    expect(out.map((t) => t.chat)).toEqual(["+15550100003"]);
+  });
+
+  // Reading the canonical row covers its aliases, exactly as the read marks
+  // do: a re-keyed group's retired chat row is the same conversation on screen.
+  test("an alias of the open conversation is not toasted either", () => {
+    const out = selectToasts(
+      [msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30 11:00:00" })],
+      "2026-08-30 10:00:00",
+      allow,
+      [],
+      ["chat640665907856941413", "+15550100002"],   // canonical + alias
+    );
+    expect(out).toEqual([]);
+  });
+
+  test("nothing open toasts as before", () => {
+    const out = selectToasts(
+      [msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30 11:00:00" })],
+      "2026-08-30 10:00:00",
+      allow,
+      [],
+      [],
+    );
+    expect(out).toHaveLength(1);
+  });
+
   test("drops senders that are not allowlisted", () => {
     // Bank alerts and 2FA codes are the reason this gate exists.
     const out = selectToasts(
-      [msg({ chat: "878478", handle: "878478", ts: "2026-08-30 11:00:00" })],
-      "2026-08-30 10:00:00",
+      [msg({ chat: "878478", handle: "878478", ts: "2026-08-30T11:00:00Z" })],
+      "2026-08-30T10:00:00Z",
       allow,
       [],
     );
@@ -372,8 +443,8 @@ describe("selectToasts", () => {
 
   test("never toasts outbound", () => {
     const out = selectToasts(
-      [msg({ chat: "+15550100002", handle: "+15550100002", from_me: true, ts: "2026-08-30 11:00:00" })],
-      "2026-08-30 10:00:00",
+      [msg({ chat: "+15550100002", handle: "+15550100002", from_me: true, ts: "2026-08-30T11:00:00Z" })],
+      "2026-08-30T10:00:00Z",
       allow,
       [],
     );
@@ -382,7 +453,7 @@ describe("selectToasts", () => {
 
   test("never toasts the backlog on first run", () => {
     const out = selectToasts(
-      [msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30 11:00:00" })],
+      [msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30T11:00:00Z" })],
       "",
       allow,
       [],
@@ -393,20 +464,20 @@ describe("selectToasts", () => {
   test("suppresses a message already toasted — the self-thread echo guard", () => {
     // In the self-thread, the user's sent replies come back as from_me=false.
     // Without this dedupe the loop would notify on its own output forever.
-    const m = msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30 11:00:00", text: "echo" });
-    const out = selectToasts([m], "2026-08-30 10:00:00", ["+15550100001"], [toastKey(m)]);
+    const m = msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30T11:00:00Z", text: "echo" });
+    const out = selectToasts([m], "2026-08-30T10:00:00Z", ["+15550100001"], [toastKey(m)]);
     expect(out).toEqual([]);
   });
 
   test("deduplicates identical messages within a single batch", () => {
-    const m = msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30 11:00:00" });
-    const out = selectToasts([m, { ...m }], "2026-08-30 10:00:00", allow, []);
+    const m = msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-08-30T11:00:00Z" });
+    const out = selectToasts([m, { ...m }], "2026-08-30T10:00:00Z", allow, []);
     expect(out).toHaveLength(1);
   });
 
   test("persisted toast keys are opaque and distinguish group senders", () => {
-    const a = msg({ chat: "group", handle: "ALICE", text: "yes", ts: "2026-08-30 11:00:00" });
-    const b = msg({ chat: "group", handle: "BOB", text: "yes", ts: "2026-08-30 11:00:00" });
+    const a = msg({ chat: "group", handle: "ALICE", text: "yes", ts: "2026-08-30T11:00:00Z" });
+    const b = msg({ chat: "group", handle: "BOB", text: "yes", ts: "2026-08-30T11:00:00Z" });
     expect(toastKey(a)).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(toastKey(a)).not.toContain("yes");
     expect(toastKey(a)).not.toBe(toastKey(b));
@@ -414,8 +485,8 @@ describe("selectToasts", () => {
 
   test("matches on handle when the chat id is an opaque GUID", () => {
     const out = selectToasts(
-      [msg({ chat: "053856bb0d9a40e392db59eace1c56d1", handle: "+15550100004", ts: "2026-08-30 11:00:00" })],
-      "2026-08-30 10:00:00",
+      [msg({ chat: "053856bb0d9a40e392db59eace1c56d1", handle: "+15550100004", ts: "2026-08-30T11:00:00Z" })],
+      "2026-08-30T10:00:00Z",
       ["+15550100004"],
       [],
     );
@@ -424,8 +495,8 @@ describe("selectToasts", () => {
 
   test("an empty allowlist toasts nothing", () => {
     const out = selectToasts(
-      [msg({ ts: "2026-08-30 11:00:00" })],
-      "2026-08-30 10:00:00",
+      [msg({ ts: "2026-08-30T11:00:00Z" })],
+      "2026-08-30T10:00:00Z",
       [],
       [],
     );
@@ -435,19 +506,19 @@ describe("selectToasts", () => {
 
 describe("maxTs", () => {
   test("returns the highest timestamp", () => {
-    expect(maxTs([msg({ ts: "2026-08-30 09:00:00" }), msg({ ts: "2026-08-30 11:00:00" })], "")).toBe(
-      "2026-08-30 11:00:00",
+    expect(maxTs([msg({ ts: "2026-08-30T09:00:00Z" }), msg({ ts: "2026-08-30T11:00:00Z" })], "")).toBe(
+      "2026-08-30T11:00:00Z",
     );
   });
 
   test("never moves the watermark backwards on a short window", () => {
-    expect(maxTs([msg({ ts: "2026-01-01 00:00:00" })], "2026-08-30 10:00:00")).toBe(
-      "2026-08-30 10:00:00",
+    expect(maxTs([msg({ ts: "2026-01-01T00:00:00Z" })], "2026-08-30T10:00:00Z")).toBe(
+      "2026-08-30T10:00:00Z",
     );
   });
 
   test("an empty fetch leaves the watermark untouched", () => {
-    expect(maxTs([], "2026-08-30 10:00:00")).toBe("2026-08-30 10:00:00");
+    expect(maxTs([], "2026-08-30T10:00:00Z")).toBe("2026-08-30T10:00:00Z");
   });
 });
 
@@ -456,19 +527,19 @@ describe("state and allowlist I/O", () => {
     const p = join(tmp(), "state.json");
     const opaque = `sha256:${"a".repeat(64)}`;
     expect(saveState({
-      watermark: "2026-08-30 10:00:00", readMark: "2026-08-30 09:00:00",
-      unreadCounts: { A: 2 }, unreadOldest: { A: "2026-08-30 09:01:00" },
+      watermark: "2026-08-30T10:00:00Z", readMark: "2026-08-30T09:00:00Z",
+      unreadCounts: { A: 2 }, unreadOldest: { A: "2026-08-30T09:01:00Z" },
       unreadInitialized: true, selfChats: ["SELF"],
-      readMarks: { A: "x" }, groups: {}, chatAliases: { OLD: "A" }, pins: { A: 0 }, toasted: [opaque],
+      readMarks: { A: "2026-08-30T09:30:00Z" }, groups: {}, chatAliases: { OLD: "A" }, pins: { A: 0 }, toasted: [opaque],
     }, p)).toBe(true);
     expect(loadState(p)).toEqual({
-      watermark: "2026-08-30 10:00:00",
-      readMark: "2026-08-30 09:00:00",
+      watermark: "2026-08-30T10:00:00Z",
+      readMark: "2026-08-30T09:00:00Z",
       unreadCounts: { A: 2 },
-      unreadOldest: { A: "2026-08-30 09:01:00" },
+      unreadOldest: { A: "2026-08-30T09:01:00Z" },
       unreadInitialized: true,
       selfChats: ["SELF"],
-      readMarks: { A: "x" },
+      readMarks: { A: "2026-08-30T09:30:00Z" },
       groups: {},
       chatAliases: { OLD: "A" },
       pins: { A: 0 },
@@ -525,20 +596,44 @@ describe("state and allowlist I/O", () => {
     // Migration guard: an old {watermark, toasted} file must report zero unread,
     // not a fabricated backlog, the first time the new collector reads it.
     const p = join(tmp(), "legacy.json");
-    writeFileSync(p, JSON.stringify({ watermark: "2026-08-30 10:00:00", toasted: [] }));
-    expect(loadState(p).readMark).toBe("2026-08-30 10:00:00");
+    writeFileSync(p, JSON.stringify({ watermark: "2026-08-30T10:00:00Z", toasted: [] }));
+    expect(loadState(p).readMark).toBe("2026-08-30T10:00:00Z");
     expect(loadState(p).readMarks).toEqual({});
   });
 
   test("a count-only ledger is reseeded so deletes can be reconciled", () => {
     const p = join(tmp(), "count-only.json");
     writeFileSync(p, JSON.stringify({
-      watermark: "2026-08-30 12:00:00",
-      readMark: "2026-08-30 10:00:00",
+      watermark: "2026-08-30T12:00:00Z",
+      readMark: "2026-08-30T10:00:00Z",
       unreadCounts: { A: 2 },
       unreadInitialized: true,
     }));
     expect(loadState(p).unreadInitialized).toBe(false);
+  });
+
+  // Both loaders swallow a parse error and return [], so a README example that
+  // does not parse is indistinguishable from having no file: everything still
+  // counts on the badge and nothing ever toasts, with no error anywhere. The
+  // examples were fenced ```jsonc with a `//` line above the object, which
+  // JSON.parse rejects -- copied as shown, they configured nothing.
+  test("the README's allowlist and mutelist examples load as written", () => {
+    const readme = readFileSync(new URL("./README.md", import.meta.url), "utf8");
+    const blocks = [...readme.matchAll(/```json\n([\s\S]*?)\n```/g)].map((m) => m[1]!);
+    expect(blocks.length).toBeGreaterThanOrEqual(2);
+
+    const allowBlock = blocks.find((b) => b.includes('"allow"'));
+    const muteBlock = blocks.find((b) => b.includes('"mute"'));
+    expect(allowBlock).toBeDefined();
+    expect(muteBlock).toBeDefined();
+
+    const a = join(tmp(), "readme-allow.json");
+    writeFileSync(a, allowBlock!);
+    expect(loadAllowlist(a).length).toBeGreaterThan(0);
+
+    const m = join(tmp(), "readme-mute.json");
+    writeFileSync(m, muteBlock!);
+    expect(loadMutelist(m).length).toBeGreaterThan(0);
   });
 
   test("reads a bare-array allowlist", () => {
@@ -624,10 +719,10 @@ describe("fetchMessages", () => {
 describe("adaptive unread catch-up", () => {
   test("expands until the previous watermark is inside the fetched window", () => {
     const all = [
-      msg({ ts: "2026-08-30 12:04:00" }),
-      msg({ ts: "2026-08-30 12:03:00" }),
-      msg({ ts: "2026-08-30 12:02:00" }),
-      msg({ ts: "2026-08-30 11:59:00" }),
+      msg({ ts: "2026-08-30T12:04:00Z" }),
+      msg({ ts: "2026-08-30T12:03:00Z" }),
+      msg({ ts: "2026-08-30T12:02:00Z" }),
+      msg({ ts: "2026-08-30T11:59:00Z" }),
     ];
     const limits: number[] = [];
     const fake = ((_cmd: string, args: string[]) => {
@@ -635,7 +730,7 @@ describe("adaptive unread catch-up", () => {
       limits.push(limit);
       return { status: 0, stdout: JSON.stringify(all.slice(0, limit)), stderr: "" };
     }) as never;
-    const result = fetchMessagesAfter("2026-08-30 12:00:00", 2, fake);
+    const result = fetchMessagesAfter("2026-08-30T12:00:00Z", 2, fake);
     expect(result.ok).toBe(true);
     expect(result.msgs).toHaveLength(4);
     expect(limits).toEqual([2, 4]);
@@ -646,10 +741,10 @@ describe("adaptive unread catch-up", () => {
     // neither chat nor handle and is dropped. Counting survivors read that as
     // "the bridge ran out" and stopped before the older unread.
     const all = [
-      msg({ ts: "2026-08-30 12:03:00", handle: "+15550000001" }),
-      msg({ ts: "2026-08-30 12:02:00", chat: null as unknown as string, handle: null as unknown as string }),
-      msg({ ts: "2026-08-30 12:01:00", handle: "+15550000002" }),
-      msg({ ts: "2026-08-30 11:59:00", handle: "+15550000003" }),
+      msg({ ts: "2026-08-30T12:03:00Z", handle: "+15550000001" }),
+      msg({ ts: "2026-08-30T12:02:00Z", chat: null as unknown as string, handle: null as unknown as string }),
+      msg({ ts: "2026-08-30T12:01:00Z", handle: "+15550000002" }),
+      msg({ ts: "2026-08-30T11:59:00Z", handle: "+15550000003" }),
     ];
     const limits: number[] = [];
     const fake = ((_cmd: string, args: string[]) => {
@@ -657,7 +752,7 @@ describe("adaptive unread catch-up", () => {
       limits.push(limit);
       return { status: 0, stdout: JSON.stringify(all.slice(0, limit)), stderr: "" };
     }) as never;
-    const r = fetchMessagesAfter("2026-08-30 12:00:00", 2, fake);
+    const r = fetchMessagesAfter("2026-08-30T12:00:00Z", 2, fake);
     expect(r.ok).toBe(true);
     expect(limits).toEqual([2, 4]);
     expect(r.fetchedCount).toBe(4);
@@ -669,10 +764,10 @@ describe("adaptive unread catch-up", () => {
     const fake = ((_cmd: string, args: string[]) => {
       const limit = Number(args[2]);
       limits.push(limit);
-      const rows = Array.from({ length: limit }, (_, i) => msg({ ts: "2026-08-30 12:01:00", handle: "H" + i }));
+      const rows = Array.from({ length: limit }, (_, i) => msg({ ts: "2026-08-30T12:01:00Z", handle: "H" + i }));
       return { status: 0, stdout: JSON.stringify(rows), stderr: "" };
     }) as never;
-    const r = fetchMessagesAfter("2026-08-30 12:00:00", 2, fake);
+    const r = fetchMessagesAfter("2026-08-30T12:00:00Z", 2, fake);
     expect(r.ok).toBe(true);
     expect(limits[limits.length - 1]).toBeLessThanOrEqual(CATCHUP_MAX_ROWS);
     expect(limits.length).toBeLessThan(20);
@@ -680,9 +775,9 @@ describe("adaptive unread catch-up", () => {
 
   test("expands past an equal timestamp boundary", () => {
     const all = [
-      msg({ ts: "2026-08-30 12:01:00", handle: "A" }),
-      msg({ ts: "2026-08-30 12:00:00", handle: "B" }),
-      msg({ ts: "2026-08-30 12:00:00", handle: "C" }),
+      msg({ ts: "2026-08-30T12:01:00Z", handle: "A" }),
+      msg({ ts: "2026-08-30T12:00:00Z", handle: "B" }),
+      msg({ ts: "2026-08-30T12:00:00Z", handle: "C" }),
     ];
     const limits: number[] = [];
     const fake = ((_cmd: string, args: string[]) => {
@@ -690,30 +785,30 @@ describe("adaptive unread catch-up", () => {
       limits.push(limit);
       return { status: 0, stdout: JSON.stringify(all.slice(0, limit)), stderr: "" };
     }) as never;
-    expect(fetchMessagesAfter("2026-08-30 12:00:00", 2, fake).msgs).toHaveLength(3);
+    expect(fetchMessagesAfter("2026-08-30T12:00:00Z", 2, fake).msgs).toHaveLength(3);
     expect(limits).toEqual([2, 4]);
   });
 
   test("the unread ledger records counts and its reconciliation boundary", () => {
     const rows = [
-      msg({ chat: "A", ts: "2026-08-30 11:00:00" }),
-      msg({ chat: "A", ts: "2026-08-30 10:30:00" }),
-      msg({ chat: "A", ts: "2026-08-30 11:01:00", from_me: true }),
+      msg({ chat: "A", ts: "2026-08-30T11:00:00Z" }),
+      msg({ chat: "A", ts: "2026-08-30T10:30:00Z" }),
+      msg({ chat: "A", ts: "2026-08-30T11:01:00Z", from_me: true }),
     ];
-    expect(unreadCounts(rows, "2026-08-30 10:00:00", {})).toEqual({ A: 2 });
-    expect(unreadOldest(rows, "2026-08-30 10:00:00", {})).toEqual({ A: "2026-08-30 10:30:00" });
+    expect(unreadCounts(rows, "2026-08-30T10:00:00Z", {})).toEqual({ A: 2 });
+    expect(unreadOldest(rows, "2026-08-30T10:00:00Z", {})).toEqual({ A: "2026-08-30T10:30:00Z" });
   });
 
   test("rebuilding the covered unread range removes deleted rows", () => {
-    const rowsAfterDelete = [msg({ chat: "A", ts: "2026-08-30 11:00:00" })];
-    expect(unreadCounts(rowsAfterDelete, "2026-08-30 10:00:00", {})).toEqual({ A: 1 });
-    expect(unreadOldest(rowsAfterDelete, "2026-08-30 10:00:00", {})).toEqual({ A: "2026-08-30 11:00:00" });
+    const rowsAfterDelete = [msg({ chat: "A", ts: "2026-08-30T11:00:00Z" })];
+    expect(unreadCounts(rowsAfterDelete, "2026-08-30T10:00:00Z", {})).toEqual({ A: 1 });
+    expect(unreadOldest(rowsAfterDelete, "2026-08-30T10:00:00Z", {})).toEqual({ A: "2026-08-30T11:00:00Z" });
   });
 
   test("exact ledger counts override the bounded thread window", () => {
     const threads = buildThreads(
-      [msg({ chat: "A", ts: "2026-08-30 11:00:00" })],
-      "2026-08-30 10:00:00", {}, {}, { A: 151 },
+      [msg({ chat: "A", ts: "2026-08-30T11:00:00Z" })],
+      "2026-08-30T10:00:00Z", {}, {}, { A: 151 },
     );
     expect(threads[0]!.unread).toBe(151);
   });
@@ -722,8 +817,8 @@ describe("adaptive unread catch-up", () => {
 describe("readMarks pruning", () => {
   test("a per-thread mark at or below the global mark is dropped from state", () => {
     // collect() prunes; emulate its rule directly.
-    const readMarks: Record<string, string> = { A: "2026-08-30 09:00:00", B: "2026-08-30 12:00:00" };
-    const readMark = "2026-08-30 10:00:00";
+    const readMarks: Record<string, string> = { A: "2026-08-30T09:00:00Z", B: "2026-08-30T12:00:00Z" };
+    const readMark = "2026-08-30T10:00:00Z";
     for (const [chat, ts] of Object.entries(readMarks)) if (ts <= readMark) delete readMarks[chat];
     expect(Object.keys(readMarks)).toEqual(["B"]);
   });
@@ -733,8 +828,8 @@ describe("text-bearing self twins", () => {
   test("a same-chat same-handle same-second text pair marks the self chat", () => {
     // imsg decodes attributedBody: the outbound twin is rarely empty.
     const msgs = [
-      msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30 21:45:00", from_me: true, text: "note" }),
-      msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30 21:45:00", from_me: false, text: "note" }),
+      msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30T21:45:00Z", from_me: true, text: "note" }),
+      msg({ chat: "+15550100001", handle: "+15550100001", ts: "2026-08-30T21:45:00Z", from_me: false, text: "note" }),
     ];
     expect(detectSelfChats(msgs)).toEqual(["+15550100001"]);
     const out = dedupeSelfEcho(msgs);
@@ -744,8 +839,8 @@ describe("text-bearing self twins", () => {
 
   test("two different senders with the same text in one second stay distinct", () => {
     const msgs = [
-      msg({ chat: "g", handle: "+15550100004", ts: "2026-08-30 21:45:00", from_me: false, text: "lol" }),
-      msg({ chat: "g", handle: "+15550100005", ts: "2026-08-30 21:45:00", from_me: false, text: "lol" }),
+      msg({ chat: "g", handle: "+15550100004", ts: "2026-08-30T21:45:00Z", from_me: false, text: "lol" }),
+      msg({ chat: "g", handle: "+15550100005", ts: "2026-08-30T21:45:00Z", from_me: false, text: "lol" }),
     ];
     expect(detectSelfChats(msgs)).toEqual([]);
     expect(dedupeSelfEcho(msgs)).toHaveLength(2);
@@ -767,25 +862,25 @@ describe("fetchGroups", () => {
 
 describe("phone-synced read state (imsg ≥1.9.0 `read`)", () => {
   const m = (over: Record<string, unknown>) => ({
-    ts: "2026-08-31 12:00:00", from_me: false, handle: "+15551234567",
+    ts: "2026-08-31T12:00:00Z", from_me: false, handle: "+15551234567",
     name: null, service: "iMessage", chat: "+15551234567", text: "x", ...over,
   }) as never;
 
   test("a message read on the PHONE stops counting even past the local mark", () => {
     const counts = unreadCounts(
-      [m({ read: true }), m({ ts: "2026-08-31 12:01:00", read: false })],
-      "2026-08-31 00:00:00", {},
+      [m({ read: true }), m({ ts: "2026-08-31T12:01:00Z", read: false })],
+      "2026-08-31T00:00:00Z", {},
     );
     expect(counts["+15551234567"]).toBe(1);
   });
 
   test("rows without the read field fall back to local-only semantics", () => {
-    const counts = unreadCounts([m({})], "2026-08-31 00:00:00", {});
+    const counts = unreadCounts([m({})], "2026-08-31T00:00:00Z", {});
     expect(counts["+15551234567"]).toBe(1);
   });
 
   test("locally-read messages stay read regardless of Apple state", () => {
-    const counts = unreadCounts([m({ read: false })], "2026-08-31 23:00:00", {});
+    const counts = unreadCounts([m({ read: false })], "2026-08-31T23:00:00Z", {});
     expect(counts["+15551234567"]).toBeUndefined();
   });
 });
@@ -793,27 +888,27 @@ describe("phone-synced read state (imsg ≥1.9.0 `read`)", () => {
 describe("future-dated messages must not poison read marks", () => {
   test("mark-all clamps the global mark to now; the future chat gets a per-chat mark", () => {
     // Simulated via collect()'s pieces: verify the clamp math directly.
-    const { localNowTs } = require("./collector") as typeof import("./collector");
-    const now = localNowTs();
-    const future = "2099-01-01 00:00:00";
+    const { nowTs } = require("./collector") as typeof import("./collector");
+    const now = nowTs();
+    const future = "2099-01-01T00:00:00Z";
     expect(future > now).toBe(true);
     const readMark = future <= now ? future : now;
     expect(readMark).toBe(now);   // global mark never exceeds the clock
   });
 
   test("a chat read now stays readable for messages arriving later today", () => {
-    const { isUnread, localNowTs } = require("./collector") as typeof import("./collector");
-    const mark = localNowTs(new Date(Date.now() - 60000)); // read a minute ago
-    const arriving = { ts: localNowTs(), from_me: false, read: false } as never;
+    const { isUnread, nowTs } = require("./collector") as typeof import("./collector");
+    const mark = nowTs(new Date(Date.now() - 60000)); // read a minute ago
+    const arriving = { ts: nowTs(), from_me: false, read: false } as never;
     expect(isUnread(arriving, mark)).toBe(true);  // new arrival still badges
   });
 });
 
 describe("failed-delivery detection", () => {
   const { selectFailures } = require("./collector") as typeof import("./collector");
-  const now = "2026-08-31 20:30:00";
+  const now = "2026-08-31T20:30:00Z";
   const mine = (over: Record<string, unknown>) => ({
-    ts: "2026-08-31 20:25:00", from_me: true, handle: "+15551234567", name: "Pat",
+    ts: "2026-08-31T20:25:00Z", from_me: true, handle: "+15551234567", name: "Pat",
     service: "iMessage", chat: "+15551234567", text: "photo", ...over,
   }) as never;
 
@@ -828,7 +923,7 @@ describe("failed-delivery detection", () => {
   test("error 0, inbound rows, and old failures are ignored", () => {
     expect(selectFailures([mine({ error: 0 })], [], now).length).toBe(0);
     expect(selectFailures([mine({ error: 25, from_me: false })], [], now).length).toBe(0);
-    expect(selectFailures([mine({ error: 25, ts: "2026-08-31 19:00:00" })], [], now).length).toBe(0);
+    expect(selectFailures([mine({ error: 25, ts: "2026-08-31T19:00:00Z" })], [], now).length).toBe(0);
   });
 
   test("dedupes through the toasted ring — interrupts exactly once", () => {
@@ -840,7 +935,7 @@ describe("failed-delivery detection", () => {
 
 describe("a link that just arrived opens the share sheet", () => {
   const { firstUrl, selectIncomingLinks } = require("./collector") as typeof import("./collector");
-  const WM = "2026-09-02 12:00:00";
+  const WM = "2026-09-02T12:00:00Z";
 
   test("firstUrl finds one http(s) url and drops sentence punctuation", () => {
     expect(firstUrl("see https://gpc.sc/occ/pay to view bill.")).toBe("https://gpc.sc/occ/pay");
@@ -853,11 +948,11 @@ describe("a link that just arrived opens the share sheet", () => {
 
   test("only NEW inbound links, newest last, one key each", () => {
     const out = selectIncomingLinks([
-      msg({ ts: "2026-09-02 12:30:00", from_me: false, text: "read https://a.test/1" }),
-      msg({ ts: "2026-09-02 11:00:00", from_me: false, text: "old https://b.test/2" }),   // before watermark
-      msg({ ts: "2026-09-02 12:40:00", from_me: true, text: "mine https://c.test/3" }),   // outbound
-      msg({ ts: "2026-09-02 12:50:00", from_me: false, text: "no url" }),
-      msg({ ts: "2026-09-02 12:55:00", from_me: false, text: "later https://d.test/4" }),
+      msg({ ts: "2026-09-02T12:30:00Z", from_me: false, text: "read https://a.test/1" }),
+      msg({ ts: "2026-09-02T11:00:00Z", from_me: false, text: "old https://b.test/2" }),   // before watermark
+      msg({ ts: "2026-09-02T12:40:00Z", from_me: true, text: "mine https://c.test/3" }),   // outbound
+      msg({ ts: "2026-09-02T12:50:00Z", from_me: false, text: "no url" }),
+      msg({ ts: "2026-09-02T12:55:00Z", from_me: false, text: "later https://d.test/4" }),
     ], WM, []);
     expect(out.map((l) => l.url)).toEqual(["https://a.test/1", "https://d.test/4"]);
     expect(out[out.length - 1]!.url).toBe("https://d.test/4");   // the caller shows the newest
@@ -866,21 +961,21 @@ describe("a link that just arrived opens the share sheet", () => {
 
   test("every link of a message rides along; url stays the first", () => {
     const out = selectIncomingLinks([
-      msg({ ts: "2026-09-02 12:30:00", from_me: false, text: "two: https://a.test/1, and https://b.test/2." }),
+      msg({ ts: "2026-09-02T12:30:00Z", from_me: false, text: "two: https://a.test/1, and https://b.test/2." }),
     ], WM, []);
     expect(out[0]!.url).toBe("https://a.test/1");
     expect(out[0]!.urls).toEqual(["https://a.test/1", "https://b.test/2"]);
   });
 
   test("a link fires once — its key suppresses the next poll", () => {
-    const m = msg({ ts: "2026-09-02 12:30:00", from_me: false, text: "https://a.test/1" });
+    const m = msg({ ts: "2026-09-02T12:30:00Z", from_me: false, text: "https://a.test/1" });
     const first = selectIncomingLinks([m], WM, []);
     expect(first.length).toBe(1);
     expect(selectIncomingLinks([m], WM, [first[0]!.key])).toEqual([]);
   });
 
   test("never the backlog on first run, never the self-thread", () => {
-    const m = msg({ ts: "2026-09-02 12:30:00", from_me: false, text: "https://a.test/1" });
+    const m = msg({ ts: "2026-09-02T12:30:00Z", from_me: false, text: "https://a.test/1" });
     expect(selectIncomingLinks([m], "", [])).toEqual([]);
     expect(selectIncomingLinks([m], WM, [], [String(m.chat || m.handle)])).toEqual([]);
   });
@@ -890,7 +985,7 @@ describe("a re-keyed group is ONE conversation", () => {
   const { aliasesFromChats, foldThreadAliases, foldChatRecord } =
     require("./collector") as typeof import("./collector");
   const chat = (id: string, aliases: string[] = []) => ({
-    id, name: "Sportsball!", service: "iMessage", messages: 3, last: "2026-08-09 21:50:59",
+    id, name: "Sportsball!", service: "iMessage", messages: 3, last: "2026-08-09T21:50:59Z",
     last_text: "", last_from_me: false, last_handle: "", last_name: null,
     pinned: false, pin_order: null, aliases,
   });
@@ -909,24 +1004,24 @@ describe("a re-keyed group is ONE conversation", () => {
 
   test("two rows of one group become a single thread, counts summed", () => {
     const out = foldThreadAliases(
-      [thread("chat6703", "2026-02-26 22:26:56", 5263, 1), thread("chat2244", "2026-08-09 21:50:59", 3477, 2)],
+      [thread("chat6703", "2026-02-26T22:26:56Z", 5263, 1), thread("chat2244", "2026-08-09T21:50:59Z", 3477, 2)],
       { chat6703: "chat2244" },
     );
     expect(out.length).toBe(1);
     expect(out[0]!.chat).toBe("chat2244");
-    expect(out[0]!.last_ts).toBe("2026-08-09 21:50:59");   // the LIVE row's preview
+    expect(out[0]!.last_ts).toBe("2026-08-09T21:50:59Z");   // the LIVE row's preview
     expect(out[0]!.count).toBe(5263 + 3477);
     expect(out[0]!.unread).toBe(3);
   });
 
   test("the older row alone still shows, under the live id", () => {
-    const out = foldThreadAliases([thread("chat6703", "2026-02-26 22:26:56", 5, 0)], { chat6703: "chat2244" });
+    const out = foldThreadAliases([thread("chat6703", "2026-02-26T22:26:56Z", 5, 0)], { chat6703: "chat2244" });
     expect(out.length).toBe(1);
     expect(out[0]!.chat).toBe("chat2244");
   });
 
   test("no aliases is a no-op (same array back)", () => {
-    const t = [thread("chat2244", "2026-08-09 21:50:59", 1, 0)];
+    const t = [thread("chat2244", "2026-08-09T21:50:59Z", 1, 0)];
     expect(foldThreadAliases(t, {})).toBe(t);
   });
 
@@ -934,10 +1029,10 @@ describe("a re-keyed group is ONE conversation", () => {
     expect(foldChatRecord({ chat6703: 1, chat2244: 2, "+1555": 4 }, { chat6703: "chat2244" }, (a, b) => a + b))
       .toEqual({ chat2244: 3, "+1555": 4 });
     expect(foldChatRecord(
-      { chat6703: "2026-02-26 22:26:56", chat2244: "2026-08-09 21:50:59" },
+      { chat6703: "2026-02-26T22:26:56Z", chat2244: "2026-08-09T21:50:59Z" },
       { chat6703: "chat2244" },
       (a, b) => (a < b ? a : b),
-    )).toEqual({ chat2244: "2026-02-26 22:26:56" });
+    )).toEqual({ chat2244: "2026-02-26T22:26:56Z" });
   });
 
   test("a merged DM (phone + email) folds onto the live handle", () => {
@@ -945,13 +1040,13 @@ describe("a re-keyed group is ONE conversation", () => {
     const email = "pat@example.com";
     const out = foldThreadAliases(
       [
-        thread(phone, "2026-09-04 21:32:29", 40, 0),
-        thread(email, "2026-09-05 17:24:01", 12, 1),
+        thread(phone, "2026-09-04T21:32:29Z", 40, 0),
+        thread(email, "2026-09-05T17:24:01Z", 12, 1),
       ],
       { [phone]: email },
     );
     expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ chat: email, last_ts: "2026-09-05 17:24:01", unread: 1 });
+    expect(out[0]).toMatchObject({ chat: email, last_ts: "2026-09-05T17:24:01Z", unread: 1 });
   });
 });
 
@@ -959,17 +1054,17 @@ describe("complete conversation list (mergeChats)", () => {
   const { mergeChats } = require("./collector") as typeof import("./collector");
   const windowThread = {
     chat: "+15551234567", guid: "", name: "Pat", handle: "+15551234567", service: "iMessage",
-    last_ts: "2026-08-31 20:00:00", last_text: "hi", last_from_me: false, count: 3, unread: 1,
+    last_ts: "2026-08-31T20:00:00Z", last_text: "hi", last_from_me: false, count: 3, unread: 1,
     pinned: false, pin_order: null,
   };
   const chats = [
-    { id: "+15551234567", name: null, service: "iMessage", last: "2026-08-31 20:00:00",
+    { id: "+15551234567", name: null, service: "iMessage", last: "2026-08-31T20:00:00Z",
       last_text: "hi", last_from_me: false, last_handle: "+15551234567", last_name: "Pat",
       pinned: false, pin_order: null, aliases: ["+15551234567"], pin_name: null },
-    { id: "ce5a593a78af408282d61461ade89135", name: "Lunch Crew", service: "iMessage", last: "2026-08-31 19:00:00",
+    { id: "ce5a593a78af408282d61461ade89135", name: "Lunch Crew", service: "iMessage", last: "2026-08-31T19:00:00Z",
       last_text: "Nice", last_from_me: false, last_handle: "+15550001111", last_name: "Sam",
       pinned: false, pin_order: null, aliases: ["ce5a593a78af408282d61461ade89135"], pin_name: null },
-    { id: "+15559990000", name: null, service: "SMS", last: "2026-08-20 09:00:00",
+    { id: "+15559990000", name: null, service: "SMS", last: "2026-08-20T09:00:00Z",
       last_text: "old news", last_from_me: true, last_handle: "+15559990000", last_name: "Quiet Q",
       pinned: false, pin_order: null, aliases: ["+15559990000"], pin_name: null },
   ];
@@ -1053,8 +1148,8 @@ describe("complete conversation list (mergeChats)", () => {
   test("mirrored pins sort first in Messages pin order, ahead of activity", () => {
     const out = mergeChats(
       [
-        { ...windowThread, last_ts: "2026-08-31 22:00:00" },
-        { ...windowThread, chat: "+15557770000", last_ts: "2026-08-31 21:00:00", pinned: false, pin_order: null },
+        { ...windowThread, last_ts: "2026-08-31T22:00:00Z" },
+        { ...windowThread, chat: "+15557770000", last_ts: "2026-08-31T21:00:00Z", pinned: false, pin_order: null },
       ],
       [
         { ...chats[0]!, pinned: false, pin_order: null },
@@ -1079,12 +1174,12 @@ describe("pinned conversation metadata", () => {
       status: 0,
       stdout: JSON.stringify([
         {
-          id: "+15551234567", name: "Pat", service: "iMessage", last: "2026-08-31 20:00:00",
+          id: "+15551234567", name: "Pat", service: "iMessage", last: "2026-08-31T20:00:00Z",
           last_text: "hi", last_from_me: false, last_handle: "+15551234567", last_name: "Pat",
           pinned: true, pin_order: 0,
         },
         {
-          id: "+15550001111", name: null, service: "SMS", last: "2026-08-31 19:00:00",
+          id: "+15550001111", name: null, service: "SMS", last: "2026-08-31T19:00:00Z",
           last_text: "old", last_from_me: true, last_handle: "+15550001111", last_name: null,
         },
       ]),
@@ -1155,17 +1250,17 @@ describe("explainBridgeError — a dim icon is not a diagnosis", () => {
 
 describe("toast identity is stable across polls (2.1.6)", () => {
   test("the same message with its text decoded on the second poll toasts once", () => {
-    const first = { ts: "2026-09-01 20:00:05", from_me: false, handle: "+15550001111", name: "T", service: "iMessage", chat: "+15550001111", text: "" } as ImsgMessage;
+    const first = { ts: "2026-09-01T20:00:05Z", from_me: false, handle: "+15550001111", name: "T", service: "iMessage", chat: "+15550001111", text: "" } as ImsgMessage;
     const second = { ...first, text: "Ok, I will be there" };
     const allow = ["+15550001111"];
-    const t1 = selectToasts([first], "2026-09-01 20:00:00", allow, []);
+    const t1 = selectToasts([first], "2026-09-01T20:00:00Z", allow, []);
     expect(t1).toHaveLength(1);
-    const t2 = selectToasts([second], "2026-09-01 20:00:00", allow, [t1[0]!.key]);
+    const t2 = selectToasts([second], "2026-09-01T20:00:00Z", allow, [t1[0]!.key]);
     expect(t2).toHaveLength(0);
   });
   test("a bridge ROWID wins over the ts/chat/handle fallback", () => {
-    const a = { id: 42, ts: "2026-09-01 20:00:05", from_me: false, handle: "h", name: null, service: "iMessage", chat: "h", text: "x" } as ImsgMessage;
-    const b = { ...a, ts: "2026-09-01 20:00:09", text: "y" };
+    const a = { id: 42, ts: "2026-09-01T20:00:05Z", from_me: false, handle: "h", name: null, service: "iMessage", chat: "h", text: "x" } as ImsgMessage;
+    const b = { ...a, ts: "2026-09-01T20:00:09Z", text: "y" };
     expect(toastKey(a)).toBe(toastKey(b));
   });
 });
@@ -1174,13 +1269,13 @@ describe("self-chat promotion is not persisted on one coincidence (2.2.0)", () =
   const dm = (ts: string, from_me: boolean, text: string) =>
     ({ ts, from_me, handle: "+15550002222", name: "B", service: "iMessage", chat: "+15550002222", text } as ImsgMessage);
   test("a single same-second 'ok' pair dedupes for display but does not promote for persistence", () => {
-    const pair = [dm("2026-09-01 20:00:05", true, "ok"), dm("2026-09-01 20:00:05", false, "ok")];
+    const pair = [dm("2026-09-01T20:00:05Z", true, "ok"), dm("2026-09-01T20:00:05Z", false, "ok")];
     expect(detectSelfChats(pair)).toEqual(["+15550002222"]);      // display-time dedupe still works
     expect(detectSelfChats(pair, 2)).toEqual([]);                  // persistence needs a second twin
   });
   test("two twins at different seconds do promote", () => {
-    const rows = [dm("2026-09-01 20:00:05", true, "a"), dm("2026-09-01 20:00:05", false, "a"),
-                  dm("2026-09-01 20:00:09", true, "b"), dm("2026-09-01 20:00:09", false, "b")];
+    const rows = [dm("2026-09-01T20:00:05Z", true, "a"), dm("2026-09-01T20:00:05Z", false, "a"),
+                  dm("2026-09-01T20:00:09Z", true, "b"), dm("2026-09-01T20:00:09Z", false, "b")];
     expect(detectSelfChats(rows, 2)).toEqual(["+15550002222"]);
   });
 });
@@ -1188,12 +1283,12 @@ describe("self-chat promotion is not persisted on one coincidence (2.2.0)", () =
 describe("failure-toast keys survive the ring normalizer (2.2.0)", () => {
   const { selectFailures } = require("./collector") as typeof import("./collector");
   test("a fail: key is kept verbatim on load, so a failed send toasts once", () => {
-    const m = { id: 9, ts: "2026-09-01 20:00:05", from_me: true, handle: "h", name: "H", service: "iMessage", chat: "h", text: "x", error: 25 } as ImsgMessage;
-    const first = selectFailures([m], [], "2026-09-01 20:05:00");
+    const m = { id: 9, ts: "2026-09-01T20:00:05Z", from_me: true, handle: "h", name: "H", service: "iMessage", chat: "h", text: "x", error: 25 } as ImsgMessage;
+    const first = selectFailures([m], [], "2026-09-01T20:05:00Z");
     expect(first).toHaveLength(1);
     const tmp = `${process.env.XDG_CACHE_HOME}/state-${process.pid}.json`;
     saveState({ ...loadState(tmp), toasted: [first[0]!.key] }, tmp);
-    const again = selectFailures([m], loadState(tmp).toasted, "2026-09-01 20:05:00");
+    const again = selectFailures([m], loadState(tmp).toasted, "2026-09-01T20:05:00Z");
     expect(again).toHaveLength(0);
   });
 });
@@ -1244,7 +1339,7 @@ describe("which service a DM sends on (@lukejmorrison, PR #4)", () => {
   const { normalizeSendService, sendServiceForMessages } =
     require("./collector") as typeof import("./collector");
   const at = (min: number, over: Partial<ImsgMessage> = {}) =>
-    msg({ ts: `2026-09-03 1${String(min).padStart(2, "0")}:00:00`, ...over });
+    msg({ ts: `2026-09-03T1${String(min).padStart(2, "0")}:00:00Z`, ...over });
 
   test("normalizes what chat.db says into what imsg-send accepts", () => {
     expect(normalizeSendService("SMS")).toBe("SMS");
@@ -1291,8 +1386,8 @@ describe("which service a DM sends on (@lukejmorrison, PR #4)", () => {
   test("a group keeps the raw service — it sends by chat-id, not by service", () => {
     const threads = buildThreads([
       msg({ chat: "chat900001", handle: "+15550100011", from_me: false, service: "RCS",
-            ts: "2026-09-03 10:00:00" }),
-    ], "2026-09-03 09:00:00");
+            ts: "2026-09-03T10:00:00Z" }),
+    ], "2026-09-03T09:00:00Z");
     expect(threads[0]!.service).toBe("RCS");
   });
 });
@@ -1303,7 +1398,7 @@ describe("pins survive shallow polls", () => {
     last_from_me: false, count: 1, unread: 0, pinned: false, pin_order: null, ...extra,
   });
   const chat = (id: string, pinned: boolean, pin_order: number | null): ChatInfo => ({
-    id, name: id, service: "iMessage", last: "2026-09-03 10:00:00", last_text: "", last_from_me: false,
+    id, name: id, service: "iMessage", last: "2026-09-03T10:00:00Z", last_text: "", last_from_me: false,
     last_handle: id, last_name: null, pinned, pin_order, aliases: [],
   });
 
@@ -1313,7 +1408,7 @@ describe("pins survive shallow polls", () => {
   });
 
   test("applyPins re-pins a shallow poll's rows and sorts them first", () => {
-    const shallow = [thread("NEW", "2026-09-03 12:00:00"), thread("MOM", "2026-09-03 11:00:00"), thread("OLD", "2026-09-03 10:00:00")];
+    const shallow = [thread("NEW", "2026-09-03T12:00:00Z"), thread("MOM", "2026-09-03T11:00:00Z"), thread("OLD", "2026-09-03T10:00:00Z")];
     const out = applyPins(shallow, { MOM: 0, QUIET: 1 });
     expect(out.map((t) => t.chat)).toEqual(["MOM", "NEW", "OLD"]);
     expect(out[0]).toMatchObject({ pinned: true, pin_order: 0 });
@@ -1323,12 +1418,12 @@ describe("pins survive shallow polls", () => {
   });
 
   test("applyPins un-pins a row whose pin was removed on the Mac", () => {
-    const stale = [thread("X", "2026-09-03 12:00:00", { pinned: true, pin_order: 0 }), thread("Y", "2026-09-03 13:00:00")];
+    const stale = [thread("X", "2026-09-03T12:00:00Z", { pinned: true, pin_order: 0 }), thread("Y", "2026-09-03T13:00:00Z")];
     expect(applyPins(stale, {}).map((t) => [t.chat, t.pinned])).toEqual([["Y", false], ["X", false]]);
   });
 
   test("applyPins with nothing pinned anywhere is a no-op", () => {
-    const list = [thread("A", "2026-09-03 12:00:00")];
+    const list = [thread("A", "2026-09-03T12:00:00Z")];
     expect(applyPins(list, {})).toBe(list);
   });
 
@@ -1401,8 +1496,8 @@ describe("mute list", () => {
 
   test("one match mutes the whole conversation, not just that message", () => {
     const window = [
-      blast({ ts: "2026-08-30 09:00:00" }),
-      blast({ ts: "2026-08-30 10:00:00", text: "Are you still with us?" }),
+      blast({ ts: "2026-08-30T09:00:00Z" }),
+      blast({ ts: "2026-08-30T10:00:00Z", text: "Are you still with us?" }),
       msg({ chat: "+15550100002", handle: "+15550100002", text: "lunch?" }),
     ];
     const muted = mutedChats(window, ["Stop2End"]);
@@ -1414,7 +1509,7 @@ describe("mute list", () => {
 
   test("the chat list drops muted rows too, by id, alias, or preview text", () => {
     const row = (id: string, last_text: string, aliases: string[] = []): ChatInfo => ({
-      id, name: id, service: "SMS", last: "2026-08-30 10:00:00", last_text,
+      id, name: id, service: "SMS", last: "2026-08-30T10:00:00Z", last_text,
       last_from_me: false, last_handle: id, last_name: null, pinned: false, pin_order: null, aliases,
     });
     const chats = [
@@ -1428,7 +1523,7 @@ describe("mute list", () => {
 
   test("your own reply keeps a chat row alive", () => {
     const row: ChatInfo = {
-      id: "+15550100002", name: "Alex Rivera", service: "iMessage", last: "2026-08-30 10:00:00",
+      id: "+15550100002", name: "Alex Rivera", service: "iMessage", last: "2026-08-30T10:00:00Z",
       last_text: "ugh, ActBlue again", last_from_me: true, last_handle: "+15550100002",
       last_name: null, pinned: false, pin_order: null, aliases: [],
     };
@@ -1440,9 +1535,9 @@ describe("mute list", () => {
   });
 
   test("a muted conversation never toasts, because it never reaches selectToasts", () => {
-    const window = [blast({ ts: "2026-08-30 11:00:00" })];
+    const window = [blast({ ts: "2026-08-30T11:00:00Z" })];
     const kept = dropMuted(window, mutedChats(window, ["ActBlue"]));
-    expect(selectToasts(kept, "2026-08-30 10:00:00", ["78462"], [])).toEqual([]);
+    expect(selectToasts(kept, "2026-08-30T10:00:00Z", ["78462"], [])).toEqual([]);
   });
 });
 
@@ -1534,7 +1629,7 @@ describe("pushRead breadcrumb", () => {
 
 describe("security codes: detect, hold once, never from a group", () => {
   const { extractCode, selectCodes } = require("./collector") as typeof import("./collector");
-  const WM = "2026-09-02 12:00:00";
+  const WM = "2026-09-02T12:00:00Z";
   const code = (text: string) => extractCode(text)?.code ?? null;
 
   test("the usual shapes", () => {
@@ -1576,13 +1671,13 @@ describe("security codes: detect, hold once, never from a group", () => {
   });
 
   test("selectCodes: inbound, new, DM only, once", () => {
-    const m = msg({ ts: "2026-09-02 12:30:00", from_me: false, chat: "77029", handle: "77029", name: null, text: "Your code is 483920" });
+    const m = msg({ ts: "2026-09-02T12:30:00Z", from_me: false, chat: "77029", handle: "77029", name: null, text: "Your code is 483920" });
     const out = selectCodes([
       m,
-      msg({ ts: "2026-09-02 11:00:00", from_me: false, text: "old code 111111" }),                 // before watermark
-      msg({ ts: "2026-09-02 12:40:00", from_me: true, text: "my code is 222222" }),                 // outbound
-      msg({ ts: "2026-09-02 12:45:00", from_me: false, chat: "e98633ecd4e84723b69d142cd721b2b9", text: "code 333333" }), // group
-      msg({ ts: "2026-09-02 12:50:00", from_me: false, chat: "+15550001111", handle: "+15550001111", name: "Eli", text: "Enter passcode 444444" }),
+      msg({ ts: "2026-09-02T11:00:00Z", from_me: false, text: "old code 111111" }),                 // before watermark
+      msg({ ts: "2026-09-02T12:40:00Z", from_me: true, text: "my code is 222222" }),                 // outbound
+      msg({ ts: "2026-09-02T12:45:00Z", from_me: false, chat: "e98633ecd4e84723b69d142cd721b2b9", text: "code 333333" }), // group
+      msg({ ts: "2026-09-02T12:50:00Z", from_me: false, chat: "+15550001111", handle: "+15550001111", name: "Eli", text: "Enter passcode 444444" }),
     ], WM, []);
     expect(out.map((c) => [c.code, c.name])).toEqual([["483920", "77029"], ["444444", "Eli"]]);
     expect(out.every((c) => c.key.startsWith("code:"))).toBe(true);
@@ -1733,6 +1828,16 @@ describe("blip-setup: ssh never eats the script's stdin", () => {
     expect(src).toContain("Press Enter to run the permission check");
     expect(src).toContain("then press Enter to re-check");
   });
+});
+
+// `scp bridge/mac/*` also matched __pycache__ once anyone had run the Mac
+// tests; scp without -r exits 1 on a directory, and under set -e setup died
+// before install.sh ran, leaving the Mac on the OLD tools with no hint why.
+test("blip-setup copies only regular files to the Mac", () => {
+  const src = readFileSync(new URL("./scripts/blip-setup", import.meta.url), "utf8");
+  const runnable = src.split("\n").filter((l) => !/^\s*#/.test(l) && !/^\s*echo\s/.test(l)).join("\n");
+  expect(runnable).not.toMatch(/scp\s+-q\s+"\$here"\/bridge\/mac\/\*/);
+  expect(runnable).toContain('find "$here/bridge/mac" -maxdepth 1 -type f -print0');
 });
 
 test("group labels prefer short names while participant details retain full names", () => {

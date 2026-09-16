@@ -27,6 +27,24 @@ describe("QML safety invariants", () => {
   // exclude <>"'), and 45 of the 46 annotated sinks already say PlainText.
   // This keeps the sink safe by construction rather than by the filter staying
   // correct, and makes the house rule checkable instead of aspirational.
+  // BlipView mirrors collector.isGroupChat() by hand ("Same rule as ...").
+  // Four copies of one rule drifted apart once already: widening only the TS
+  // side would make a short code a DM in the collector and a group in the
+  // panel, i.e. read-only with no way to reply. Pin the shape, both files.
+  test("the QML phone-shape rule matches the collector's", () => {
+    const collector = readFileSync(new URL("./collector.ts", import.meta.url), "utf8");
+    const shapes = (src: string) =>
+      // NOTE the open form: {5,} must be SEEN and compared, not skipped as a
+      // non-match, or reverting one site to it reads as "no rule here".
+      [...src.matchAll(/\/\^\\\+\?\[0-9\]\{(\d+),(\d*)\}\$\//g)].map((m) => `${m[1]},${m[2]}`);
+    const inCollector = shapes(collector);
+    const inPanel = shapes(panel);
+    expect(inCollector.length).toBeGreaterThan(0);
+    expect(inPanel.length).toBeGreaterThan(0);
+    expect(new Set([...inCollector, ...inPanel]).size).toBe(1);   // one bound everywhere
+    expect(inCollector[0]).toBe("3,15");                          // E.164: 15 digits max
+  });
+
   test("every Text/TextEdit declares a textFormat", () => {
     const offenders: string[] = [];
     for (const file of readdirSync(new URL(".", import.meta.url)).filter((f) => f.endsWith(".qml"))) {
@@ -169,7 +187,7 @@ describe("QML safety invariants", () => {
     expect(panel).toContain("readonly property var avatarFiles: hostWidget ? hostWidget.avatarCache : localAvatarFiles");
     expect(panel).not.toContain("root.avatarFiles = m");
     expect(panel).toContain("function retryBareAvatars()");
-    expect(panel).toContain("onSurfaceOpenChanged: if (surfaceOpen) root.retryBareAvatars()");
+    expect(panel).toContain("if (surfaceOpen) root.retryBareAvatars()");
   });
 
   test("ui_font_size scales Blip text without touching Omarchy", () => {
@@ -289,7 +307,9 @@ describe("QML safety invariants", () => {
     expect(panel).toContain("openThread(threads[i])");
     const catcher = panel.slice(panel.indexOf("function catchNavText"), panel.indexOf("function catchEscape"));
     expect(catcher).toContain('text >= "1" && text <= "9"');
-    expect(catcher).toContain("root.draftPath");
+    // A queued attachment still blocks the 1-9 jump: with a draft armed the
+    // keystroke belongs to the caption, not to thread navigation.
+    expect(catcher).toContain("root.attachCount > 0");
     expect(catcher).toContain("return handleTextKey(text) === true");
     const fn = handleTextKeySource();
     expect(fn).toContain("if (searching || newMode) return false");
@@ -421,7 +441,9 @@ describe("QML safety invariants", () => {
   test("bubble actions reuse the click handlers and never steal a real send", () => {
     // Enter/Ctrl+C/Ctrl+R act on the selection only with an empty field and
     // no queued file — a queued file's Enter is a send, and must stay one.
-    expect(panel).toContain('var b = empty && root.draftPath === "" ? root.selectedBubble() : null');
+    // draftPath became attachCount when a message learned to carry SEVERAL
+    // files; the guard is the same one — no queued attachment.
+    expect(panel).toContain('var b = empty && root.attachCount === 0 ? root.selectedBubble() : null');
     const open = qmlFunction("openBubble");
     expect(open).toContain("openAttachment(b.attachments[0])");
     expect(open).toContain("openShare(urls, false)");   // a link goes to the sheet, never straight to the browser
@@ -491,6 +513,41 @@ describe("QML safety invariants", () => {
     const panelQml = readFileSync(new URL("./Panel.qml", import.meta.url), "utf8");
     expect(panelQml).toContain("focusTarget: view.inThread ? view.composeEditor : view.navigationKeys");
     expect(panelQml).toContain("onNavigationFocusRequested: view.navigationKeys.forceActiveFocus()");
+  });
+
+  test("the conversation list builds only the rows near the viewport", () => {
+    // A Repeater inside a Flickable instantiates AND renders every row it is
+    // handed, and the popout's layer surface is destroyed on close — so all
+    // ~300 conversations were rebuilt on every open. Measured 2026-09-15 with
+    // a frame-gap probe: 441-627 ms of blocked GUI thread, which froze the
+    // card's 140 ms fade half-way (the panel "hung slightly transparent").
+    expect(panel).toContain(
+      "model: root.online && root.listShowing && !root.searchShowing && !root.newMode ? root.rowsBuilt : 0");
+    expect(panel).toContain("readonly property int rowsBuilt: Math.min(rowBudget, unpinnedThreads.length)");
+    // the COUNT, never a slice: a Repeater handed a new array destroys and
+    // rebuilds every delegate, which is the cost being avoided
+    expect(panel).not.toContain("root.unpinnedThreads.slice(");
+    expect(panel).toContain("readonly property var modelData: root.unpinnedThreads[index] || root.absentThread");
+    // cursorChat is "" when there is no cursor, and so is an absent row's chat
+    expect(panel).toContain(
+      'readonly property bool hasCursor: root.cursorChat !== "" && root.cursorChat === String(modelData.chat)');
+    // closing drops what scrolling built, so the next open is cheap again
+    expect(panel).toContain("else rowBudget = rowBatch");
+  });
+
+  test("the row budget grows for the wheel and for the keyboard", () => {
+    expect(panel).toContain("onContentYChanged: root.growRowsForScroll()");
+    const grow = qmlFunction("growRowsForScroll");
+    expect(grow).toContain("threadFlick.contentY + threadFlick.height * 2 < threadFlick.contentHeight");
+    // one batch per frame: contentHeight only catches up after a layout pass,
+    // so a synchronous loop would build every row it was trying not to build
+    expect(grow).toContain("rowGrowth.restart()");
+    // End and paging address a row by index, past what is built
+    expect(panel).toContain("onCursorChanged: if (ensureRows(cursor + 2)) cursorCatchUp.restart()");
+    expect(qmlFunction("ensureRows")).toContain(
+      "rowBudget = Math.min(Math.max(n, rowBudget + rowBatch), unpinnedThreads.length)");
+    // scrollCursorIntoView measures a row, so the new one needs a frame first
+    expect(panel).toContain("Timer { id: cursorCatchUp; interval: 16; onTriggered: root.scrollCursorIntoView() }");
   });
 
   test("an old toast can still reopen its conversation (omarchy-exec-argv)", () => {
@@ -635,6 +692,32 @@ test("follower bars forward right/middle clicks to the leader", () => {
   expect(widget).toContain('code === Qt.RightButton ? "read" : "refresh"');
 });
 
+// QsWindow.window is null while a freshly built bar completes its widgets, so
+// on a monitor hotplug EVERY screen's widget briefly satisfied `!ownScreen`
+// and crowned itself. One screen (or none) must still default to leader —
+// that is what keeps a widget outside any window alive — but with more than
+// one, an unresolved widget waits rather than racing its siblings.
+test("an unresolved window only claims the crown when it is the only screen", () => {
+  const elect = widget.slice(widget.indexOf("readonly property var ownScreen"),
+                             widget.indexOf("id: followerState"));
+  expect(elect).toContain("Quickshell.screens.length <= 1");
+  expect(elect).toContain("!!ownScreen &&");
+  expect(elect).not.toMatch(/leader:\s*!ownScreen/);
+});
+
+// The follower watchers ARE killed by the leader gate — and then their own
+// backoff timer brings them back. `watchProc.running = true` replaces the
+// `running: root.leader` binding permanently, so from the first restart a
+// follower watched, refreshed and toasted forever: one duplicate desktop
+// notification per extra screen, until the shell was restarted.
+test("the watch restart restores the leader binding, never a bare true", () => {
+  expect(widget).toContain("running: root.leader");
+  expect(widget).not.toMatch(/watchProc\.running\s*=\s*true\b/);
+  const restart = widget.slice(widget.indexOf("id: watchRestart"),
+                               widget.indexOf("// ---", widget.indexOf("id: watchRestart")));
+  expect(restart).toMatch(/running\s*=\s*Qt\.binding\(function\s*\(\)\s*\{\s*return root\.leader\s*\}\)/);
+});
+
 // A URL out of a message is message content: stdin to the preview fetcher, never argv.
 test("link preview URLs never ride argv", () => {
   expect(panel).toContain('["bun", root.previewScript, "--stdin"]');
@@ -662,6 +745,21 @@ test("window focus is an exact title match, not a prefix", () => {
   const win = readFileSync(new URL("./BlipWindow.qml", import.meta.url), "utf8");
   expect(win).toContain('String(Hyprland.activeToplevel.title || "") === win.title');
   expect(win).not.toContain('.indexOf("Blip") === 0');
+});
+
+// Idle remaps a new client onto the focused workspace. Adopting that as home
+// is what made a walk-away move Blip. A user move is the new home; a remap
+// is sent back. Keep in lockstep with workspaceDecision() in window-restore.ts.
+test("idle remaps do not adopt the focused workspace", () => {
+  expect(window).not.toContain("savedWorkspace = currentWorkspace; saveWinState()");
+  expect(window).toContain('if (reason === "move") return "save"');
+  expect(window).toContain('if (reason === "map" || reason === "monitor") return "return"');
+  expect(window).toContain('runRestore("home", savedWorkspace)');
+  expect(window).toContain('runRestore("return", savedWorkspace, addr || ourAddress())');
+  expect(window).toContain('["bun", win.restoreScript, "prepare", win.savedWorkspace]');
+  expect(window).toContain("/^Blip( \\([0-9]+\\))?$/.test(title)");
+  expect(window).toContain("id: strayReturn");
+  expect(window).toContain("sameAddress");
 });
 
 // Esc over the share sheet closes the sheet; a stale search never stays clickable;
@@ -753,7 +851,6 @@ test("the share sheet steps through a message's links", () => {
   expect(qmlFunction("showShareUrl")).not.toContain('shareQr = ""');
 });
 
-
 test("a thread response taken before a local send or failure cannot replace bubbles", () => {
   const start = panel.indexOf("onStreamFinished: {", panel.indexOf("id: threadProc"));
   const brace = panel.indexOf("{", start);
@@ -802,3 +899,77 @@ test("tapbacks on picture-only messages get a pill on the picture", () => {
    expect(run(1,1,qt,"sample",{y:0},rect,3)).toBe(false);
    expect(run(99,0,qt,"sample",{y:0},rect,3)).toBe(false);
  });
+
+describe("a message can carry several files (multi-file drafts)", () => {
+  function source(fn: string, until: string) {
+    const start = panel.indexOf(`function ${fn}`);
+    return panel.slice(start, panel.indexOf(until, start));
+  }
+
+  test("a drop attaches EVERY file, not just the first", () => {
+    // drop.urls[0] attached one photo of five and discarded the rest with no
+    // message — worse than refusing the drop.
+    expect(panel).not.toContain("var u = String(drop.urls[0])");
+    expect(panel).toContain("for (var i = 0; i < drop.urls.length; i++)");
+    expect(panel).toContain("root.addAttachments(paths)");
+  });
+
+  test("the draft is a list, and it is capped", () => {
+    expect(panel).toContain("property var attachDrafts: []");
+    expect(panel).toContain("readonly property int attachMax: 10");
+    // A stray drop of a whole folder is refused, not turned into 80 sends.
+    const add = source("addAttachment", "function addAttachments");
+    expect(add).toContain("root.attachDrafts.length >= root.attachMax");
+    // the same file twice is one attachment
+    expect(add).toContain("root.attachDrafts[i].path === p");
+  });
+
+  test("files ship one part at a time, and only the first carries the caption", () => {
+    // copyProc on current main is a multi-line Process with onExited; slice
+    // to copyText, the next function after the pump.
+    const pump = source("pumpFileSend", "function copyText");
+    // fileSendProc is a single Process: a second start would clobber the first.
+    expect(pump).toContain("if (fileSendProc.running) return");
+    expect(pump).toContain("root.fileQueue = root.fileQueue.slice(1)");
+    // caption over stdin, never argv (audit #4)
+    expect(pump).toContain("--caption-stdin");
+    expect(pump).not.toContain("root.sendCaption]");
+    // spent after the first part, so five files do not post one sentence five times
+    expect(pump).toContain('root.sendCaption = ""');
+  });
+
+  test("only the part that shipped is retired; a failure keeps the rest attached", () => {
+    expect(panel).toContain("root.removeAttachment(root.sendDraftPath)");
+    // mid-batch the field must not clear and focus must not jump
+    expect(panel).toContain("if (root.fileQueue.length > 0)");
+    expect(panel).toContain("still attached");
+  });
+
+  test("draft chips are one per row, never a RowLayout of N", () => {
+    // Summed implicit widths stretch the column past the panel and take every
+    // right-aligned element off-screen with it (CLAUDE.md).
+    expect(panel).toContain("id: attachList");
+    expect(panel).toContain("model: root.attachDrafts");
+    // each chip removes ITSELF, not the whole draft
+    expect(panel).toContain("root.removeAttachment(modelData.path)");
+    expect(panel).toContain("attachList.width");
+  });
+
+  test("switching threads still drops every queued file", () => {
+    // a queued file must never survive into another conversation
+    const clear = source("clearAttachments", "/** Ship the next queued file");
+    expect(clear).toContain("root.attachDrafts = []");
+    expect(clear).toContain("root.fileQueue = []");
+  });
+});
+
+describe("a multi-part send is pinned to the thread it started in", () => {
+  test("the service is captured once, not re-read per part", () => {
+    // root.active can change under a batch; a later part must not go out on a
+    // different service from the first (war room #2).
+    expect(panel).toContain("property string sendService");
+    expect(panel).toContain('root.sendService !== "" ? ["--service", root.sendService] : []');
+    const pump = panel.slice(panel.indexOf("function pumpFileSend"), panel.indexOf("function copyText"));
+    expect(pump).not.toContain("root.active.service");
+  });
+});

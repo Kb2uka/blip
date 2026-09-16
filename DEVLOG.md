@@ -1,5 +1,23 @@
 # Development log
 
+## 2026-09-14 — Stay on the last workspace after a walk-away
+
+- Idle, screensaver and display-off remake the shell window on the focused
+  workspace. The earlier restore only covered a shell restart, and then
+  treated that remap as a new home.
+- Keep a live-title compositor rule for the last real workspace. Save a new
+  home only from a user window move. A remap or monitor churn is returned
+  silently, without focus.
+- Verification: 487 TypeScript tests passed, including the home rule,
+  move-vs-remap decision and silent return. Deployed onto this machine and
+  restarted the shell from another workspace: the window came back on
+  workspace 2, unfocused, IPC online and healthy. A compositor move off
+  workspace 2 was returned there by the silent-home path. Full idle-cycle
+  confirmation remains with the user.
+- Known limitation: a compositor that reports a user-looking `movewindow`
+  during display-off can still be adopted as a new home; the live rule is
+  the backstop for the usual close-and-reopen remap.
+
 ## 2026-09-07 — Upstream composer update
 
 - Updated the installed plugin to upstream ba1d8f9 (manifest 2.3.3), including the fix that keeps the cursor visible after a draft exceeds the composer height.

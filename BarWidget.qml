@@ -65,9 +65,15 @@ BarWidget {
   // therefore one of these widgets — PER SCREEN. Only the widget on the first
   // screen polls, watches, toasts, owns the app window and answers IPC; the
   // others show the badge from state.json and hand clicks to the leader.
+  // QsWindow.window is still null when a freshly built bar completes its
+  // widgets — on a hotplug every screen's widget therefore saw `!ownScreen`
+  // and claimed the crown for the few hundred ms until the window resolved.
+  // With one screen that default is right (and is what keeps a widget outside
+  // any window working); with several it must be the opposite, so an
+  // unresolved widget waits instead of racing.
   readonly property var ownScreen: QsWindow.window ? QsWindow.window.screen : null
-  readonly property bool leader: !ownScreen || Quickshell.screens.length === 0
-    || String(ownScreen.name) === String(Quickshell.screens[0].name)
+  readonly property bool leader: Quickshell.screens.length <= 1
+    || (!!ownScreen && String(ownScreen.name) === String(Quickshell.screens[0].name))
   FileView {
     id: followerState
     path: root.home + "/.local/state/blip/state.json"
@@ -587,7 +593,12 @@ BarWidget {
     // that is off for the night must not eat an ssh probe every 8 seconds.
     // Any successful "ready" resets the ladder.
     interval: 8000 * Math.pow(2, root.watchFails)
-    onTriggered: watchProc.running = true
+    // Restore the BINDING, never a bare `true`: a plain assignment replaces
+    // `running: root.leader` for the life of the process, so a follower whose
+    // watcher was correctly killed by the leader gate restarted itself one
+    // backoff later and then watched, refreshed and toasted forever — one
+    // duplicate desktop notification per extra screen.
+    onTriggered: watchProc.running = Qt.binding(function() { return root.leader })
   }
 
   // ------------------------------------------------------------ toasts

@@ -1,5 +1,14 @@
 import { expect, test } from "bun:test";
-import { luaString, restoreRule, workspaceSelector } from "./window-restore";
+import {
+  homeRule,
+  isLiveBlipTitle,
+  luaString,
+  restoreRule,
+  silentMove,
+  windowAddress,
+  workspaceDecision,
+  workspaceSelector,
+} from "./window-restore";
 
 test("restores numbered, named and special workspaces without relative selectors", () => {
   expect(workspaceSelector("2")).toBe("2");
@@ -19,5 +28,41 @@ test("quiet mapping applies only to the unique restoration window", () => {
 });
 test("workspace names cannot inject Lua", () => {
   expect(luaString('"\\\n')).toBe('"\\034\\092\\010"');
-  expect(restoreRule('x"}); os.execute("bad', "Blip-restore-abcd")).not.toContain('os.execute');
+  expect(restoreRule('x"}); os.execute("bad', "Blip-restore-abcd")).not.toContain("os.execute");
+  expect(homeRule('x"}); os.execute("bad')).not.toContain("os.execute");
+  expect(silentMove('x"}); os.execute("bad', "0xabc")).not.toContain("os.execute");
+});
+
+test("the live home rule matches Blip and Blip (N), not a restore title", () => {
+  expect(isLiveBlipTitle("Blip")).toBe(true);
+  expect(isLiveBlipTitle("Blip (3)")).toBe(true);
+  expect(isLiveBlipTitle("Blip-restore-abcd-1234")).toBe(false);
+  expect(isLiveBlipTitle("Blip documentation")).toBe(false);
+  const rule = homeRule("2");
+  expect(rule).toContain('name = "blip-session-home"');
+  expect(rule).toContain(`title = ${luaString("^Blip( \\([0-9]+\\))?$")}`);
+  expect(rule).toContain(`workspace = ${luaString("2 silent")}`);
+  expect(homeRule(undefined)).not.toContain("workspace =");
+});
+
+test("a remap or monitor churn returns home; a user move is the new home", () => {
+  expect(workspaceDecision("2", "5", "map")).toBe("return");
+  expect(workspaceDecision("2", "5", "monitor")).toBe("return");
+  expect(workspaceDecision("2", "5", "report")).toBe("ignore");
+  expect(workspaceDecision("2", "5", "move")).toBe("save");
+  expect(workspaceDecision("2", "2", "map")).toBe("ignore");
+  expect(workspaceDecision("", "5", "map")).toBe("save");
+  expect(workspaceDecision("", "5", "report")).toBe("ignore");
+  expect(workspaceDecision("2", "", "move")).toBe("ignore");
+});
+
+test("silent return requires a real address and a real workspace", () => {
+  expect(windowAddress("0xabcDEF")).toBe("0xabcDEF");
+  expect(windowAddress("abc")).toBeNull();
+  const lua = silentMove("2", "0x1234abcd");
+  expect(lua).toContain(`workspace = ${luaString("2")}`);
+  expect(lua).toContain("follow = false");
+  expect(lua).toContain(`window = ${luaString("address:0x1234abcd")}`);
+  expect(silentMove("2", "not-an-address")).toBeNull();
+  expect(silentMove("", "0x1234abcd")).toBeNull();
 });

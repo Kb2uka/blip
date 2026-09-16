@@ -63,7 +63,10 @@ FloatingWindow {
   // ---- persistence: the window lives inside the shell process, so every
   // omarchy-restart-shell (every plugin deploy/update) would kill it. Remember
   // "was open", size and workspace in window.json; restore quietly on start.
+  // Idle/DPMS remaps as a new client on the focused workspace — that is not a
+  // new home. Only a user move updates savedWorkspace; a remap is sent back.
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/blip"
+  readonly property string restoreScript: Qt.resolvedUrl("window-restore.ts").toString().replace(/^file:\/\//, "")
   property bool restoring: true
   property bool restoreReady: false
   property bool explicitShow: false
@@ -74,15 +77,77 @@ FloatingWindow {
   }) || null
   readonly property string currentWorkspace: ownToplevel && ownToplevel.workspace
     ? String(ownToplevel.workspace.name) : ""
+  function ourAddress() {
+    return ownToplevel && ownToplevel.lastIpcObject ? String(ownToplevel.lastIpcObject.address || "") : ""
+  }
+  function sameAddress(a, b) {
+    return !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase()
+  }
+  function eventParts(event, count) {
+    try { if (event && event.parse) return event.parse(count) } catch (e) { }
+    return String(event && event.data ? event.data : "").split(",")
+  }
+  // Keep in lockstep with workspaceDecision() in window-restore.ts.
+  function workspaceDecision(incoming, reason) {
+    if (!incoming) return "ignore"
+    if (savedWorkspace === "") return reason === "report" ? "ignore" : "save"
+    if (incoming === savedWorkspace) return "ignore"
+    if (reason === "move") return "save"
+    if (reason === "map" || reason === "monitor") return "return"
+    return "ignore"
+  }
+  function runRestore() {
+    var args = ["bun", restoreScript]
+    for (var i = 0; i < arguments.length; i++) args.push(String(arguments[i]))
+    Quickshell.execDetached(args)
+  }
+  function applyWorkspaceDecision(incoming, reason, addr) {
+    if (restoring) return
+    var decision = workspaceDecision(incoming, reason)
+    if (decision === "save") {
+      savedWorkspace = incoming
+      saveWinState()
+      if (savedWorkspace !== "") runRestore("home", savedWorkspace)
+    } else if (decision === "return" && savedWorkspace !== "") {
+      runRestore("return", savedWorkspace, addr || ourAddress())
+    }
+  }
   Connections {
     target: Hyprland
     function onRawEvent(event) {
+      var name = event.name
       // New toplevels initially have no IPC metadata (including their PID).
-      if (event.name === "openwindow" || event.name === "movewindowv2") Hyprland.refreshToplevels()
+      if (name === "openwindow" || name === "movewindowv2" || name === "monitoradded" || name === "monitorremoved")
+        Hyprland.refreshToplevels()
+      if (name === "openwindow") {
+        var open = win.eventParts(event, 4)
+        var title = String(open[3] || "")
+        if (String(open[2] || "") === "org.quickshell" && /^Blip( \([0-9]+\))?$/.test(title))
+          win.applyWorkspaceDecision(String(open[1] || ""), "map", String(open[0] || ""))
+      } else if (name === "movewindowv2") {
+        var moved = win.eventParts(event, 3)
+        if (win.sameAddress(moved[0], win.ourAddress()))
+          win.applyWorkspaceDecision(String(moved[2] || ""), "move", String(moved[0] || ""))
+      } else if (name === "monitoradded" || name === "monitorremoved") {
+        Qt.callLater(function() {
+          if (win.currentWorkspace !== "") win.applyWorkspaceDecision(win.currentWorkspace, "monitor", win.ourAddress())
+        })
+      }
     }
   }
   onCurrentWorkspaceChanged: {
-    if (currentWorkspace !== "") { savedWorkspace = currentWorkspace; saveWinState() }
+    if (restoring || currentWorkspace === "") return
+    if (savedWorkspace === "") applyWorkspaceDecision(currentWorkspace, "map", ourAddress())
+    else if (currentWorkspace !== savedWorkspace) strayReturn.restart()
+  }
+  Timer {
+    id: strayReturn
+    interval: 400
+    repeat: false
+    onTriggered: {
+      if (win.restoring || win.currentWorkspace === "" || win.currentWorkspace === win.savedWorkspace) return
+      win.applyWorkspaceDecision(win.currentWorkspace, "map", win.ourAddress())
+    }
   }
   onOwnToplevelChanged: {
     if (ownToplevel && restorationTitle !== "") Qt.callLater(function() { restorationTitle = "" })
@@ -93,7 +158,7 @@ FloatingWindow {
   }
   Process {
     id: prepareRestore
-    command: ["bun", Qt.resolvedUrl("window-restore.ts").toString().replace(/^file:\/\//, ""), win.savedWorkspace]
+    command: ["bun", win.restoreScript, "prepare", win.savedWorkspace]
     stdout: StdioCollector {
       onStreamFinished: {
         try { win.restorationTitle = JSON.parse(text).title || "" } catch (e) { }

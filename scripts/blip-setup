@@ -127,7 +127,10 @@ blip_key_from() {
 # 4. Mac install (needs ssh to already work — key-based)
 if ssh -n -o ConnectTimeout=6 -o BatchMode=yes -- "$host" true 2>/dev/null; then
   ssh -n -- "$host" 'mkdir -p ~/.blip/src'
-  scp -q "$here"/bridge/mac/* "$host:~/.blip/src/"
+  # Regular files only: `bridge/mac/*` also matches __pycache__ once anyone has
+  # run the Mac tests, and scp without -r exits 1 on a directory — under set -e
+  # that aborted setup here, before install.sh ran, leaving the old tools.
+  find "$here/bridge/mac" -maxdepth 1 -type f -print0 | xargs -0 -I{} scp -q {} "$host:~/.blip/src/"
   ssh -n -- "$host" 'bash ~/.blip/src/install.sh --no-check'   # the check runs below, after the "be at the Mac" pause
 
   # python3 on a fresh Mac is a Command Line Tools STUB that exits 1 (and may

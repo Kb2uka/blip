@@ -383,12 +383,20 @@ the same entry, exactly as Omarchy's clock takes its `format`:
 safe to re-run.
 
 **Toasts** — desktop notifications fire only for handles you list; everything
-else still counts and still shows.
+else still counts and still shows. Put this in
+`~/.config/blip/allowlist.json`; it is re-read every poll, so no restart.
 
-```jsonc
-// ~/.config/blip/allowlist.json — re-read every poll, no restart
+```json
 { "allow": ["+15551234567", "them@icloud.com"] }
 ```
+
+Strict JSON — **no comments, no trailing commas.** A file that does not parse
+is treated as an empty list, silently, so a stray `//` line reads exactly like
+having no allowlist at all: everything still counts on the badge, and nothing
+ever toasts. If toasts are not firing, check the file parses
+(`jq . ~/.config/blip/allowlist.json`) before anything else. List each handle a
+person actually messages from — someone with an iCloud address *and* a phone
+needs both lines, or they go quiet whenever they switch.
 
 **Mute (spam)** — the allowlist's opposite: a muted conversation does not
 show at all. No sidebar row, no unread count, no toast. This is the knob for
@@ -399,8 +407,10 @@ whack-a-mole, so list the words instead: the PAC platform's name (`ActBlue`,
 `WinRed`) and the opt-out footer the law makes every one of them carry
 (`Stop2End`) survive the rotation.
 
-```jsonc
-// ~/.config/blip/mutelist.json — re-read every poll, no restart
+Put this in `~/.config/blip/mutelist.json` — re-read every poll, and strict
+JSON exactly like the allowlist above:
+
+```json
 { "mute": ["ActBlue", "WinRed", "Stop2End", "78462"] }
 ```
 

@@ -7,6 +7,53 @@
   separate digit boxes. The prompt shares Blip's fonts and colors, falls back
   to the top right when field bounds are unavailable, and expires after five
   minutes. No browser extension or clipboard is needed.
+- **The app window stays on its workspace after idle.** Walking away used to
+  remap Blip onto whichever workspace was on screen. A user move is still the
+  new home; a screensaver or display-off remap is sent back quietly.
+- **GIFs move.** An animated GIF arrived as a still, and did so twice over. The
+  inline-preview path asks the Mac to resample every image with sips, which
+  flattens an animation to a single frame — a 1.4 MB GIF reached Linux as a
+  198 KB JPEG, the motion gone before the panel ever saw it. Animated formats
+  now skip that path and cross as their own bytes, into the same cache slot a
+  click uses. And a QML `Image` paints one frame whatever you hand it, so
+  animated attachments render through `AnimatedImage` instead; stills stay on
+  `Image`, which is what applies `autoTransform` (the EXIF fall-back for
+  anything cached before orientation was baked in at fetch time). Only the
+  active renderer loads, so no photo decodes twice, and the decode is still
+  bounded in both axes. GIF dimensions now come off the header too — they read
+  0×0 before, leaving the bubble nothing to size itself from.
+- **A message can carry several files.** Dropping five photos on a
+  conversation attached one and threw the other four away without a word: the
+  drop handler read `urls[0]` and the draft was a single path. Drafts are a
+  list now — drag-and-drop takes every file, `/attach` and Ctrl+V add to it,
+  and each chip has its own ✕. They ship one part per file in the order you
+  queued them, with the caption on the first only (repeating it would post the
+  same sentence five times), and the service is captured when the batch starts
+  so switching threads mid-send cannot push a later part onto a different one.
+  A part that fails stops the batch and leaves the rest attached, saying how
+  many, rather than making you work out which of five went out. Capped at ten
+  files, because a stray drop of a folder should be refused and not become
+  eighty sends. Chips are one per row, like the received ones — a row of N
+  sums its implicit widths and drags the whole column off the panel.
+
+- **Time crosses the bridge as UTC.** Stamps used to arrive as the Mac's naive
+  wall clock ("2026-09-07 14:33:12") and were compared against the Linux
+  clock — the same string only while both machines sat in one timezone. A Mac
+  an hour ahead put every read mark ahead of every message, so nothing ever
+  counted as unread; an hour behind and the backlog re-toasted. And once a
+  year, in the DST fall-back hour, the Mac's own clock repeated itself: two
+  messages an hour apart carried the SAME stamp, so ordering, the watermark
+  and "newer than the mark" all quietly stopped meaning anything for that
+  hour. The bridge now emits ISO-8601 UTC (`2026-09-07T18:33:12Z`), which is
+  monotonic and whose lexical order is chronological order — the property
+  every ledger, sort and watermark in Blip was already assuming. Local time
+  became a display concern: bubbles, day dividers, "Today"/"Yesterday" and
+  read receipts are rendered in the READER's zone, so a day still breaks at
+  your midnight and not at Greenwich's. `imsg`'s own plain-text output keeps
+  the Mac's clock — a person reading `imsg recent` wants the time they
+  remember. Upgrading migrates the marks in `state.json`, and stamps from a
+  Mac still on the old bridge are normalised as they come in, so a
+  half-upgraded pair keeps working instead of silently going quiet.
 
 ## 2.5.0 — 2026-09-13 — photos at once, and sends that stay put
 

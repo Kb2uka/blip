@@ -57,6 +57,31 @@ what it is handed. Keep it that way.
   can carry a FUTURE timestamp (tz skew); a mark taken from the global max
   once suppressed unrelated threads until "tomorrow". The panel passes the
   newest VISIBLE ts (`--seen`) so mid-round-trip arrivals stay unread.
+- **Every stamp inside Blip is UTC; local time is a DISPLAY concern.** The
+  bridge emits ISO-8601 UTC to the second (`2026-09-07T18:33:12Z`, `fmt_ts`),
+  because fixed-width UTC is the one format whose LEXICAL order is
+  chronological order — which every watermark, ledger, `maxTs` and `a.ts <
+  b.ts` in the collector silently assumes. Naive Mac wall clock broke that
+  twice: against a Linux clock in another zone every mark sat ahead of every
+  message (nothing unread), and in the DST fall-back hour the Mac's own clock
+  repeats, so two messages an hour apart carried the same string. Convert to
+  the reader's zone only when rendering — `localDay()`/`formatStamp()` in
+  thread.ts, `stampMs()`/`localDay()`/`fmtTime()` in BlipView. NEVER slice a
+  date out of a stamp (`ts.slice(0, 10)`) to find its day: that is UTC's day,
+  and the divider belongs at the reader's midnight. `imsg`'s plain-text
+  renders keep `fmt_ts_local` — a human reading `imsg recent` wants the time
+  they remember; every JSON field is `fmt_ts`.
+  **Stamps are normalised at the two fetch doors** (`fetchMessages` in
+  collector.ts, `loadThread` in thread.ts) via `toUtcStamp`, and `loadState`
+  migrates the marks a pre-UTC release wrote. Both halves are load-bearing
+  together: migrating the marks while the bridge still emitted naive stamps
+  would sort every message BELOW every mark (`" "` < `"T"`) and silently
+  empty the badge and the toasts. Legacy stamps are read as Linux-local —
+  exact whenever the Mac shared the zone, which is every setup where the old
+  format looked right. The suite runs pinned to `TZ=UTC` (test-setup.ts),
+  where all of this is invisible; `timezone.test.ts` and
+  `bridge/mac/test_wire_time.py` set their own zones and are what actually
+  cover it.
 - **Reads are optimistic-with-suppression.** Persistent read state moves only
   via collector runs (~1 s), so BarWidget applies reads to the local model
   IMMEDIATELY and remembers them in `localReads[chat]` (thread last_ts at
@@ -296,6 +321,9 @@ what it is handed. Keep it that way.
   BarWidget's `ensureWindow()`/`hideWindow()` toggle the Loader's `active`;
   BlipWindow persists size + was-open in `~/.local/state/blip/window.json`
   and restores on creation. Do not "simplify" this back to `visible`.
+  Idle/DPMS maps a new client on the focused workspace; that is not a new
+  home. Save workspace only from a user `movewindowv2`. Keep a live-title
+  home rule so a remap returns where the window was.
 - **After an Omarchy plugin HOT-RELOAD, `qs ipc` keeps serving the OLD
   BarWidget.** Proved 2026-08-31 with a build tag (A after reload to B; C
   after D): the destroyed widget's IpcHandler stays bound to the target,
@@ -318,6 +346,22 @@ what it is handed. Keep it that way.
   caching, dropping the EXIF block so nothing double-rotates; the QML flag
   covers files cached before that, and the fall-back when jpegtran fails.
   Never move this to the Mac side: `sips` cannot auto-orient.
+- **The conversation list builds only the rows near the viewport.** A Repeater
+  inside a Flickable instantiates AND renders every row it is handed, and the
+  popout's layer surface is destroyed on close, so all ~300 conversations were
+  rebuilt on every open: 441-627 ms of blocked GUI thread (frame-gap probe,
+  2026-09-15), which froze the card's 140 ms fade half-way — "it hangs slightly
+  transparent before fully opening". `rowBudget` starts at 24 and grows as the
+  reader scrolls toward the end of what is built (`growRowsForScroll`, one
+  batch per frame — `contentHeight` only catches up after a layout pass, so a
+  synchronous loop rebuilds everything it was avoiding) or when the cursor
+  addresses a row past it (`ensureRows`, for End and paging). Closing resets
+  it. The model is the COUNT, never a slice: a Repeater handed a new array
+  destroys and rebuilds every delegate, which is the whole cost — with an int
+  model a `threads` refresh re-evaluates bindings instead. Two traps: an
+  absent row's `chat` is `""`, which is also `cursorChat` with no cursor, so
+  `hasCursor` tests both; and `scrollCursorIntoView` measures a row, so a
+  cursor move that just BUILT one has to wait a frame (`cursorCatchUp`).
 - **Never let one delegate's implicit width exceed the panel.** A single
   RowLayout of N attachment chips summed implicit widths and silently
   stretched the whole conversation column to 2× panel width — every
@@ -353,7 +397,26 @@ to whatever has focus otherwise.
 
 ## Things that are not possible
 
-- Tapbacks, edits, typing indicators out. Needs SIP-off code injection; rejected.
+- ~~Tapbacks, edits, typing indicators out — needs SIP-off code injection.~~
+  **Half wrong; do not quote this as settled** (2026-09-07). macOS 26 Messages
+  has real MENU ITEMS for three of them — `Edit ▸ Tapback Message…`,
+  `Edit ▸ Reply to Message…`, `Edit ▸ Edit Last Message…`, plus `Send Later…`
+  — enumerated over System Events on the gateway Mac. A menu item is
+  scriptable, which is exactly how `imsg-read` overturned the old "marking
+  read is impossible" note. Typing indicators have no menu item and stay out.
+  What is NOT yet proved, and what anyone picking this up must establish
+  first: all four read `enabled=false` from the background, which per the
+  read-push note is evidence of NOTHING (AppKit validates menus against the
+  ACTIVE app's responder chain) — so feasibility has to be tested with
+  Messages frontmost. Then the real obstacles: the item acts on the SELECTED
+  message, and selecting an arbitrary bubble from Linux is the unsolved part;
+  the "…" suggests a picker that needs further navigation for the emoji;
+  Messages must come forward, so it steals focus the way `--chat` read-push
+  does; and a GROUP still cannot be addressed at all (next bullet).
+  #69 is the live discussion: a working Accessibility-on-balloons patch
+  (SIP on, the same grant `imsg-read` already holds) is reported there.
+  Nothing from that issue is in-tree; do not treat the menu-item note
+  above as a claim that outbound tapbacks ship.
 - Selecting a GROUP on the Mac from Linux. `imessage://` addresses a handle;
   a group's `chat<digits>` id has no URL form. So per-conversation read-push
   is DMs only; groups clear through `--all`. NOT closed for good: Bluetooth MAP

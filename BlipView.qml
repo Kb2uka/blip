@@ -139,15 +139,23 @@ FocusScope {
   property var attMetrics: ({})
   property var fetchQueue: []
   property string fetchingId: ""
-  // Compose draft attachment (one per message in v1).
-  property string draftPath: ""
-  property string draftLabel: ""
+  // Queued attachments, oldest first: [{ path, label }]. A single draft could
+  // only ever ship the first of five dropped photos, silently discarding the
+  // rest — a drop that loses four files with no message is worse than a
+  // refusal. Sends go out one part per file, in this order.
+  property var attachDrafts: []
+  readonly property int attachCount: attachDrafts.length
+  /** How many files one message may carry. A stray drop of a whole folder
+   *  should be refused, not turned into eighty sends. */
+  readonly property int attachMax: 10
   // What the in-flight file send / paste belong to, so late completions
   // can't clobber a NEWER draft or land in a DIFFERENT conversation.
   property string sendDraftPath: ""
   property string pasteChat: ""
 
   readonly property var threads: hostWidget ? hostWidget.threads : []
+  // Stand-in for a row whose thread is gone for a tick (see the list delegate).
+  readonly property var absentThread: ({ chat: "", handle: "", name: "", unread: 0, participants: [] })
   readonly property var pinnedThreads: root.threads.filter(function(t) { return t.pinned === true })
   readonly property var unpinnedThreads: root.threads.filter(function(t) { return t.pinned !== true })
   readonly property bool online: hostWidget ? hostWidget.online : false
@@ -310,6 +318,56 @@ FocusScope {
   // return to it), but a row must not LOOK selected while typing happens
   // elsewhere — Up from the top and a click in the field both got here.
   readonly property bool cursorShown: !searchField.activeFocus
+
+  // ---- how many conversation rows actually exist ----------------------
+  //
+  // The list is a Repeater inside a Flickable, so every row it is handed is
+  // instantiated AND rendered every frame — the ~290 below the fold included.
+  // The popout's layer surface is destroyed on close, which releases the
+  // scene graph, so opening rebuilt all of them from scratch: ~500 ms of
+  // blocked GUI thread, during which the card's 140 ms fade froze half-way
+  // and the panel sat there translucent before snapping in. Measured
+  // 2026-09-15 with a FrameAnimation frame-gap probe, 300 conversations:
+  // 441/476/484/496/580/627 ms of gap on open. Capped at 20 rows: no gap at
+  // all, and the model assignment fell from 228 ms to 19 ms.
+  //
+  // So only the rows near the viewport exist. `rowBudget` grows as the reader
+  // scrolls toward the end of what is built, and resets when the surface
+  // closes — the next open is cheap again. The model is the COUNT, not a
+  // slice: a Repeater given a new array destroys and rebuilds every delegate,
+  // which is the cost being avoided, while an int model only appends the new
+  // ones (and a `threads` refresh now re-evaluates bindings instead of
+  // rebuilding 300 rows).
+  readonly property int rowBatch: 24        // ≈2 viewports at either density
+  property int rowBudget: rowBatch
+  readonly property int rowsBuilt: Math.min(rowBudget, unpinnedThreads.length)
+  /** Make sure row `n` exists. True when that actually built anything, so the
+   *  caller can defer the work that needs the new row laid out. */
+  function ensureRows(n) {
+    if (n <= rowBudget || rowBudget >= unpinnedThreads.length) return false
+    rowBudget = Math.min(Math.max(n, rowBudget + rowBatch), unpinnedThreads.length)
+    return true
+  }
+  /** Within a viewport of the last built row → build the next batch. */
+  function growRowsForScroll() {
+    if (!listShowing || searchShowing || newMode || rowBudget >= unpinnedThreads.length) return
+    if (threadFlick.contentY + threadFlick.height * 2 < threadFlick.contentHeight) return
+    rowBudget = Math.min(rowBudget + rowBatch, unpinnedThreads.length)
+    // One batch per frame, re-checked once it has been laid out: a jump
+    // straight to the end (the scrollbar dragged down) needs several, and
+    // contentHeight only catches up after the layout pass, so a synchronous
+    // loop here would build every row it was trying not to build.
+    rowGrowth.restart()
+  }
+  Timer { id: rowGrowth; interval: 16; onTriggered: root.growRowsForScroll() }
+  // scrollCursorIntoView is synchronous because a cursor move does not
+  // normally touch the model. When it just built the row, it does — give the
+  // layout a frame before measuring where the row landed.
+  Timer { id: cursorCatchUp; interval: 16; onTriggered: root.scrollCursorIntoView() }
+  // A cursor jump (End, paging) can address a row past what is built. Pinned
+  // threads sort ahead of unpinned in `threads`, so the cursor index is never
+  // smaller than the row's index here — over-asking is safe.
+  onCursorChanged: if (ensureRows(cursor + 2)) cursorCatchUp.restart()
   // The bubble the arrows have selected in a conversation (-1 = none) and the
   // delegate drawing it — registered by the row itself, like cursorRow. The
   // selection is a TARGET for actions (copy, open, reply), not a scroll state.
@@ -332,6 +390,15 @@ FocusScope {
   // Text sends queue instead of refusing while one is on the wire; each gets
   // its bubble the instant Enter is pressed (see pendingSends).
   property var sendQueue: []
+  // Files still to ship for the send in flight: one part per file, in order.
+  // The caption rides the FIRST part only — repeating it on each would post
+  // the same sentence five times.
+  property var fileQueue: []
+  property string sendCaption: ""
+  // The service is captured when the batch STARTS, never re-read per part:
+  // root.active can change under a multi-part send, and a later part must not
+  // go out on a different service from the first (war room #2).
+  property string sendService: ""
   // Sends the Mac has not written a row for yet, {chat, text, ts}. Every
   // thread reload carries them to thread.ts (--pending-stdin, never argv),
   // which keeps their bubbles until the real row lands. Memory only.
@@ -391,7 +458,7 @@ FocusScope {
     }
   }
   // Same rule as collector.isGroupChat(): anything that is not a phone/email.
-  function isGroupId(c) { c = String(c || ""); return c !== "" && !/^\+?[0-9]{5,}$/.test(c) && c.indexOf("@") < 0 }
+  function isGroupId(c) { c = String(c || ""); return c !== "" && !/^\+?[0-9]{3,15}$/.test(c) && c.indexOf("@") < 0 }
   readonly property bool activeIsGroup: inThread && isGroupId(active.chat)
 
   /**
@@ -405,7 +472,7 @@ FocusScope {
     if (!t) return false
     var c = String(t.chat || "")
     if (isGroupId(c)) return /^[A-Za-z]+;[+-];.+$/.test(String(t.guid || ""))
-    return /^\+?[0-9]{5,}$/.test(c) || c.indexOf("@") > 0
+    return /^\+?[0-9]{3,15}$/.test(c) || c.indexOf("@") > 0
   }
 
   // Unsent compose text per chat id. It lives on the host (BarWidget.draftCache)
@@ -457,7 +524,7 @@ FocusScope {
   function back() {
     clearThread()
     composeField.text = ""
-    clearDraft()   // a queued file must never survive into another thread
+    clearAttachments()   // a queued file must never survive into another thread
     pinToBottom = false
     // Top of the list for a mouse user; the cursor row for a keyboard user.
     Qt.callLater(function() {
@@ -511,7 +578,7 @@ FocusScope {
     loading = true
     composeField.text = drafts[String(t.chat)] || ""   // this conversation's unsent text
     composeField.cursorPosition = composeField.length
-    clearDraft()   // a queued file must never survive into another thread
+    clearAttachments()   // a queued file must never survive into another thread
     requestThreadLoad(String(t.chat))
   }
 
@@ -696,6 +763,10 @@ FocusScope {
   // ---------------------------------------------------- attachment fetching
 
   function isImageMime(m) { return String(m || "").indexOf("image/") === 0 }
+  /** Formats that MOVE — they render through AnimatedImage, not Image, and
+   *  fetch.ts keeps them off the resampling path that would flatten them.
+   *  Mirrors isAnimatedMime() in fetch.ts; keep the two in step. */
+  function isAnimatedMime(m) { return String(m || "").toLowerCase() === "image/gif" }
   function linkHost(u) { var m = /^https?:\/\/([^/?#]+)/i.exec(String(u || "")); return (m ? m[1] : String(u || "")).replace(/^www\./, "").toLowerCase() }
   /** Only http(s) ever reaches xdg-open from a card (thread.ts filters too). */
   function openLink(u) {
@@ -800,7 +871,11 @@ FocusScope {
     root.putAvatarFiles(m)
     for (var i = 0; i < keys.length; i++) root.requestAvatar(keys[i])
   }
-  onSurfaceOpenChanged: if (surfaceOpen) root.retryBareAvatars()
+  onSurfaceOpenChanged: {
+    if (surfaceOpen) root.retryBareAvatars()
+    // Closed: drop the rows scrolling built, so the next open is cheap again.
+    else rowBudget = rowBatch
+  }
   function pumpAvatar() {
     if (avatarProc.running || avatarQueue.length === 0) return
     avatarInFlight = avatarQueue.slice(0, 1024)
@@ -927,18 +1002,41 @@ FocusScope {
 
   // ------------------------------------------------------ compose attachment
 
-  function setDraft(path) {
+  /** Queue one more file on the draft. The same path twice is one attachment. */
+  function addAttachment(path) {
     var p = String(path || "")
     if (p === "") return
-    draftPath = p
+    for (var i = 0; i < root.attachDrafts.length; i++) if (root.attachDrafts[i].path === p) return
+    if (root.attachDrafts.length >= root.attachMax) {
+      root.note = "at most " + root.attachMax + " files per message"
+      return
+    }
     var parts = p.split("/")
-    draftLabel = parts[parts.length - 1] || "file"
+    root.attachDrafts = root.attachDrafts.concat([{ path: p, label: parts[parts.length - 1] || "file" }])
     Qt.callLater(function() { composeField.forceActiveFocus() })
   }
 
-  function clearDraft() {
-    draftPath = ""
-    draftLabel = ""
+  /** Queue several at once — a multi-file drop. Reports what would not fit
+   *  rather than dropping it on the floor. */
+  function addAttachments(paths) {
+    var before = root.attachDrafts.length
+    for (var i = 0; i < (paths || []).length; i++) {
+      if (root.attachDrafts.length >= root.attachMax) {
+        root.note = "attached " + (root.attachDrafts.length - before) + " — at most "
+                  + root.attachMax + " files per message"
+        return
+      }
+      root.addAttachment(paths[i])
+    }
+  }
+
+  function removeAttachment(path) {
+    root.attachDrafts = root.attachDrafts.filter(function(d) { return d.path !== String(path) })
+  }
+
+  function clearAttachments() {
+    root.attachDrafts = []
+    root.fileQueue = []
   }
 
   function startPaste() {
@@ -1289,35 +1387,35 @@ FocusScope {
     if (trimmed.indexOf("/attach ") === 0) {
       var p = trimmed.slice(8).trim()
       if (p.indexOf("~/") === 0) p = root.home + p.slice(1)
-      setDraft(p)
+      addAttachment(p)
       composeField.text = ""
-      note = "attached — type a caption or press Enter to send"
+      note = root.attachCount > 1
+        ? root.attachCount + " files attached — caption, or Enter to send"
+        : "attached — type a caption or press Enter to send"
       return
     }
 
-    if (draftPath === "" && trimmed === "") return
+    if (root.attachCount === 0 && trimmed === "") return
     if (!isSendable(root.active)) {
       note = "Read-only — group id unknown — send from your phone"
       return
     }
 
-    if (draftPath !== "") {
+    if (root.attachCount > 0) {
       if (sendProc.running || fileSendProc.running) {
         note = "a message is already sending"
         return
       }
-      note = "sending…"
       sendChat = String(root.active.chat)
       sendText = text
-      // send-file.ts owns target resolution (group guid or DM handle).
-      sendDraftPath = draftPath
-      // caption on stdin — never in this process's argv (audit #4, war room #1/#13)
-      fileSendProc.command = ["bun", root.sendFileScript, sendChat, draftPath, "--caption-stdin"]
-        .concat(/^(SMS|RCS)$/i.test(String(root.active.service || "")) ? ["--service", String(root.active.service).toUpperCase()] : [])
-      fileSendProc.stdinEnabled = true
-      fileSendProc.running = true
-      fileSendProc.write(trimmed !== "" ? text : "")
-      fileSendProc.stdinEnabled = false
+      // One part per file, in the order they were queued; the caption goes
+      // with the first only. fileSendProc is a single Process, so they ship
+      // strictly one at a time — pumpFileSend() starts the next as each lands.
+      root.fileQueue = root.attachDrafts.map(function(d) { return d.path })
+      root.sendCaption = trimmed
+      var svc = String(root.active.service || "")
+      root.sendService = /^(SMS|RCS)$/i.test(svc) ? svc.toUpperCase() : ""
+      pumpFileSend()
       return
     }
 
@@ -1325,7 +1423,7 @@ FocusScope {
     // writing the row) happens behind it. The field clears at once, so a
     // second message can follow without waiting — sends queue in order.
     var chat = String(root.active.chat)
-    var stamp = root.localStamp()
+    var stamp = root.wireStamp()
     var target = root.activeIsGroup
       ? ["--chat-id", String(root.active.guid)]
       : ["--to", chat]
@@ -1343,9 +1441,27 @@ FocusScope {
     pumpSend()
   }
 
-  /** Local wall clock as a chat.db-style stamp; the pending bubble's ts. */
-  function localStamp() {
-    return Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm:ss")
+  /** Now in the bridge's WIRE format (UTC ISO-8601): the pending bubble's ts.
+   *  It is compared against real message stamps — which are UTC — so a local
+   *  wall clock here would put every in-flight bubble hours out of order. */
+  function wireStamp() {
+    return new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+  }
+
+  /** Wire stamp → epoch ms. Mirrors stampMs() in thread.ts, including the
+   *  fallback that reads a pre-UTC stamp as local. */
+  function stampMs(ts) {
+    var t = String(ts || "")
+    if (t === "") return NaN
+    return Date.parse(t.indexOf("T") >= 0 ? t : t.replace(" ", "T"))
+  }
+
+  /** The LOCAL calendar date a wire stamp falls on — day dividers break at
+   *  the reader's midnight, never UTC's. Mirrors localDay() in thread.ts. */
+  function localDay(ts) {
+    var ms = stampMs(ts)
+    if (isNaN(ms)) return ""
+    return Qt.formatDate(new Date(ms), "yyyy-MM-dd")
   }
 
   /** The instant echo: thread.ts's pendingBubble() in miniature — enough to
@@ -1354,8 +1470,8 @@ FocusScope {
   function appendPendingBubble(list, text, stamp, localId) {
     var out = (list || []).slice()
     var prev = out.length ? out[out.length - 1] : null
-    var newDay = !prev || String(prev.ts || "").slice(0, 10) !== stamp.slice(0, 10)
-    var gapMin = prev ? (Date.parse(stamp.replace(" ", "T")) - Date.parse(String(prev.ts || "").replace(" ", "T"))) / 60000 : Infinity
+    var newDay = !prev || root.localDay(prev.ts) !== root.localDay(stamp)
+    var gapMin = prev ? (root.stampMs(stamp) - root.stampMs(prev.ts)) / 60000 : Infinity
     var start = !prev || newDay || prev.from_me !== true || !(gapMin <= 15)
     if (!start) { var p = Object.assign({}, prev); p.groupEnd = false; p.time = ""; out[out.length - 1] = p }
     out.push({ localId: localId, ts: stamp, from_me: true, name: "", text: String(text).trim(), day: newDay ? "Today" : "",
@@ -1396,6 +1512,27 @@ FocusScope {
     sendProc.stdinEnabled = false
   }
 
+  /** Ship the next queued file. The caption rides the FIRST part only, and
+   *  goes over stdin — never this process's argv (audit #4, war room #1/#13). */
+  function pumpFileSend() {
+    if (fileSendProc.running) return
+    if (root.fileQueue.length === 0) return
+    var path = root.fileQueue[0]
+    root.fileQueue = root.fileQueue.slice(1)
+    root.sendDraftPath = path
+    var left = root.fileQueue.length
+    root.note = left > 0 ? "sending… (" + (left + 1) + " left)" : "sending…"
+    // send-file.ts owns target resolution (group guid or DM handle).
+    fileSendProc.command = ["bun", root.sendFileScript, root.sendChat, path, "--caption-stdin"]
+      .concat(root.sendService !== "" ? ["--service", root.sendService] : [])
+    fileSendProc.stdinEnabled = true
+    fileSendProc.running = true
+    fileSendProc.write(root.sendCaption)
+    fileSendProc.stdinEnabled = false
+    // Spent: only the first part carries it.
+    root.sendCaption = ""
+  }
+
   property string copyFeedback: ""
   Process {
     id: copyProc
@@ -1432,13 +1569,15 @@ FocusScope {
   // The same patterns as the bubbles: today the time, older rows the date and
   // the time, with the year once it is not this year.
   function fmtTime(ts) {
-    var s = String(ts || "")
-    if (s.length < 16) return s
+    var ms = root.stampMs(ts)
+    if (isNaN(ms)) return String(ts || "")
     var now = new Date()
-    var at = new Date(+s.substring(0, 4), +s.substring(5, 7) - 1, +s.substring(8, 10),
-                      +s.substring(11, 13), +s.substring(14, 16))
+    // The stamp is UTC; every label below is the reader's local time. Reading
+    // the digits out of the string (as this did) showed a Mac's clock, and
+    // compared it against a Linux date.
+    var at = new Date(ms)
     var clock = Qt.formatTime(at, root.timeFormat)
-    if (s.substring(0, 10) === Qt.formatDate(now, "yyyy-MM-dd")) return clock
+    if (Qt.formatDate(at, "yyyy-MM-dd") === Qt.formatDate(now, "yyyy-MM-dd")) return clock
     // Messages stamps a row "Yesterday", then the weekday for the last week,
     // then a date — never a date-plus-clock, which is what a mail client does.
     var midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate())
@@ -1641,7 +1780,7 @@ FocusScope {
         if (!root.inThread || String(root.active.chat) !== root.pasteChat) return
         try {
           var d = JSON.parse(text.trim())
-          if (d.kind === "image" || d.kind === "file") root.setDraft(String(d.path || ""))
+          if (d.kind === "image" || d.kind === "file") root.addAttachment(String(d.path || ""))
           else if (d.kind === "text") {
             composeField.insert(composeField.cursorPosition, String(d.text || ""))
           }
@@ -1663,18 +1802,33 @@ FocusScope {
           if (!ok) err = d.online === false ? "not sent — Mac unreachable" : String(d.error || err)
         } catch (e) { /* fall through */ }
         if (ok) {
-          // Only clear the draft this send actually shipped — the user may
-          // have queued a NEWER file while this one was in flight.
-          if (root.draftPath === root.sendDraftPath) root.clearDraft()
+          // Retire only the part that actually shipped — the user may have
+          // queued another file while this one was in flight.
+          root.removeAttachment(root.sendDraftPath)
+          root.sendDraftPath = ""
+          root.reloadChat = root.sendChat
+          reloadTimer.restart()
+          if (root.fileQueue.length > 0) {
+            // More parts to go: keep sendChat/sendText, do NOT clear the
+            // field or hand focus back mid-batch.
+            root.pumpFileSend()
+            return
+          }
           if (belongsHere) {
             root.note = ""
             if (composeField.text === root.sendText) composeField.text = ""
           }
-          root.reloadChat = root.sendChat
-          reloadTimer.restart()
         } else if (belongsHere) {
-          root.note = err
+          // Stop the batch: the parts still queued stay attached, so the user
+          // can retry them rather than hunt for which of five went out.
+          var left = root.fileQueue.length
+          root.note = left > 0 ? err + " — " + (left + 1) + " still attached" : err
+          root.fileQueue = []
+          root.sendDraftPath = ""
         }
+        root.fileQueue = []
+        root.sendCaption = ""
+        root.sendService = ""
         root.sendChat = ""
         root.sendText = ""
         if (belongsHere) composeField.forceActiveFocus()
@@ -1945,7 +2099,7 @@ FocusScope {
       || (text >= "1" && text <= "9")
     if (!jump) return false
     if (searchField.activeFocus || newField.activeFocus || bubbleFocused) return false
-    if (composeField.activeFocus && (composeField.text.length > 0 || root.draftPath !== ""))
+    if (composeField.activeFocus && (composeField.text.length > 0 || root.attachCount > 0))
       return false
     return handleTextKey(text) === true
   }
@@ -2085,6 +2239,7 @@ FocusScope {
           boundsBehavior: Flickable.StopAtBounds
           interactive: contentHeight > height
           ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+          onContentYChanged: root.growRowsForScroll()
 
           // Wheel scrolling is DIRECT, 1:1 — no animation. Two animated
           // schemes (restarted easing, SmoothedAnimation chase) both fought
@@ -2525,7 +2680,7 @@ FocusScope {
                       font.bold: true
                     }
                     Text {
-                      text: String(modelData.ts || "").slice(0, 16)
+                      text: root.fmtTime(modelData.ts)
                       textFormat: Text.PlainText
                       color: root.dim
                       font.family: root.fontFamily
@@ -2568,13 +2723,19 @@ FocusScope {
               spacing: 0
               Repeater {
                 id: chronologicalRepeater
-                model: root.online && root.listShowing && !root.searchShowing && !root.newMode ? root.unpinnedThreads : []
+                model: root.online && root.listShowing && !root.searchShowing && !root.newMode ? root.rowsBuilt : 0
                 delegate: Rectangle {
                   id: threadRow
-                  required property var modelData
                   required property int index
+                  // The count and the array change in either order; a row that
+                  // is briefly past the end of the list renders as nothing
+                  // rather than throwing on every binding it has.
+                  readonly property var modelData: root.unpinnedThreads[index] || root.absentThread
                   readonly property bool highlighted: rowHover.hovered || (hasCursor && root.cursorShown)
-                  readonly property bool hasCursor: root.cursorChat === String(modelData.chat)
+                  // cursorChat is "" when there is no cursor, which is also an
+                  // absent row's chat — without the first test a placeholder
+                  // would light up and claim cursorRow.
+                  readonly property bool hasCursor: root.cursorChat !== "" && root.cursorChat === String(modelData.chat)
                   onHasCursorChanged: if (hasCursor) root.cursorRow = threadRow
 
                   Layout.fillWidth: true
@@ -3059,11 +3220,22 @@ FocusScope {
                     spacing: 0
                     Item { Layout.fillWidth: true; visible: bubbleRow.mine }
 
-                    // fetched image renders inline, like Messages; click = full view
-                    Image {
+                    // fetched image renders inline, like Messages; click = full view.
+                    // A GIF has to MOVE, and Image paints frame one and stops,
+                    // so animated formats go through AnimatedImage instead.
+                    // Static formats stay on Image: it is the one that applies
+                    // autoTransform, the EXIF fall-back for anything cached
+                    // before fetch.ts started baking orientation in. Sizing is
+                    // computed ONCE here so the two can never disagree — a
+                    // delegate whose implicit width outgrows the panel takes
+                    // every right-aligned element off-screen with it.
+                    Item {
                       id: attImage
                       TapbackPill { visible: chipRow.pillHere; mine: bubbleRow.mine; tapbacks: bubbleRow.modelData.tapbacks }
                       visible: chipRow.showImage
+                      readonly property bool animated: root.isAnimatedMime(chipRow.modelData.mime)
+                      readonly property var view: animated ? attAnimated : attStill
+                      readonly property int status: view.status
                       readonly property real maxW: Math.round(content.width * 0.6)
                       // Retina PNGs carry their density in the header (read by
                       // fetch.ts); divide it out so a 2x screenshot draws at
@@ -3074,35 +3246,64 @@ FocusScope {
                       readonly property real naturalWidth:
                         Number(chipRow.imageMetrics.pixelWidth || 0) > 0
                           ? Number(chipRow.imageMetrics.pixelWidth) / pixelRatio
-                          : implicitWidth
+                          : view.implicitWidth
                       readonly property real naturalHeight:
                         Number(chipRow.imageMetrics.pixelHeight || 0) > 0
                           ? Number(chipRow.imageMetrics.pixelHeight) / pixelRatio
-                          : implicitHeight
-                      source: chipRow.showImage ? chipRow.fileUrl : ""
-                      asynchronous: true
-                      fillMode: Image.PreserveAspectFit
-                      // iPhone photos store rotation as an EXIF tag, not in
-                      // the pixels (sips keeps the tag when it converts HEIC);
-                      // Qt ignores it unless asked, so portraits came out on
-                      // their side. implicitWidth/Height follow the transform.
-                      autoTransform: true
-                      // bound the DECODE in BOTH axes, not just the paint — a
-                      // 12MP photo (or a 100×100000 sliver) must not cost
-                      // 50 MB of texture (Codex review points 19 and #3)
-                      sourceSize.width: 800
-                      sourceSize.height: 800
-                      // LRU eviction or a corrupt file: fall back to the chip
-                      // (⚠ marker); a click re-fetches through fetch.ts.
-                      onStatusChanged: if (status === Image.Error) {
-                        var m = Object.assign({}, root.attFiles)
-                        m[chipRow.attId] = ""
-                        root.attFiles = m
-                      }
+                          : view.implicitHeight
+
                       Layout.preferredWidth: status === Image.Ready ? Math.min(maxW, naturalWidth) : maxW
                       Layout.preferredHeight: status === Image.Ready && naturalWidth > 0
                         ? Layout.preferredWidth * naturalHeight / naturalWidth
                         : Style.space(120)
+
+                      // LRU eviction or a corrupt file: fall back to the chip
+                      // (⚠ marker); a click re-fetches through fetch.ts.
+                      function forget() {
+                        var m = Object.assign({}, root.attFiles)
+                        m[chipRow.attId] = ""
+                        root.attFiles = m
+                      }
+
+                      Image {
+                        id: attStill
+                        anchors.fill: parent
+                        visible: !attImage.animated
+                        // Only the ACTIVE renderer loads: two sources would
+                        // decode every photo twice.
+                        source: chipRow.showImage && !attImage.animated ? chipRow.fileUrl : ""
+                        asynchronous: true
+                        fillMode: Image.PreserveAspectFit
+                        // iPhone photos store rotation as an EXIF tag, not in
+                        // the pixels (sips keeps the tag when it converts HEIC);
+                        // Qt ignores it unless asked, so portraits came out on
+                        // their side. implicitWidth/Height follow the transform.
+                        autoTransform: true
+                        // bound the DECODE in BOTH axes, not just the paint — a
+                        // 12MP photo (or a 100×100000 sliver) must not cost
+                        // 50 MB of texture (Codex review points 19 and #3)
+                        sourceSize.width: 800
+                        sourceSize.height: 800
+                        onStatusChanged: if (status === Image.Error) attImage.forget()
+                      }
+
+                      AnimatedImage {
+                        id: attAnimated
+                        anchors.fill: parent
+                        visible: attImage.animated
+                        source: chipRow.showImage && attImage.animated ? chipRow.fileUrl : ""
+                        asynchronous: true
+                        fillMode: Image.PreserveAspectFit
+                        // AnimatedImage honours sourceSize (measured), so the
+                        // same decode ceiling applies to a huge GIF.
+                        sourceSize.width: 800
+                        sourceSize.height: 800
+                        // Nothing animates off-screen: a thread full of GIFs
+                        // would otherwise decode frames nobody is looking at.
+                        playing: visible && root.inThread
+                        onStatusChanged: if (status === Image.Error) attImage.forget()
+                      }
+
                       HoverHandler { cursorShape: Qt.PointingHandCursor }
                       TapHandler { onTapped: root.openAttachment(chipRow.modelData) }
                     }
@@ -3423,32 +3624,47 @@ FocusScope {
           foreground: root.foreground
         }
 
-        // queued attachment — one per message; ✕ removes it
-        RowLayout {
+        // queued attachments — ✕ removes one. ONE CHIP PER ROW, never a
+        // RowLayout of N: summed implicit widths stretch the whole column
+        // past the panel and take every right-aligned element off-screen
+        // with it (CLAUDE.md; the same rule the received chips follow).
+        ColumnLayout {
+          id: attachList
           Layout.fillWidth: true
-          visible: root.inThread && root.draftPath !== ""
-          spacing: 0
-          Rectangle {
-            Layout.preferredWidth: Math.ceil(draftText.implicitWidth) + Style.space(18)
-            Layout.preferredHeight: Math.ceil(draftText.implicitHeight) + Style.space(12)
-            radius: Style.space(14)
-            color: root.mineFill
-            opacity: 0.9
-            Text {
-              id: draftText
-              anchors.centerIn: parent
-              text: "📎 " + (root.draftLabel.length > 40
-                              ? root.draftLabel.slice(0, 37) + "…"
-                              : root.draftLabel) + "   ✕"
-              textFormat: Text.PlainText
-              color: root.mineText
-              font.family: root.fontFamily
-              font.pixelSize: root.fontCaption
+          visible: root.inThread && root.attachCount > 0
+          spacing: Style.space(4)
+          Repeater {
+            model: root.attachDrafts
+            delegate: RowLayout {
+              required property var modelData
+              Layout.fillWidth: true
+              spacing: 0
+              Rectangle {
+                // Capped at the compose column: a long filename must not
+                // push the row wider than the panel.
+                Layout.preferredWidth: Math.min(
+                  Math.ceil(attachChipText.implicitWidth) + Style.space(18),
+                  attachList.width)
+                Layout.preferredHeight: Math.ceil(attachChipText.implicitHeight) + Style.space(12)
+                radius: Style.space(14)
+                color: root.mineFill
+                opacity: 0.9
+                Text {
+                  id: attachChipText
+                  anchors.centerIn: parent
+                  readonly property string label: String(modelData.label || "file")
+                  text: "📎 " + (label.length > 40 ? label.slice(0, 37) + "…" : label) + "   ✕"
+                  textFormat: Text.PlainText
+                  color: root.mineText
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fontCaption
+                }
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: root.removeAttachment(modelData.path) }
+              }
+              Item { Layout.fillWidth: true }
             }
-            HoverHandler { cursorShape: Qt.PointingHandCursor }
-            TapHandler { onTapped: root.clearDraft() }
           }
-          Item { Layout.fillWidth: true }
         }
 
         RowLayout {
@@ -3552,7 +3768,7 @@ FocusScope {
                 // instead; send() is the authoritative online/sendability guard.
                 enabled: true
                 readOnly: !root.online || !root.isSendable(root.active)
-                placeholderText: root.draftPath !== ""
+                placeholderText: root.attachCount > 0
                   ? "caption (optional) — Enter sends the file"
                   : root.isSendable(root.active) ? "iMessage" : "Read-only — group id unknown"
                 color: root.foreground
@@ -3611,7 +3827,7 @@ FocusScope {
                   }
                   // Actions on the selected bubble. Enter is free here: with no
                   // text and no queued file, send() would do nothing anyway.
-                  var b = empty && root.draftPath === "" ? root.selectedBubble() : null
+                  var b = empty && root.attachCount === 0 ? root.selectedBubble() : null
                   if (b) {
                     if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { event.accepted = true; root.openBubble(b); return }
                     if (event.matches(StandardKey.Copy)) { event.accepted = true; root.copyBubble(b); return }
@@ -3630,7 +3846,7 @@ FocusScope {
           // send button — the blue arrow circle (lit when text OR a file is queued)
           Rectangle {
             Layout.alignment: Qt.AlignBottom
-            readonly property bool armed: composeField.text.trim() !== "" || root.draftPath !== ""
+            readonly property bool armed: composeField.text.trim() !== "" || root.attachCount > 0
             width: Style.space(28); height: width; radius: width / 2
             color: armed ? root.mineFill : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
             Text {
@@ -3717,9 +3933,16 @@ FocusScope {
       keys: ["text/uri-list"]
       onDropped: (drop) => {
         if (!drop.hasUrls || drop.urls.length === 0) return
-        var u = String(drop.urls[0])
-        if (u.indexOf("file://") !== 0) return
-        root.setDraft(decodeURIComponent(u.replace(/^file:\/\//, "")))
+        // EVERY dropped file, not just urls[0]: dropping five photos used to
+        // attach one and discard four without saying so.
+        var paths = []
+        for (var i = 0; i < drop.urls.length; i++) {
+          var u = String(drop.urls[i])
+          if (u.indexOf("file://") !== 0) continue
+          paths.push(decodeURIComponent(u.replace(/^file:\/\//, "")))
+        }
+        if (paths.length === 0) return
+        root.addAttachments(paths)
         drop.accept()
       }
     }
