@@ -164,10 +164,12 @@ Linux side. If the Mac is asleep, the widget dims and says so.
   this to `~/.config/hypr/bindings.lua` — it asks **Hyprland** where the
   window is (front → close, elsewhere → focus, none → create) instead of
   the plugin, because after an Omarchy plugin update the plugin's IPC can
-  answer from a stale instance until the shell restarts:
+  answer from a stale instance until the shell restarts. Match the Quickshell
+  class and exact app title (`Blip` or `Blip (N)`); a browser or editor titled
+  "Blip documentation" must never be focused or closed by this shortcut:
   ```lua
   o.bind("SUPER + M", "Blip messages", [[sh -c '
-    blip() { hyprctl clients -j | jq -r ".[] | select(.title | startswith(\"Blip\")) | .address" | head -1; }
+    blip() { hyprctl clients -j | jq -r ".[] | select(.class == \"org.quickshell\" and (.title | test(\"^Blip( [(][0-9]+[)])?$\"))) | .address" | head -1; }
     a=$(blip)
     if [ -z "$a" ]; then
       omarchy-shell nixfred.blip app >/dev/null

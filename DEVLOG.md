@@ -1,5 +1,20 @@
 # Development log
 
+## 2026-09-15 — Match the app before focusing or closing a window
+
+- Restrict the documented Super+M shortcut and the app IPC focus command to
+  `org.quickshell` windows titled exactly `Blip` or `Blip (N)`. An unrelated
+  browser/editor titled “Blip documentation” must not be focused or closed.
+- Preserve the documented toggle behavior for the real app, the bounded map
+  wait, and compositor-based lookup after a shell hot-reload.
+- Verification: 535 Bun tests pass; the eight new shell-command regression
+  cases all fail against the original implementation. Tests execute the actual
+  README/QML commands with synthetic client metadata and intercepted dispatch,
+  IPC and sleep commands. Plugin validation and whitespace checks pass.
+- Existing users must replace their copied keybinding to receive the shortcut
+  correction. No real conversations were opened or messages sent for testing;
+  no layout changes or live shell restart were needed.
+
 ## 2026-09-14 — Stay on the last workspace after a walk-away
 
 - Idle, screensaver and display-off remake the shell window on the focused
