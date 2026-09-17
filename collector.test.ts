@@ -1973,3 +1973,20 @@ test("generated group labels join the last short name with an ampersand", () => 
  expect(groupName('chat123',{...info,participants:['a']},new Map())).toBe('Pat');
  expect(groupName('chat123',{...info,name:'Custom, title'},new Map())).toBe('Custom, title');
 });
+
+describe("Send Later", () => {
+  const queued = { chat: "A", from_me: true, ts: "2099-01-01T18:00:00Z", text: "later", scheduled: true };
+  test("a waiting scheduled message is never a thread's newest message", () => {
+    const [t] = buildThreads([msg({ chat: "A", ts: "2026-09-16T15:00:00Z", text: "sent" }), msg(queued)], "");
+    expect(t!.last_text).toBe("sent");
+    expect(t!.last_ts).toBe("2026-09-16T15:00:00Z");
+    expect(t!.count).toBe(2);
+  });
+  test("a thread holding only a scheduled message still has a preview", () => {
+    const [t] = buildThreads([msg(queued)], "");
+    expect(t!.last_text).toBe("later");
+  });
+  test("a scheduled message never moves the watermark", () => {
+    expect(maxTs([msg({ ts: "2026-09-16T15:00:00Z" }), msg(queued)], "")).toBe("2026-09-16T15:00:00Z");
+  });
+});

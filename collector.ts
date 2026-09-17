@@ -76,6 +76,10 @@ export interface ImsgMessage {
    *  AppleScript reports success for sends that die later — this is where
    *  the truth lands. imsg ≥1.10.0. */
   error?: number;
+  /** A Send Later message still waiting on the Mac (imsg: schedule_type 2,
+   *  state 2). Its ts is the FUTURE send time, so it never becomes a
+   *  thread's newest message and never moves a watermark or read mark. */
+  scheduled?: boolean | null;
   // ---- imsg --rich extras (claude-on-mac ≥ 1.5.0); absent on plain fetches
   read_at?: string | null;
   tapbacks?: Tapback[] | null;
@@ -664,7 +668,8 @@ export function buildThreads(
   const threads: Thread[] = [];
   for (const [chat, list] of byChat) {
     const sorted = [...list].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-    const last = sorted[sorted.length - 1]!;
+    const sent = sorted.filter((m) => m.scheduled !== true);
+    const last = sent.length ? sent[sent.length - 1]! : sorted[sorted.length - 1]!;
     const mark = readMarks[chat] && readMarks[chat]! > watermark ? readMarks[chat]! : watermark;
     const unread = unreadCounts
       ? unreadCounts[chat] ?? 0
@@ -1167,7 +1172,7 @@ export function selectFailures(
 
 export function maxTs(msgs: ImsgMessage[], fallback: string): string {
   let hi = fallback;
-  for (const m of msgs) if (m.ts > hi) hi = m.ts;
+  for (const m of msgs) if (m.scheduled !== true && m.ts > hi) hi = m.ts;
   return hi;
 }
 
@@ -1746,6 +1751,7 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   const now = nowTs();
   const chatMax: Record<string, string> = {};
   for (const m of fetched.msgs) {
+    if (m.scheduled === true) continue;   // a queued Send Later is not seen yet
     const c = chatKey(m);
     if (!chatMax[c] || m.ts > chatMax[c]!) chatMax[c] = m.ts;
   }

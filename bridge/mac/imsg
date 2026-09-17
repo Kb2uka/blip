@@ -101,9 +101,11 @@ def _child_delegate_sources() -> set[str]:
 #   0  the local store, "On My Mac": no backing account. The owner typed it.
 #   1  the owner's own iCloud (a CardDAV account owned by Apple ID settings).
 #   2  every other synced source.
-# Lowest rank that offers a name wins; only WITHIN a rank does the most common
-# spelling still decide. An unreadable Accounts database ranks everything the
-# same, which is exactly the old count-the-votes behaviour.
+# Lowest rank that offers a name wins. WITHIN a rank the LARGEST source wins
+# outright (ZABCDRECORD count, path as the tie-break); sources never sum, or
+# several small stale/shared stores outvote the primary account
+# (claude-on-mac #4/#5). An unreadable Accounts database puts every source in
+# one rank, so size alone decides.
 _RANK_LOCAL, _RANK_ICLOUD, _RANK_SYNCED = 0, 1, 2
 
 
@@ -128,6 +130,17 @@ def _source_ranks() -> dict:
     return out
 
 
+def _record_count(path: str) -> int:
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return int(con.execute("SELECT COUNT(*) FROM ZABCDRECORD").fetchone()[0] or 0)
+        finally:
+            con.close()
+    except sqlite3.DatabaseError:
+        return 0
+
+
 def _rank_of(path: str, ranks: dict) -> int:
     """A source directory with no account behind it is the local store."""
     return ranks.get(os.path.basename(os.path.dirname(path)), _RANK_LOCAL)
@@ -148,7 +161,7 @@ def _ab_sources() -> list[str]:
         p for p in sorted(glob(_AB_GLOB))
         if os.path.basename(os.path.dirname(p)) not in skip
     ]
-    return sorted(paths, key=lambda p: (_rank_of(p, ranks), p))
+    return sorted(paths, key=lambda p: (_rank_of(p, ranks), -_record_count(p), p))
 
 
 def _digits(s: str) -> str:
@@ -318,14 +331,17 @@ def name_for(handle: str | None) -> str | None:
         # DIFFERENT records inside ONE source sharing the key — that source is
         # skipped for that key. A Family Sharing child's mirrored address book is
         # not one of yours at all (_ab_sources drops it).
-        # Across sources the OWNER'S book wins outright (see _source_ranks); the
-        # most common spelling only breaks ties within one rank. Counting every
-        # source equally let a synced directory's bulk rows rename people.
-        # key -> name -> [best source rank seen, times seen]
+        # Across sources the OWNER'S book wins outright (see _source_ranks), then
+        # the largest source within that rank. Nothing is summed: counting
+        # sources let a synced directory, or a handful of stale stores, rename
+        # people. _ab_sources() already yields that order, so the first source
+        # that names a key wins.
+        # key -> name -> [best source rank seen, -size of the largest source]
         votes: dict[str | Phone, dict[str, list]] = {}
         ranks = _source_ranks()
         for path in _ab_sources():
             rank = _rank_of(path, ranks)
+            size = _record_count(path)
             try:
                 con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
                 con.row_factory = sqlite3.Row
@@ -363,15 +379,14 @@ def name_for(handle: str | None) -> str | None:
                     _EXACT_SEEN.add(key)
                     if name:
                         slot = votes.setdefault(key, {})
-                        if name in slot:
-                            slot[name][0] = min(slot[name][0], rank)
-                            slot[name][1] += 1
-                        else:
-                            slot[name] = [rank, 1]
+                        best = [rank, -size]
+                        if name not in slot or best < slot[name]:
+                            slot[name] = best
             except sqlite3.DatabaseError:
                 continue
-        # Nearest source first; only then the most common spelling.
-        resolved = {k: min(v.items(), key=lambda kv: (kv[1][0], -kv[1][1]))[0] for k, v in votes.items()}
+        # Nearest source first; within a rank the largest; dict order breaks a
+        # full tie deterministically (sources arrive path-sorted).
+        resolved = {k: min(v.items(), key=lambda kv: kv[1])[0] for k, v in votes.items()}
         _NAME_INDEX = {k: n for k, n in resolved.items() if isinstance(k, str)}
         _PHONE_INDEX = {k: n for k, n in resolved.items() if isinstance(k, tuple)}
     if "@" in handle:
@@ -967,6 +982,8 @@ def render(rows, as_json: bool, with_names: bool = True, con=None, rich: bool = 
                 # place the truth lands (e.g. 25 = attachment not readable).
                 "error": int(r["error"] or 0) if r["is_from_me"] else 0,
             }
+            if _is_pending_schedule(r["schedule_type"], r["schedule_state"]):
+                row["scheduled"] = True   # ts is the time it WILL send
             if rich:
                 row["guid"] = r["guid"]
                 row.update(extras.get(r["ROWID"], {}))
@@ -1046,6 +1063,21 @@ def message_src(has_recently_deleted: bool) -> str:
 
 MESSAGE_SRC = message_src(has_recently_deleted=True)
 
+# Send Later (macOS 15+): the row is written the moment you schedule it, dated
+# at the FUTURE send time. schedule_type 2 = Send Later; schedule_state 2 =
+# still waiting, 3 = sent (observed on macOS 27, 2026-09-16). A waiting
+# row is not a sent message: it must not become a conversation's newest
+# message, and a client must not take a read mark from its future date.
+def _is_pending_schedule(schedule_type, schedule_state) -> bool:
+    return schedule_type == 2 and schedule_state == 2
+
+
+def pending_schedule_sql(con, alias: str = "m") -> str:
+    if not _has_col(con, "schedule_type"):
+        return "(0 = 1)"   # never a bare integer: ORDER BY reads that as a column index
+    return f"({alias}.schedule_type = 2 AND {alias}.schedule_state = 2)"
+
+
 _BASE_SELECT_CACHE: str | None = None
 
 
@@ -1059,10 +1091,15 @@ def base_select(con) -> str:
             if _has_col(con, "date_edited")
             else "0 AS date_edited, 0 AS date_retracted, NULL AS message_summary_info,"
         )
+        sched_cols = (
+            "m.schedule_type, m.schedule_state,"
+            if _has_col(con, "schedule_type")
+            else "0 AS schedule_type, 0 AS schedule_state,"
+        )
         _BASE_SELECT_CACHE = f"""
             SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
                    m.service, h.id AS handle, c.chat_identifier, c.room_name,
-                   m.guid, m.date_read, m.is_read, m.error, {edit_cols}
+                   m.guid, m.date_read, m.is_read, m.error, {edit_cols} {sched_cols}
                    m.associated_message_type AS assoc_type,
                    m.thread_originator_guid AS orig_guid,
                    m.expressive_send_style_id AS style_id,
@@ -1209,11 +1246,13 @@ def cmd_chats(con, args):
     chat_cols = {row[1] for row in con.execute("PRAGMA table_info(chat)")}
     orig_col = "c.original_group_id" if "original_group_id" in chat_cols else "NULL"
     filt = chat_filter_sql(con, args, already_where=False)
+    pending = pending_schedule_sql(con)
     rows = con.execute(
         f"""
         SELECT c.ROWID AS cid, c.chat_identifier, c.guid, c.group_id,
                {orig_col} AS original_group_id, c.display_name, c.room_name, c.style,
-               c.service_name, MAX(m.date) AS last_date,
+               c.service_name,
+               COALESCE(MAX(CASE WHEN {pending} THEN NULL ELSE m.date END), MAX(m.date)) AS last_date,
                COUNT(m.ROWID) AS n
         FROM chat c
         LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
@@ -1265,7 +1304,7 @@ def cmd_chats(con, args):
                     JOIN {MESSAGE_SRC} m ON m.ROWID = cmj.message_id
                     LEFT JOIN handle h ON h.ROWID = m.handle_id
                     WHERE cmj.chat_id = ?
-                    ORDER BY m.date DESC LIMIT 1""",
+                    ORDER BY {pending} ASC, m.date DESC LIMIT 1""",
                 (r["cid"],),
             ).fetchone()
             if last:

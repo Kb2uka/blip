@@ -686,7 +686,30 @@ qs -p /usr/share/omarchy/shell ipc call nixfred.blip typecode           # type t
 qs -p /usr/share/omarchy/shell ipc call nixfred.blip copycode           # or copy it
 ```
 
-**Security codes.** When a text arrives that looks like a one-time code
+### Security-code autofill
+
+Set `otp_autofill=on` in `~/.config/blip/bridge.conf` to offer new codes beside
+the focused field. Click **Fill code** to insert, or **×** to dismiss. The
+prompt shares Blip's fonts and colors and handles separate digit boxes. Sites
+need not declare `autocomplete="one-time-code"`; accessible labels can identify
+the field. Codes expire after five minutes, even if you change focus.
+
+This uses Linux accessibility, with no browser extension. When field bounds
+are unavailable the prompt appears at the top right; when field metadata is
+unavailable, select the intended input before clicking. Known chat, password,
+phone and search fields are excluded. It does not copy the code or press Enter.
+The field prompt does not require `automation=on` and replaces the legacy
+code toast and `typecode`/`copycode` handling while enabled.
+
+**The text must reach the Mac first.** If it appears only on the iPhone, check
+**Settings → Apps → Messages → Text Message Forwarding** and enable the Mac
+used by Blip. Both devices must use the same Apple Account; Messages in iCloud
+can provide forwarding automatically. See [Apple's forwarding guide](https://support.apple.com/en-au/102545).
+
+Linux dependencies, browser activation and troubleshooting:
+[Autofill setup](docs/AUTOFILL.md).
+
+**Legacy security-code toast.** With autofill off, when a text looks like a one-time code
 ("Your verification code is 483920", "G-482913", the origin-bound
 `@example.com #493857` form), Blip toasts it. Click the toast to copy it, or
 bind `typecode` to a key and it is typed into whatever has focus, the way

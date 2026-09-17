@@ -92,6 +92,10 @@ export interface Bubble {
   /** Drawn the moment Enter was pressed, before the Mac has written the row;
    *  "Sending…" replaces the time. Absent on every real bubble. */
   pending?: boolean;
+  /** A Send Later message still waiting on the Mac: "Scheduled for Tomorrow
+   *  6:00 PM" replaces the time, and it is never counted as seen. */
+  scheduled?: boolean;
+  scheduledFor?: string;
   localId?: string;
   failureReason?: string;
 }
@@ -322,6 +326,9 @@ export function decorate(msgs: ImsgMessage[], today: string, formats = DEFAULT_F
       audio: m.audio === true,
       html: linkify((m.text ?? "").replace(/￼/g, "").trim()),
       failed: m.from_me && typeof m.error === "number" && m.error !== 0,
+      ...(m.scheduled === true
+        ? { scheduled: true, scheduledFor: `${dayLabel(m.ts, today, formats)} ${clockLabel(m.ts, formats.time)}` }
+        : {}),
     });
   }
 

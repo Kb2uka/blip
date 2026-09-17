@@ -15,6 +15,23 @@
   never-iMessage green thread stays green, and a failed iMessage to a phone
   still flips to SMS. Off by default. Groups still send by chat id.
 
+- **A Send Later message shows as Scheduled, not sent.** Messages writes a
+  scheduled message into chat.db the moment you queue it, dated at the time it
+  will go out. Blip showed it as already sent, made it the conversation's
+  newest message (a thread jumped to the top of the list with tomorrow's
+  date), and opening that thread would have set its read mark a day ahead,
+  hiding every reply until then. The bridge now flags a waiting Send Later
+  (`schedule_type` 2, `schedule_state` 2), the bubble reads "Scheduled for
+  Sep 17 2:00 PM" in your own time zone, and it never counts as the newest
+  message or moves a watermark or read mark. Once it sends, it is an ordinary
+  message. Found on macOS 27; Send Later itself dates from macOS 15, so older
+  Macs had it too. Re-run `blip-setup` so the Mac picks up the new `imsg`.
+
+- **Fill a security code beside the field.** `otp_autofill=on` offers incoming
+  codes through a Blip prompt using native Linux accessibility, including
+  separate digit boxes. The prompt shares Blip's fonts and colors, falls back
+  to the top right when field bounds are unavailable, and expires after five
+  minutes. No browser extension or clipboard is needed.
 - **Right-click a message to quote it.** Replying to something further up the
   conversation used to be hidden behind Shift+Page Up, then Ctrl+R. Right-click
   on a message now offers Quote and reply and Copy message; right-click on a

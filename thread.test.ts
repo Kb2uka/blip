@@ -719,3 +719,15 @@ describe("pending sends (the bubble drawn before the Mac writes the row)", () =>
     expect(out.pending).toEqual([{ chat: "+15550100001", text: "hi", ts: localToday() + " 00:00:00" }]);
   });
 });
+
+describe("Send Later bubbles", () => {
+  test("a waiting scheduled message says when it will send", () => {
+    const [b] = decorate([msg({ from_me: true, ts: "2026-09-17T18:00:00Z", scheduled: true })], "2026-09-16");
+    expect(b!.scheduled).toBe(true);
+    expect(b!.scheduledFor).toContain(clockLabel("2026-09-17T18:00:00Z"));
+  });
+  test("an ordinary bubble carries no schedule fields", () => {
+    const [b] = decorate([msg({ ts: "2026-09-16T12:00:00Z" })], "2026-09-16");
+    expect(b!.scheduled).toBeUndefined();
+  });
+});
