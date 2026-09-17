@@ -16,6 +16,7 @@
  * at 500 MB, evicted after each write.
  */
 
+import { shimPath } from "./shim-path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
@@ -363,7 +364,7 @@ export function fetchAttachment(
     ...(wantsJpeg(mime) || preview ? ["--jpeg"] : []),
     ...(preview ? ["--max-dim", String(PREVIEW_MAX_DIM)] : []),
   ];
-  const res = runner(`${HOME}/bin/imsg`, args, {
+  const res = runner(shimPath("imsg"), args, {
     timeout: 120000,
     maxBuffer: FETCH_MAX_BYTES + (1 << 20),
   });

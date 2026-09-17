@@ -12,10 +12,12 @@ treating a Mac as the gateway. Read this before touching anything.
               blip-dispatch         forced-command gate for ~/.ssh/blip_ed25519: only the five tools run.
                                     imsg: sqlite read of chat.db, `--rich` (tapbacks/read_at/reply_to/
                                     attachments/error), `watch`, `attachment`, `chats`; Recently Deleted hidden.
-(Linux side)  bridge/linux/blip-shim installed as ~/bin/{imsg,imsg-send,contacts} by scripts/blip-setup;
+(Linux side)  bridge/linux/blip-shim installed as ~/bin/{imsg,imsg-send,contacts} by scripts/blip-setup
+                                    (bin_dir= in bridge.conf moves them; bin-dir.ts parses it);
                                     reads ~/.config/blip/bridge.conf (host=, remote_bin='$HOME/.blip/bin'
                                     — single-quoted, expands on the MAC). `ssh -n` preflight; exit 69 offline.
-                                    Blip only ever calls ~/bin/imsg*. No hostnames in code, ever.
+                                    Blip only ever calls the shims via shimPath() (TS) or hostWidget.binDir
+                                    (QML) — never a literal ~/bin path. No hostnames in code, ever.
 contact-review.ts                   bounded read-only contact broker, view models, fingerprint cache.
 ContactReview.qml                   compact review and scan, opened from conversations.
 collector.ts                        poll → {threads, unread, toast}. Pure functions + one spawn.
@@ -397,7 +399,8 @@ to whatever has focus otherwise.
 
 Local text-send failures retain their optimistic bubble and a bounded reason
 in memory, including across thread reloads. `send-state.ts` builds the QML
-module `SendState.mjs`; regenerate it with the command in its header. Local
+module `SendState.mjs`; regenerate it with the command in its header (`bin-dir.ts` → `BinDir.mjs`
+works the same way). Local
 send IDs distinguish same-second sends. A reload started before a local send
 or failure is discarded and retried, so it cannot erase the new state. Failed
 local bubbles remain provisional and never advance read marks.

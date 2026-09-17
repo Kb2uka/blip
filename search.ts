@@ -9,6 +9,7 @@
  * sidebar thread list (name/handle/chat id only; never message bodies).
  */
 
+import { shimPath } from "./shim-path";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -171,7 +172,7 @@ export function runSearch(
   // "--" so a query starting with "-" is a query, not a flag.
   // The query is message text the moment someone pastes a sentence into the
   // box: stdin to the bridge, never argv on either machine (Astra B#2).
-  const res = runner(`${HOME}/bin/imsg`, ["--json", "search", "--stdin", String(limit * 2)], {
+  const res = runner(shimPath("imsg"), ["--json", "search", "--stdin", String(limit * 2)], {
     encoding: "utf8",
     timeout: 20000,
     input: q,

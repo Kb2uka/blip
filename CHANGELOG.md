@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`bin_dir=` in `bridge.conf`.** The Linux-side shims (`imsg`, `imsg-send`,
+  `imsg-read`, `contacts`) no longer have to live in `~/bin`. Set
+  `bin_dir=~/.local/bin` (or any plain absolute path; `~` and `$HOME` expand)
+  and `blip-setup` installs them there, and every spawn — the collector, thread,
+  search, attachments, avatars, contacts, sends and the `imsg watch` channel —
+  looks there. `BLIP_BIN_DIR` does the same for one `blip-setup` run and is
+  written back to `bridge.conf`. Unset, nothing changes: `~/bin` as before.
+
 - Read-only contact review opens directly from conversations. Inspect matching
   source cards and open an exact card in Contacts on Mac. A bounded duplicate
   scan reuses results only while the handle set and Mac fingerprint match.

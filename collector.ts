@@ -5,7 +5,7 @@
  *
  * iMessage is macOS-only. chat.db and the AppleScript send path both live on
   * the Mac; this machine is a thin client over a multiplexed SSH socket (~47ms warm). This
- * script never touches SQLite itself — it shells out to ~/bin/imsg, which
+ * script never touches SQLite itself — it shells out to the imsg shim (~/bin/imsg by default, bin_dir=), which
  * proxies to the Mac.
  *
  * Output: one JSON object on stdout. Never throws — a failure is reported as
@@ -17,6 +17,7 @@
  *   bun collector.ts --read <chat>      # clear one thread's dot (opened it)
  */
 
+import { shimPath } from "./shim-path";
 import { openSync, writeSync, fsyncSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
@@ -1039,7 +1040,7 @@ export function pushReadArgs(
 export function pushRead(args: string[] | null, home = HOME): void {
   if (!args) return;
   try {
-    const child = spawn("sh", pushReadCommand(`${home}/bin/imsg-read`, args, pushReadLogPath(home)),
+    const child = spawn("sh", pushReadCommand(shimPath("imsg-read", home), args, pushReadLogPath(home)),
       { detached: true, stdio: "ignore" });
     child.unref();
   } catch { /* no shim, no Mac, no matter */ }
@@ -1165,14 +1166,14 @@ export function explainBridgeError(status: number | null, stderr: string): strin
 }
 
 export function fetchMessages(limit: number, runner = spawnSync): FetchResult {
-  const res = runner(`${HOME}/bin/imsg`, ["--json", "recent", String(limit)], {
+  const res = runner(shimPath("imsg"), ["--json", "recent", String(limit)], {
     encoding: "utf8",
     timeout: 15000, maxBuffer: 64 * 1024 * 1024,
   });
 
   if (res.error) {
-    // spawn itself failed: ~/bin/imsg missing (run blip-setup) or not executable
-    return { ok: false, online: false, error: `cannot run ~/bin/imsg: ${(res.error as Error).message}`, msgs: [], fetchedCount: 0 };
+    // spawn itself failed: the imsg shim missing (run blip-setup) or not executable
+    return { ok: false, online: false, error: `cannot run ${shimPath("imsg")}: ${(res.error as Error).message}`, msgs: [], fetchedCount: 0 };
   }
   if (res.status === null) {
     // killed by our timeout — a Mac asleep behind a live ControlMaster looks exactly like this
@@ -1310,7 +1311,7 @@ export const CHAT_LIST_LIMIT = 300;
  * widget's memory. Previews are never persisted (no content on disk).
  */
 export function fetchChats(runner = spawnSync): ChatInfo[] | null {
-  const res = runner(`${HOME}/bin/imsg`, ["--json", "chats", String(CHAT_LIST_LIMIT)], {
+  const res = runner(shimPath("imsg"), ["--json", "chats", String(CHAT_LIST_LIMIT)], {
     encoding: "utf8",
     timeout: 20000, maxBuffer: 64 * 1024 * 1024,
   });
@@ -1544,7 +1545,7 @@ export function mergeChats(
 }
 
 export function fetchGroups(runner = spawnSync): Record<string, GroupInfo> | null {
-  const res = runner(`${HOME}/bin/imsg`, ["--json", "groups"], { encoding: "utf8", timeout: 15000, maxBuffer: 64 * 1024 * 1024 });
+  const res = runner(shimPath("imsg"), ["--json", "groups"], { encoding: "utf8", timeout: 15000, maxBuffer: 64 * 1024 * 1024 });
   if (res.status !== 0) return null;
   try {
     const rows = JSON.parse(res.stdout as string);
