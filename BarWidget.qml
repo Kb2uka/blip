@@ -39,7 +39,7 @@ BarWidget {
 
   // ---- collector state
   property var threads: []           // [{chat,name,handle,service,last_ts,last_text,last_from_me,count,unread,pinned,pin_order}]
-  property string threadsJson: ""    // last assigned list, for no-op detection
+  readonly property string threadsJson: JSON.stringify(threads) // includes optimistic reads
   property int unread: 0
   property bool online: false        // the Mac is reachable
   property bool healthy: false       // last collector run parsed cleanly
@@ -460,10 +460,9 @@ BarWidget {
             // Skip the assignment when nothing actually changed.
             var j = JSON.stringify(list)
             if (j !== root.threadsJson) {
-              root.threadsJson = j
               root.threads = list
             }
-            root.unread = list.reduce(function(n, t) { return n + (Number(t.unread) || 0) }, 0)
+            root.unread = root.threads.reduce(function(n, t) { return n + (Number(t.unread) || 0) }, 0)
             root.healthy = d.persisted !== false
             // A message that carries a security code gets the code toast only:
             // its ordinary preview would put the digits into the daemon's
