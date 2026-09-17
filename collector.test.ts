@@ -1170,10 +1170,35 @@ describe("complete conversation list (mergeChats)", () => {
     expect(out[0]!.unread).toBe(windowThread.unread);
   });
 
-  test("prefer_imessage keeps a DM on iMessage when the chat list last bubble is RCS", () => {
-    const listed = chats.map((c, i) => i === 0 ? { ...c, service: "RCS" } : c);
-    expect(mergeChats([windowThread], listed, {}, {})[0]!.service).toBe("RCS");
-    expect(mergeChats([windowThread], listed, {}, {}, true)[0]!.service).toBe("iMessage");
+  // Live shape (Ian, 2026-09-16): a 1:1 keyed by an iCloud address, with the
+  // phone number as an alias of the same cluster, every inbound iMessage — and
+  // `imsg chats` reporting the cluster as RCS because its newest row was Blip's
+  // own last send. Blip then passed `--service RCS` and every reply left green,
+  // which made the next list row green too.
+  test("a merged 1:1 the window computed as iMessage is not turned green by the chat list", () => {
+    const merged = {
+      ...chats[0]!, id: "nancy@icloud.com", service: "RCS",
+      aliases: ["nancy@icloud.com", "+15551234567"],
+    };
+    const blue = { ...windowThread, chat: "nancy@icloud.com", service: "iMessage" };
+    expect(mergeChats([blue], [merged], {}, {})[0]!.service).toBe("iMessage");
+  });
+
+  test("a genuinely green DM still takes its service from the list", () => {
+    const green = { ...windowThread, chat: "+15559990000", service: "SMS" };
+    expect(mergeChats([green], [chats[2]!], {}, {})[0]!.service).toBe("SMS");
+  });
+
+  test("the list may still move a DM the other way, onto iMessage", () => {
+    const green = { ...windowThread, service: "SMS" };
+    expect(mergeChats([green], [chats[0]!], {}, {})[0]!.service).toBe("iMessage");
+  });
+
+  test("a group still takes the list service, since it sends by chat id", () => {
+    const id = "ce5a593a78af408282d61461ade89135";
+    const group = { ...windowThread, chat: id, service: "iMessage" };
+    const listed = { ...chats[1]!, service: "SMS" };
+    expect(mergeChats([group], [listed], {}, {})[0]!.service).toBe("SMS");
   });
 
   test("pinned rows receive Messages-style names and cleaned latest previews", () => {

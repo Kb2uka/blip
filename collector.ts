@@ -1565,7 +1565,6 @@ export function mergeChats(
   chats: ChatInfo[],
   groups: Record<string, GroupInfo>,
   unreadCounts: Record<string, number>,
-  preferImessage = false,
 ): Thread[] {
   const infoByChat = new Map(chats.map((c) => [c.id, c]));
   // Every participant name the window already resolved, so a chat that is new
@@ -1590,6 +1589,18 @@ export function mergeChats(
     const knownParticipantNames = new Map<string, string>(
       (thread.participants ?? []).map((person) => [person.handle, person.name]),
     );
+    // The window's rule (PR #4) reads the last INBOUND row: the service the
+    // other person's device actually used. `imsg chats` reports the CLUSTER's
+    // newest row instead — Blip's own sends included, and for a merged 1:1
+    // (an email iMessage row and a phone SMS row under one group_id) the phone
+    // alias counts too. Letting that turn a blue DM green is self-reinforcing:
+    // one green send becomes the list row's service, which makes the next send
+    // green, and the conversation never comes back on its own. Refuse that one
+    // direction; the list still names the service everywhere else. (#97, Ian)
+    const listService = info.service || thread.service;
+    const greenDowngrade = !group
+      && normalizeSendService(thread.service) === "iMessage"
+      && normalizeSendService(listService) !== "iMessage";
     return {
       ...thread,
       aliases,
@@ -1601,9 +1612,7 @@ export function mergeChats(
               ? groupName(thread.chat, groupInfo, knownParticipantNames)
               : namedGroup(thread.name, thread.chat, aliases) || thread.chat))
         : (info.last_name || info.name || thread.name || thread.chat),
-      service: (!group && preferImessage && normalizeSendService(thread.service) === "iMessage")
-        ? thread.service
-        : (info.service || thread.service),
+      service: greenDowngrade ? thread.service : listService,
       last_text: info.last === thread.last_ts ? info.last_text : messagePreview(thread.last_text),
       pinned,
       pin_order,
@@ -1834,7 +1843,7 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   exactCounts = foldChatRecord(exactCounts, chatAliases, (a, b) => a + b);
   exactOldest = foldChatRecord(exactOldest, chatAliases, (a, b) => (a < b ? a : b));
   const foldedWindow = foldThreadAliases(windowThreads, chatAliases);
-  const threads = chats ? mergeChats(foldedWindow, chats, groups, exactCounts, preferImessage) : applyPins(foldedWindow, pins);
+  const threads = chats ? mergeChats(foldedWindow, chats, groups, exactCounts) : applyPins(foldedWindow, pins);
   // The conversation on screen covers its alias rows, exactly as the read
   // marks above do: a message arriving under a retired chat row is the same
   // conversation you are looking at.

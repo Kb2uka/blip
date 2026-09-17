@@ -457,8 +457,7 @@ conversations send on their own service automatically.
 
 **Prefer iMessage on mixed 1:1s.** A DM that used to be blue and then got an
 RCS inbound (someone in a mixed-platform group, Continuity falling back)
-otherwise sends RCS/SMS next. The Mac often records SMS error 4 — "Not
-Delivered" in Blip — while the iPhone still delivers. Opt in:
+otherwise sends RCS/SMS next. Opt in:
 
 ```
 # ~/.config/blip/bridge.conf — re-read every poll, no restart

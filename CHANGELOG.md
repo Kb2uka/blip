@@ -2,13 +2,18 @@
 
 ## Unreleased
 
-- **`prefer_imessage=on` keeps mixed 1:1s on iMessage.** Last-inbound RCS/SMS
-  in a DM that already had iMessage made the next send green. The Mac then
-  often stamps SMS error 4 ("Not Delivered") while the iPhone still delivers
-  the RCS/iMessage. Opt in with `prefer_imessage=on` in `bridge.conf`: a
-  successful iMessage anywhere in the loaded window wins, a never-iMessage
-  green thread stays green, and a failed iMessage to a phone still flips to
-  SMS. Off by default. Groups still send by chat id.
+- **A blue 1:1 is not turned green by Blip's own last send.** `mergeChats`
+  used to overwrite the window's send service with the chat-list row, which
+  is the cluster's newest bubble — including ours. One green send then made
+  every later send green, even when every inbound row was iMessage. The list
+  may still move a DM onto iMessage; it may not move one off. Thanks
+  @ianswope (#97).
+- **`prefer_imessage=on` keeps mixed 1:1s on iMessage.** Separate from the
+  list overwrite: last-inbound RCS/SMS in a DM that already had iMessage
+  still made the next send green. Opt in with `prefer_imessage=on` in
+  `bridge.conf`. A successful iMessage anywhere in the loaded window wins, a
+  never-iMessage green thread stays green, and a failed iMessage to a phone
+  still flips to SMS. Off by default. Groups still send by chat id.
 
 - **Right-click a message to quote it.** Replying to something further up the
   conversation used to be hidden behind Shift+Page Up, then Ctrl+R. Right-click
