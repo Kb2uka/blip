@@ -85,34 +85,32 @@ def unread_on_mac(handle=None):
 
 
 def settle(before, handle=None, tries=8, pause=0.4):
-    """Messages writes chat.db a beat after the click. Wait for the count to
-    move (up to ~3 s) and return the last reading."""
+    """Wait up to ~3 s for the requested scope to become fully read.
+
+    A decreasing count is progress, not completion. Transient database errors
+    can recover within this same bounded wait.
+    """
     after = before
     for _ in range(tries):
         time.sleep(pause)
         after = unread_on_mac(handle)
-        if after is None or before is None or after < before:
+        if after == 0:
             return after
     return after
 
 
 def report(before, after, ok, what):
-    """Exit 0 only when the Mac's own count moved (or cannot be read).
+    """Acknowledge only a verified zero unread count in the requested scope.
 
-    A disabled menu item used to mean "nothing unread" and exit 0. It also
-    means "AppKit has not validated Messages' menus" — every Conversation item
-    reads disabled while another app is active (2026-09-04: Dock badge 1,
-    Mark All as Read disabled, the push a silent no-op while the phone kept
-    its badge). chat.db is the referee: if it says unread and the count did
-    not move, the push FAILED, whatever the menu said."""
-    if before is None or after is None:
-        print("marked" if ok else "nothing to click")   # cannot verify here
-        return
-    if after < before:
-        print(f"marked ({before} -> {after} unread)")
-        return
-    if before == 0:
-        print("nothing unread")
+    A disabled menu can mean AppKit has not validated Messages' menus. A
+    successful click can precede database writes. Neither proves completion;
+    unavailable verification or a partially cleared count must remain failures.
+    """
+    if after is None:
+        sys.stderr.write("imsg-read: could not verify read state in chat.db\n")
+        sys.exit(75)
+    if after == 0:
+        print("nothing unread" if before == 0 else "marked (0 unread)")
         return
     why = (f"{before} unread on the Mac but {what} stayed disabled even after waking "
            "Messages, so the click could not land"
