@@ -32,6 +32,7 @@ class MessageIdentityTests(unittest.TestCase):
                "text": "Synthetic message", "attributedBody": None, "is_read": 0,
                "date_edited": None, "date_retracted": None, "message_summary_info": None,
                "assoc_type": 0, "error": 0, "balloon_bundle_id": None,
+               "schedule_type": None, "schedule_state": None,
                "guid": "11111111-2222-4333-8444-555555555555"}
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

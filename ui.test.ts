@@ -135,7 +135,7 @@ describe("QML safety invariants", () => {
     expect(panel).toContain("root.failPending(completedChat, completedId, reason, completedText, completedStamp)");
     expect(panel).toContain('modelData.pending === true ? "Sending…"');
     // the read watermark never takes a pending bubble's local-clock stamp
-    expect(panel).toContain("if (list[k].pending === true) continue");
+    expect(panel).toContain("if (list[k].pending === true || list[k].scheduled === true) continue");
   });
 
   test("message text leaves this machine on stdin, never in argv (audit #4)", () => {
@@ -206,12 +206,12 @@ describe("QML safety invariants", () => {
     expect(scaleFontPx(10, 14, 11)).toBe(13);
   });
 
-  test("share sheet: right-click a link, URL on stdin, never argv", () => {
+  test("message menu retains share sheet: URL on stdin, never argv", () => {
     expect(panel).toContain("function openShare(u, auto)");
     expect(panel).toContain("qrProc.write(u)");
     expect(panel).toContain("sendShareProc.write(u)");
     expect(panel).toContain('localsend --headless send "$2"');
-    expect(panel).toContain('onTapped: root.openShare(String(linkCard.link.url || ""))');
+    expect(panel).toContain('onTapped: root.openMessageMenu(modelData, String(linkCard.link.url || ""))');
     expect(panel).toContain('if (shareUrl !== "") { closeShare(); return true }');
     expect(widget).toContain('function share(url: string): string { if (!root.automationOn) return root.automationOff;');
     // never the URL as an argv element of qrencode / localsend
@@ -463,7 +463,8 @@ describe("QML safety invariants", () => {
     expect(panel).toContain("color: calm ? root.dim : root.urgent");
     // secondary text dims by alpha, which reads right on light and dark themes alike;
     // Qt.darker on the foreground only works on a dark one
-    expect(panel).toContain("readonly property color dim: Qt.alpha(foreground, 0.66)");
+    expect(panel).toContain("readonly property color dim: appearance.muted");
+    expect(readFileSync(new URL("./BlipAppearance.qml", import.meta.url), "utf8")).toContain("readonly property color muted: Qt.alpha(foreground, 0.66)");
     expect(panel).not.toMatch(/Qt\.darker\((root\.)?foreground/);
   });
 
@@ -613,15 +614,16 @@ test("a pinned tile shows the unread dot", () => {
 // the theme accent, which on several Omarchy themes is red — a red dot on a
 // messaging icon reads as an error, and red is reserved for alerts anyway.
 test("the icon's unread dot is always iMessage blue", () => {
-  expect(widget).toContain('readonly property color blipAccent: "#0a84ff"');
+  expect(widget).toContain('readonly property color blipAccent: blipAppearance.accent');
   expect(widget).not.toContain("blipAccent:\n    Color.accent");
 });
 
 // Bubbles are iMessage blue on every theme, white text on them, like Messages.
 // They followed the theme accent until 2.3.3 — red on several Omarchy themes.
 test("outgoing bubbles are always iMessage blue with white text", () => {
-  expect(panel).toContain('readonly property color accent: "#0a84ff"');
-  expect(panel).toContain('readonly property color mineText: "#ffffff"');
+  expect(panel).toContain('readonly property color accent: appearance.accent');
+  expect(readFileSync(new URL('./BlipAppearance.qml', import.meta.url), 'utf8')).toContain('readonly property color accent: "#0a84ff"');
+  expect(panel).toContain('readonly property color mineText: appearance.accentText');
   expect(panel).not.toContain("themeHasAccent");
 });
 

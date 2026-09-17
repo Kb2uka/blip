@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **A Send Later message shows as Scheduled, not sent.** Messages writes a
+  scheduled message into chat.db the moment you queue it, dated at the time it
+  will go out. Blip showed it as already sent, made it the conversation's
+  newest message (a thread jumped to the top of the list with tomorrow's
+  date), and opening that thread would have set its read mark a day ahead,
+  hiding every reply until then. The bridge now flags a waiting Send Later
+  (`schedule_type` 2, `schedule_state` 2), the bubble reads "Scheduled for
+  Sep 17 2:00 PM" in your own time zone, and it never counts as the newest
+  message or moves a watermark or read mark. Once it sends, it is an ordinary
+  message. Found on macOS 27; Send Later itself dates from macOS 15, so older
+  Macs had it too. Re-run `blip-setup` so the Mac picks up the new `imsg`.
+
+- **Fill a security code beside the field.** `otp_autofill=on` offers incoming
+  codes through a Blip prompt using native Linux accessibility, including
+  separate digit boxes. The prompt shares Blip's fonts and colors, falls back
+  to the top right when field bounds are unavailable, and expires after five
+  minutes. No browser extension or clipboard is needed.
+- **Right-click a message to quote it.** Replying to something further up the
+  conversation used to be hidden behind Shift+Page Up, then Ctrl+R. Right-click
+  on a message now offers Quote and reply and Copy message; right-click on a
+  link or its preview offers Open in browser, Copy link and Share link. Quoting
+  puts the quote above whatever you had already typed and never sends. It is a
+  plain "> quote", not an Apple inline reply thread. Right-click on text no
+  longer copies instantly; Copy message is one item away. Thanks @jefehoser (#94).
+- **Super+M no longer closes the wrong window.** The shortcut picked the first
+  window whose title merely started with "Blip", so a focused browser tab or
+  editor called "Blip documentation" got closed instead of Blip opening. It now
+  matches only the real app, the way the window already identifies itself.
+  If you copied the Super+M binding from the README, replace it with the
+  updated example; updating the plugin does not change your Hyprland config.
+  Thanks @jefehoser (#93).
+- **Waking the laptop no longer replays the night's messages as toasts.** Nothing
+  polls while the machine sleeps, so the watermark stood still and every
+  allowlisted message that arrived meanwhile toasted on wake, one
+  `notify-send` at a time, up to twenty, even ones already read on the iPhone.
+  The badge already ignored those (`isUnread` honours Apple's read flag);
+  `selectToasts` now does too. A bridge too old to report `read` toasts as
+  before. Reported by @mwhuss (#89), fixed by @ianswope (#95).
 - **The app window stays on its workspace after idle.** Walking away used to
   remap Blip onto whichever workspace was on screen. A user move is still the
   new home; a screensaver or display-off remap is sent back quietly.

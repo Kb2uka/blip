@@ -218,7 +218,7 @@ BarWidget {
     // `running = true` while it thinks a previous run is alive, which left
     // showApp() "succeeding" without ever focusing (SUPER+M "nothing at all").
     Quickshell.execDetached(["sh", "-c",
-      'for i in 1 2 3 4 5 6 7 8; do a=$(hyprctl clients -j | jq -r \'.[] | select(.title | startswith("Blip")) | .address\' | head -1); [ -n "$a" ] && break; sleep 0.15; done; ' +
+      'for i in 1 2 3 4 5 6 7 8; do a=$(hyprctl clients -j | jq -r \'.[] | select(.class == "org.quickshell" and (.title | test("^Blip( [(][0-9]+[)])?$"))) | .address\' | head -1); [ -n "$a" ] && break; sleep 0.15; done; ' +
       '[ -n "$a" ] && hyprctl dispatch "hl.dsp.focus({ window = \\"address:$a\\" })" >/dev/null'])
   }
   /** Either surface open → keep the deep (complete) thread list. */
@@ -703,6 +703,18 @@ BarWidget {
     function onExited(code, status) { toastWatchdog.stop(); Qt.callLater(root.drainToasts) }
   }
 
+  // Extension-free prompts use Blip's existing code event stream. When on,
+  // only the private autofill helper owns a pending code; the legacy toast,
+  // clipboard and typecode paths do not receive it.
+  property bool otpAutofill: false
+  OtpAutofill { id: otp; enabled: root.leader && root.otpAutofill; appearance: root.appearance }
+  onOtpAutofillChanged: if (otpAutofill) {
+    root.pendingCode = null
+    codeExpiry.stop()
+    root.toastQueue = root.toastQueue.filter(function(t) { return !t.code })
+    notifyProc.toastCode = ""
+  }
+
   // ------------------------------------------------------ security codes
   // macOS reads a 2FA code out of an SMS and offers it to the browser. Blip's
   // version: the collector spots the code, the widget holds it IN MEMORY for
@@ -725,6 +737,7 @@ BarWidget {
     onTriggered: root.pendingCode = null
   }
   function noteCode(c) {
+    if (root.otpAutofill) { otp.receive(c); return }
     if (!c || !c.code) return
     pendingCode = { code: String(c.code), name: String(c.name || c.chat || ""), domain: String(c.domain || ""), ts: String(c.ts || "") }
     codeExpiry.restart()
@@ -837,6 +850,7 @@ BarWidget {
     onFileChanged: reload()
     onLoaded: {
       var t = text()
+      root.otpAutofill = /^\s*otp_autofill\s*=\s*on\s*$/mi.test(t)
       root.automationOn = /^\s*automation\s*=\s*['"]?(on|true|1|yes)\b/mi.test(t)
       // ui_font=theme keeps Omarchy's family even where SF Pro is installed.
       root.uiFontTheme = /^\s*ui_font\s*=\s*['"]?theme\b/mi.test(t)
@@ -844,7 +858,7 @@ BarWidget {
       var n = sm ? parseInt(sm[1], 10) : 0
       root.uiFontSize = (!isFinite(n) || n <= 0) ? 0 : Math.min(24, Math.max(9, n))
     }
-    onLoadFailed: { root.automationOn = false; root.uiFontTheme = false; root.uiFontSize = 0 }
+    onLoadFailed: { root.otpAutofill = false; root.automationOn = false; root.uiFontTheme = false; root.uiFontSize = 0 }
   }
   IpcHandler {
     target: root.moduleName
@@ -856,6 +870,7 @@ BarWidget {
         + " threads=" + root.threads.length + " healthy=" + root.healthy
         + " watch=" + root.watchAlive
         + " read_push=" + (root.readPush !== "" ? root.readPush : "?")
+        + " autofill=" + (root.otpAutofill ? (otp.ready ? "ready" : "starting") : "off")
         + (root.lastError !== "" ? " error=" + root.lastError : "")
     }
     function threads(): string { return root.automationOn ? JSON.stringify(root.threads) : root.automationOff }
@@ -968,5 +983,7 @@ BarWidget {
   // (several Omarchy themes use red, which must stay reserved for alerts, and a
   // red dot on a messaging icon reads as an error). Fred, 2.3.3: "should ALWAYS
   // be BLUE no matter what."
-  readonly property color blipAccent: "#0a84ff"
+  property alias appearance: blipAppearance
+  BlipAppearance { id: blipAppearance; hostWidget: root; themeFont: button.fontFamily }
+  readonly property color blipAccent: blipAppearance.accent
 }

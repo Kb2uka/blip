@@ -49,6 +49,22 @@ to other processes running as you.
 
 Threat model and the audit findings behind these notes: [SECURITY.md](SECURITY.md).
 
+### Security-code autofill
+
+With `otp_autofill=on`, one pending code lives in Blip's private helper for at
+most five minutes. Filling, dismissing, replacing it, disabling autofill or
+exiting clears that reference. Focus changes preserve the original deadline.
+No code is added to a file, process arguments, environment, clipboard or
+notification history. The prompt shows that a code is available, not its digits.
+The original message remains in Messages and Blip's conversation model.
+
+The helper reads native accessibility labels, field types, character counts,
+field bounds and the document origin. It checks nearby inputs to recognize a
+row of digit boxes. It does not read input values or log this metadata. Codes
+and metadata cross bounded inherited pipes; no public autofill IPC is added.
+Enabling autofill enables the session accessibility bus without turning on a
+screen reader. That shared bus remains enabled when Blip stops.
+
 ## On the Mac
 
 | Path | Contains |

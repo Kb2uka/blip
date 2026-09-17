@@ -1,4 +1,5 @@
 import "SendState.mjs" as SendState
+import "MessageActions.mjs" as MessageActions
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -50,57 +51,17 @@ FocusScope {
   property color urgent: Color.urgent
   /** The theme's font, injected by whichever surface hosts this view. */
   property string themeFont: Style.font.family
-  /**
-   * The font Messages actually uses, when this machine has it.
-   *
-   * Omarchy resolves its family to JetBrainsMono system-wide, so every label
-   * here was monospace — the loudest remaining difference from Messages, more
-   * than any spacing. Apple ships SF Pro Text with Messages; a machine themed
-   * to look like a Mac usually already has it, and Qt.fontFamilies() says so
-   * for certain rather than guessing (asking for a missing family silently
-   * yields a default sans, which would be a worse wrong answer than the
-   * theme font).
-   * Order: SF Pro if the machine has it, then Inter — which is OFL-licensed,
-   * ships in Arch's `extra`, and was drawn for exactly this job — then the
-   * theme font, so nothing changes for anyone who has installed neither.
-   * `ui_font=theme` in bridge.conf opts out.
-   *
-   * Blip will never SHIP a font: SF Pro is Apple's and its licence forbids
-   * redistribution, which is why blip-setup installs Inter and only points at
-   * Apple's own download for SF Pro.
-   */
-  readonly property string messagesFont: {
-    var want = ["SF Pro Text", "SF Pro Display", "SF Pro", "Inter"]
-    var have = Qt.fontFamilies()
-    for (var i = 0; i < want.length; i++) if (have.indexOf(want[i]) >= 0) return want[i]
-    return ""
-  }
-  readonly property bool themeFontForced: !!hostWidget && hostWidget.uiFontTheme === true
-  readonly property string fontFamily:
-    (messagesFont !== "" && !themeFontForced) ? messagesFont : themeFont
-  // `ui_font_size=N` in bridge.conf: N is bubble text in px. Unset (0) keeps
-  // Omarchy's tokens. Caption/body keep the same ratios as Style.font.
-  readonly property int uiFontSizePx: {
-    if (!hostWidget) return 0
-    var n = hostWidget.uiFontSize
-    return (typeof n === "number" && n > 0) ? n : 0
-  }
-  readonly property real uiFontScale: {
-    if (uiFontSizePx <= 0) return 1
-    var small = Style.font.bodySmall
-    return small > 0 ? uiFontSizePx / small : 1
-  }
-  readonly property int fontTitle: Math.max(1, Math.round(Style.font.title * uiFontScale))
-  readonly property int fontCaption: Math.max(1, Math.round(Style.font.caption * uiFontScale))
-  readonly property int fontBodySmall: Math.max(1, Math.round(Style.font.bodySmall * uiFontScale))
-  readonly property int fontBody: Math.max(1, Math.round(Style.font.body * uiFontScale))
-  // Secondary text: the foreground at 0.66, as Omarchy's own placeholder text
-  // is. Not Qt.darker: darker is dimmer only on a dark theme — on a light one
-  // it made timestamps heavier than the messages they sit under.
-  readonly property color dim: Qt.alpha(foreground, 0.66)
+  BlipAppearance { id: appearance; hostWidget: root.hostWidget; themeFont: root.themeFont; foreground: root.foreground }
+  readonly property string fontFamily: appearance.fontFamily
+  readonly property real uiFontScale: appearance.uiFontScale
+  readonly property int fontTitle: appearance.fontTitle
+  readonly property int fontCaption: appearance.fontCaption
+  readonly property int fontBodySmall: appearance.fontBodySmall
+  readonly property int fontBody: appearance.fontBody
+  readonly property color dim: appearance.muted
   /** An editor owns the keyboard — the host's key catcher must stand down. */
   readonly property bool editorActive:
-    deleteLoader.active || contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
+    deleteLoader.active || messageMenu.visible || contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
   readonly property alias composeEditor: composeField
   readonly property real contentHeightHint: listContent.implicitHeight
   /** The view wants keyboard navigation focus back (list mode). */
@@ -111,12 +72,12 @@ FocusScope {
   // on the themes where that accent is red "my" messages read as errors;
   // Fred, 2026-09-04: "Yes make the bubbles blue too" — blue bubbles are the
   // look, not a theme preference. White text on that blue, as Messages does.
-  readonly property color accent: "#0a84ff"
+  readonly property color accent: appearance.accent
   readonly property color cyan: accent            // legacy name; accents/links
   readonly property color okColor: accent
 
   readonly property color mineFill: accent
-  readonly property color mineText: "#ffffff"
+  readonly property color mineText: appearance.accentText
   readonly property color theirsFill: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.14)
   // Omarchy's hover-cursor fill for rows and the bubble band alike: the theme's
   // colour and alpha (foreground at 0.08 by default), not a hard-coded copy of them.
@@ -525,6 +486,7 @@ FocusScope {
    *  load still in flight is ignored when it lands, and a share sheet over it
    *  goes too (it belonged to the link you were looking at). */
   function clearThread() {
+    messageMenu.close()
     closeShare()
     peekTimer.stop()
     peeking = false
@@ -606,6 +568,7 @@ FocusScope {
     if (hostWidget && readActive && !peeking) hostWidget.markThreadRead(chat, seen)
   }
   function showThread(t) {
+    messageMenu.close()
     active = t
     activeLastTs = String(t.last_ts || "")
     bubbles = []
@@ -745,9 +708,10 @@ FocusScope {
    *  inline reply is not reachable through the bridge (no message GUID leaves
    *  the Mac and AppleScript has no reply-to), so this is a plain "> quote". */
   function quoteBubble(b) {
-    composeField.text = "> " + String(b.text || "").replace(/\s+/g, " ").slice(0, 200) + "\n"
+    composeField.text = MessageActions.quotedDraft(b, composeField.text)
     composeField.cursorPosition = composeField.length
     leaveBubbles()
+    Qt.callLater(function() { composeField.forceActiveFocus() })
   }
   function markAllRead() {
     if (!root.hostWidget || root.unread === 0) return
@@ -1654,7 +1618,7 @@ FocusScope {
             // real rows; a pending bubble carries this machine's clock.
             var seen = ""
             for (var k = 0; k < list.length; k++) {
-              if (list[k].pending === true) continue
+              if (list[k].pending === true || list[k].scheduled === true) continue
               var ts = String(list[k].ts || ""); if (ts > seen) seen = ts
             }
             // thread.ts hands back the sends it is still waiting on for this
@@ -3490,7 +3454,7 @@ FocusScope {
                     }
                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                     TapHandler { onTapped: root.openLink(String(linkCard.link.url || "")) }
-                    TapHandler { acceptedButtons: Qt.RightButton; onTapped: root.openShare(String(linkCard.link.url || "")) }
+                    TapHandler { acceptedButtons: Qt.RightButton; onTapped: root.openMessageMenu(modelData, String(linkCard.link.url || "")) }
                   }
                   Item { Layout.fillWidth: true; visible: !bubbleRow.mine }
                 }
@@ -3583,14 +3547,13 @@ FocusScope {
                       }
                     }
 
-                    // Links keep their share sheet; message actions use a menu.
+                    // Right-click offers message actions or actions for the clicked link.
                     TapHandler {
                       acceptedButtons: Qt.RightButton
                       onTapped: function(eventPoint) {
                         var p = bubbleText.mapFromItem(bubble, eventPoint.position.x, eventPoint.position.y)
                         var l = bubbleText.hasLink ? bubbleText.linkAt(p.x, p.y) : ""
-                        if (l && l !== "") root.openShare(String(l))
-                        else root.openMessageMenu(bubbleRow.modelData)
+                        root.openMessageMenu(modelData, String(l || ""))
                       }
                     }
 
@@ -3606,7 +3569,8 @@ FocusScope {
                   Layout.fillWidth: true
                   visible: String(modelData.time || "") !== "" ||
                            modelData.edited === true || String(modelData.effect || "") !== "" ||
-                           modelData.failed === true || modelData.pending === true
+                           modelData.failed === true || modelData.pending === true ||
+                           modelData.scheduled === true
                   spacing: 0
                   Item { Layout.fillWidth: true; visible: bubbleRow.mine }
                   Text {
@@ -3616,7 +3580,9 @@ FocusScope {
                     wrapMode: Text.WrapAnywhere
                     text: [modelData.failed === true ? "⚠ Not Delivered" : "",
                            modelData.failed === true ? String(modelData.failureReason || "")
-                             : modelData.pending === true ? "Sending…" : String(modelData.time || ""),
+                             : modelData.pending === true ? "Sending…"
+                             : modelData.scheduled === true ? "Scheduled for " + String(modelData.scheduledFor || "")
+                             : String(modelData.time || ""),
                            modelData.edited === true ? "Edited" : "",
                            String(modelData.effect || "") !== "" ? "sent with " + modelData.effect : ""]
                           .filter(function(s) { return s !== "" }).join(" · ")
@@ -3931,9 +3897,10 @@ FocusScope {
   property var deletingMessage: null
   property int deleteRevision: 0
   property int threadDeleteRevision: 0
-  function openMessageMenu(message) {
+  function openMessageMenu(message, url) {
     if (deleteLoader.active) return
     messageContext = Object.assign({}, message)
+    messageMenu.linkUrl = String(url || "")
     messageMenu.popup()
   }
   function closeDelete() {
@@ -3944,21 +3911,38 @@ FocusScope {
     if (peeking) navigationFocusRequested()
     else focusDefault()
   }
-  Menu {
+  MessageMenu {
     id: messageMenu
-    MenuItem {
-      text: "Copy message"
-      enabled: !!root.messageContext && !!root.messageContext.text
-      onTriggered: root.copyText(String(root.messageContext.text || ""))
-    }
+    objectName: "blipMessageMenu"
+    font.family: root.fontFamily
+    font.pixelSize: root.fontBodySmall
+    palette.window: Color.background
+    palette.base: Color.background
+    palette.text: root.foreground
+    palette.windowText: root.foreground
+    palette.buttonText: root.foreground
+    palette.highlight: root.accent
+    palette.highlightedText: "#ffffff"
+    canQuote: root.messageContext !== null && MessageActions.quoteText(root.messageContext) !== ""
+              && root.online && root.isSendable(root.active)
+    canCopy: root.messageContext !== null && String(root.messageContext.text || "") !== ""
+    onQuoteRequested: if (root.messageContext) root.quoteBubble(root.messageContext)
+    onCopyRequested: if (root.messageContext) root.copyBubble(root.messageContext)
+    onOpenRequested: function(url) { root.openLink(url) }
+    onCopyLinkRequested: function(url) { root.copyText(url) }
+    onShareRequested: function(url) { root.openShare(url) }
+    onClosed: root.messageContext = null
     MenuItem {
       text: "Delete message…"
-      enabled: !!root.messageContext && !!root.messageContext.messageId &&
+      visible: messageMenu.linkUrl === ""
+      height: visible ? implicitHeight : 0
+      enabled: visible && !!root.messageContext && !!root.messageContext.messageId &&
         !!root.messageContext.messageGuid && !!root.messageContext.messageChat &&
         !root.messageContext.pending && !root.messageContext.failed && !root.messageContext.retracted
       onTriggered: root.deletingMessage = Object.assign({}, root.messageContext)
     }
   }
+
   Loader {
     id: deleteLoader
     objectName: "blipMessageDelete"

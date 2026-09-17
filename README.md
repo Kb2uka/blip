@@ -164,10 +164,12 @@ Linux side. If the Mac is asleep, the widget dims and says so.
   this to `~/.config/hypr/bindings.lua` — it asks **Hyprland** where the
   window is (front → close, elsewhere → focus, none → create) instead of
   the plugin, because after an Omarchy plugin update the plugin's IPC can
-  answer from a stale instance until the shell restarts:
+  answer from a stale instance until the shell restarts. Match the Quickshell
+  class and exact app title (`Blip` or `Blip (N)`); a browser or editor titled
+  "Blip documentation" must never be focused or closed by this shortcut:
   ```lua
   o.bind("SUPER + M", "Blip messages", [[sh -c '
-    blip() { hyprctl clients -j | jq -r ".[] | select(.title | startswith(\"Blip\")) | .address" | head -1; }
+    blip() { hyprctl clients -j | jq -r ".[] | select(.class == \"org.quickshell\" and (.title | test(\"^Blip( [(][0-9]+[)])?$\"))) | .address" | head -1; }
     a=$(blip)
     if [ -z "$a" ]; then
       omarchy-shell nixfred.blip app >/dev/null
@@ -680,7 +682,30 @@ qs -p /usr/share/omarchy/shell ipc call nixfred.blip typecode           # type t
 qs -p /usr/share/omarchy/shell ipc call nixfred.blip copycode           # or copy it
 ```
 
-**Security codes.** When a text arrives that looks like a one-time code
+### Security-code autofill
+
+Set `otp_autofill=on` in `~/.config/blip/bridge.conf` to offer new codes beside
+the focused field. Click **Fill code** to insert, or **×** to dismiss. The
+prompt shares Blip's fonts and colors and handles separate digit boxes. Sites
+need not declare `autocomplete="one-time-code"`; accessible labels can identify
+the field. Codes expire after five minutes, even if you change focus.
+
+This uses Linux accessibility, with no browser extension. When field bounds
+are unavailable the prompt appears at the top right; when field metadata is
+unavailable, select the intended input before clicking. Known chat, password,
+phone and search fields are excluded. It does not copy the code or press Enter.
+The field prompt does not require `automation=on` and replaces the legacy
+code toast and `typecode`/`copycode` handling while enabled.
+
+**The text must reach the Mac first.** If it appears only on the iPhone, check
+**Settings → Apps → Messages → Text Message Forwarding** and enable the Mac
+used by Blip. Both devices must use the same Apple Account; Messages in iCloud
+can provide forwarding automatically. See [Apple's forwarding guide](https://support.apple.com/en-au/102545).
+
+Linux dependencies, browser activation and troubleshooting:
+[Autofill setup](docs/AUTOFILL.md).
+
+**Legacy security-code toast.** With autofill off, when a text looks like a one-time code
 ("Your verification code is 483920", "G-482913", the origin-bound
 `@example.com #493857` form), Blip toasts it. Click the toast to copy it, or
 bind `typecode` to a key and it is typed into whatever has focus, the way

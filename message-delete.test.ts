@@ -99,3 +99,27 @@ test('a structured remote refusal takes priority over a transport status',()=>{
   expect(result).toMatchObject({ok:false,uncertain:false});
   expect(result.error).toContain('Accessibility');
 });
+
+test('message menu switches from link actions to an immutable deletion target',()=>{
+  const source=require('node:fs').readFileSync(new URL('./BlipView.qml',import.meta.url),'utf8');
+  const body=source.match(/function openMessageMenu\([^)]*\) \{([\s\S]*?)\n  \}/)[1];
+  let opened=0;
+  const menu={linkUrl:'',popup:()=>opened++};
+  const loader={active:false};
+  const root={messageContext:null as any};
+  const open=new Function('root','deleteLoader','messageMenu','message','url','with(root){'+body+'}');
+  const target={messageId:'1',messageGuid:request.guid,messageChat:request.chat,text:'Synthetic message'};
+  open(root,loader,menu,target,'https://example.com');
+  expect(menu.linkUrl).toBe('https://example.com');
+  open(root,loader,menu,target,undefined);
+  expect(menu.linkUrl).toBe('');
+  expect(root.messageContext).toEqual(target);
+  expect(root.messageContext).not.toBe(target);
+  target.messageId='2';
+  expect(root.messageContext.messageId).toBe('1');
+  loader.active=true;
+  open(root,loader,menu,target,'https://example.com/other');
+  expect(opened).toBe(2);
+  expect(menu.linkUrl).toBe('');
+  expect(root.messageContext.messageId).toBe('1');
+});

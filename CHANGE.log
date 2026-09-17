@@ -1,0 +1,87 @@
+BLIP CHANGE.log
+===============
+
+Running log of every change, newest first, with the person who made it.
+This file feeds X-POSTS.md. Every post about Blip is written from here.
+
+RULES FOR THIS FILE (Fred, 2026-09-16, standing)
+  * Every entry names the person: real name from the commit author, GitHub
+    login, and their X account as a link, https://x.com/<handle>.
+  * A handle is written only when it is verified: the person published it
+    (GitHub twitter_username, GitHub social accounts, or their own site), OR
+    the X account's name matches AND its posts tie it to Omarchy/Blip/Fred.
+    Checked with `gh api users/<login>`, `gh api users/<login>/social_accounts`,
+    their site, then `x user @<handle>` and `x timeline @<handle>`.
+  * No verified handle: write "X: none found (checked YYYY-MM-DD)" so the
+    lookup is visibly done, never silently skipped.
+  * Add the entry in the SAME change that merges the work.
+
+PEOPLE (verified handles)
+  Jon Kinney        github.com/jondkinney   X https://x.com/jondkinney   (GitHub profile)
+  Zach Wilke        github.com/zachwilke    X https://x.com/zachwilke_1  (his site pinefall.dev)
+  Brenden Bishop    github.com/bbishdotdev  X https://x.com/bbishdotdev  (his site bbish.dev; X name matches)
+  Marshall Huss     github.com/mwhuss       X https://x.com/mwhuss       (X name matches; posts about his Omarchy plugin, replies to @NixFred)
+  Danny Cecil       github.com/jefehoser    X https://x.com/jefehoser    (same unique login on X; posts about Omarchy) (confirmed by Fred 2026-09-16)
+  Ian Swope         github.com/ianswope     X: none verified (checked 2026-09-16; @IanSwope exists with the same name but is a dormant account with no tie to Linux or GitHub, so not tagged)
+  cjoh              github.com/cjoh         X: none found (checked 2026-09-16)
+  Fred Nix          github.com/nixfred      X https://x.com/nixfred
+
+Earlier contributors and their handles: CONTRIBUTORS-X-POST.md.
+
+------------------------------------------------------------------------
+LAST X POST: CONTRIBUTORS-X-POST.md (2026-09-11). Everything below the
+marker for Post 2 is in the Post 2 draft in X-POSTS.md.
+------------------------------------------------------------------------
+
+2026-09-16  (direct)  Blip's Mac-side fixes upstreamed as claude-on-mac v2.0.0; contact names rank the owner's book first, then the
+                 largest source within a rank (reconciles claude-on-mac #5). tcc-check says 2 minutes, not 60s.
+                 Fred Nix / Larry, X https://x.com/nixfred
+2026-09-16  (direct)  A waiting Send Later message shows "Scheduled for <time>", not sent; never the newest
+                 message, never moves a read mark. Found checking fnix after its macOS 27 upgrade.
+                 Fred Nix / Larry, X https://x.com/nixfred
+2026-09-16  #92  Offer a security code beside the focused field (opt-in, otp_autofill=on).
+                 AT-SPI insert on click, digit boxes included; code never on argv, clipboard or disk.
+                 Brenden Bishop, github.com/bbishdotdev, X https://x.com/bbishdotdev
+2026-09-16  #94  Right-click a message: Quote and reply, Copy message; a link: Open, Copy, Share.
+                 Danny Cecil, github.com/jefehoser, X https://x.com/jefehoser
+2026-09-16  #93  Super+M only ever touches the real Blip window (exact title, not a prefix).
+                 Danny Cecil, github.com/jefehoser, X https://x.com/jefehoser
+2026-09-16  #95  A message already read on another device never toasts on wake (fixes #89).
+                 Ian Swope, github.com/ianswope, X: none verified
+                 Reported by Marshall Huss, github.com/mwhuss, X https://x.com/mwhuss
+2026-09-15  #80  Timestamps cross the bridge as UTC; local time is display only (fixes #86).
+                 Zach Wilke, github.com/zachwilke, X https://x.com/zachwilke_1
+                 Reported by cjoh, github.com/cjoh, X: none found
+2026-09-15  #82  A message carries every dropped or pasted file, caption on the first, capped at ten.
+                 Zach Wilke, github.com/zachwilke, X https://x.com/zachwilke_1
+2026-09-15  #81  Animated GIFs arrive as their own bytes and animate.
+                 Zach Wilke, github.com/zachwilke, X https://x.com/zachwilke_1
+2026-09-15  #87  The app window stays on its workspace after idle.
+                 Danny Cecil, github.com/jefehoser, X https://x.com/jefehoser
+2026-09-15  #88  Conversation list builds only rows near the viewport; panel fade no longer freezes (441-627 ms stalls measured).
+                 Ian Swope, github.com/ianswope, X: none verified
+2026-09-15  #85  Docked to extra monitors, follower bars stop firing one toast per screen.
+                 Ian Swope, github.com/ianswope, X: none verified
+2026-09-15  #76  No toast for the conversation you already have open.
+                 Ian Swope, github.com/ianswope, X: none verified
+2026-09-15  #75  A 3-4 digit carrier short code (611, 2536) is a DM you can reply STOP to, not a group.
+                 Ian Swope, github.com/ianswope, X: none verified
+2026-09-15  #84  Docs: outbound tapbacks are half possible on macOS 26, not impossible.
+                 Zach Wilke, github.com/zachwilke, X https://x.com/zachwilke_1
+2026-09-15  #77  README allowlist and mutelist examples now parse as strict JSON.
+                 Ian Swope, github.com/ianswope, X: none verified
+2026-09-15  481e555  blip-setup copies only regular files to the Mac, so __pycache__ cannot abort it.
+                 Fred Nix / Larry, X https://x.com/nixfred
+2026-09-13  2.5.0 released.
+2026-09-13  4bad82d  Contact photos stop reloading on every window open (one batch, host cache; ~45 s to instant).
+                 Fred Nix / Larry, X https://x.com/nixfred
+2026-09-13  #54  Sending a link no longer opens the share sheet.
+                 Jon Kinney, github.com/jondkinney, X https://x.com/jondkinney
+2026-09-13  #71  blip-setup passes ssh -n, so its Enter prompts no longer hit EOF.
+                 Ian Swope, github.com/ianswope, X: none verified
+2026-09-13  #74  README says how to remove Blip and what it leaves behind.
+                 Ian Swope, github.com/ianswope, X: none verified
+2026-09-13  #72  Every Text sink declares PlainText, so none can fall back to rich text.
+                 Ian Swope, github.com/ianswope, X: none verified
+2026-09-13  #73  A copied security code reaches wl-copy on stdin, not the environment (/proc leak).
+                 Ian Swope, github.com/ianswope, X: none verified
