@@ -19,7 +19,7 @@ inventory of what lands on disk.
 | `~/.cache/blip/linkpreview/` (0700, files 0600, 7-day TTL) | title, description and picture of pages linked in your messages, for links Messages did not decorate | anything from a page nobody linked you to |
 | `~/.cache/blip/avatars/` (0700, files 0600, 7-day TTL) | contact photos for people in your thread list, named by a hash of the handle; an empty `.none` marker for contacts without one | names, numbers |
 | `$XDG_RUNTIME_DIR/blip/` (tmpfs, 0700) | images pasted into the compose box; a 60s AddressBook dump (`contacts-dump.json`, names, phones, emails) for live new-message search; swept after an hour and gone at logout | message bodies |
-| `~/bin/imsg`, `~/bin/imsg-send`, `~/bin/contacts` | the bridge shim (a bash script) | — |
+| `~/bin/imsg`, `~/bin/imsg-send`, `~/bin/contacts` (or `bin_dir=` in `bridge.conf`) | the bridge shim (a bash script) | — |
 
 **Marking a conversation read is visible to the sender.** Blip can now tell
 Messages on the Mac that you have read something (`push_read=` in

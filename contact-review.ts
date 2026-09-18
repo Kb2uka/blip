@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 /** Read-only contact review. Requests and handles cross bounded stdin; the
  * only stored data is a private, fingerprint-validated scan cache. */
+import { shimPath } from "./shim-path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, mkdirSync,
@@ -250,7 +251,7 @@ export function auditCachePath(): string {
 export function storeFingerprintOnMac(runner: Runner = spawnSync): string {
   const home = process.env.HOME ?? homedir();
   const result: SpawnSyncReturns<string> = runner(
-    join(home, "bin", "contacts"),
+    shimPath("contacts", home),
     ["--json", "resolve"],
     { encoding: "utf8", input: JSON.stringify({ operation: "fingerprint" }),
       timeout: 15000, maxBuffer: MAX_BRIDGE_OUTPUT_BYTES },
@@ -400,7 +401,7 @@ export function auditContactsOnMac(
     if (Buffer.byteLength(input) > MAX_IDENTITY_REQUEST_BYTES) {
       split(batchHandles); return;
     }
-    const result: SpawnSyncReturns<string> = runner(join(home, "bin", "contacts"), ["--json", "resolve"], {
+    const result: SpawnSyncReturns<string> = runner(shimPath("contacts", home), ["--json", "resolve"], {
       encoding: "utf8", input, timeout: Math.min(35000, remaining), maxBuffer: MAX_BRIDGE_OUTPUT_BYTES,
     });
     const stdout = String(result.stdout || "");
@@ -467,7 +468,7 @@ export function resolveOnMac(
   if (operation === "open") request.token = normalizeContactToken(token);
   const home = process.env.HOME ?? homedir();
   const result: SpawnSyncReturns<string> = runner(
-    join(home, "bin", "contacts"),
+    shimPath("contacts", home),
     ["--json", "resolve"],
     {
       encoding: "utf8",

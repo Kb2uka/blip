@@ -1509,7 +1509,7 @@ FocusScope {
     root.reloadTries = 0
     // Body on STDIN (--text-stdin), never argv: argv is readable by every
     // process on this machine and travels through ssh into the Mac's ps.
-    sendProc.command = [root.home + "/bin/imsg-send"].concat(job.target).concat(["--yes", "--text-stdin", "--keep-dashes"])
+    sendProc.command = [(hostWidget ? hostWidget.binDir : root.home + "/bin") + "/imsg-send"].concat(job.target).concat(["--yes", "--text-stdin", "--keep-dashes"])
     sendProc.stdinEnabled = true
     sendProc.running = true
     sendProc.write(job.text)

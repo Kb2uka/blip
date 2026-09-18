@@ -323,7 +323,9 @@ omarchy plugin add https://github.com/nixfred/blip.git --enable
 
 It writes `~/.config/blip/bridge.conf`, adds an ssh ControlMaster block
 (polling costs ~50 ms instead of a handshake), installs the bridge shim as
-`~/bin/imsg`, `~/bin/imsg-send`, `~/bin/contacts`, copies the Mac tools to
+`~/bin/imsg`, `~/bin/imsg-send`, `~/bin/contacts` (set `bin_dir=~/.local/bin`
+in `bridge.conf`, or `BLIP_BIN_DIR`, before running it to install them
+somewhere else — Blip reads the same key to find them), copies the Mac tools to
 `~/.blip/bin` on the Mac and runs `install.sh` there, generates a
 **dedicated ssh key** (`~/.ssh/blip_ed25519`) that the Mac confines to the
 bridge tools and nothing else, then smoke-tests the bridge without printing

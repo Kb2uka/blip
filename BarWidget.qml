@@ -4,6 +4,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import Quickshell.Hyprland
+import "BinDir.mjs" as BinDir
 
 // blip — iMessage in the bar.
 //
@@ -538,8 +539,8 @@ BarWidget {
   property int watchFails: 0
   Process {
     id: watchProc
-    command: [root.home + "/bin/imsg", "watch"]
-    running: root.leader
+    command: [root.binDir + "/imsg", "watch"]
+    running: root.leader && root.bridgeConfLoaded
     // arm liveness at START: a watcher that hangs before "ready" was never
     // killed or restarted (war room #20)
     onStarted: watchLiveness.restart()
@@ -840,6 +841,10 @@ BarWidget {
     }
     onLoadFailed: root.version = ""
   }
+  // Where the bridge shims live (`bin_dir=` in bridge.conf, default ~/bin). The
+  // watcher waits for the first load so it never spawns from the wrong place.
+  property string binDir: root.home + "/bin"
+  property bool bridgeConfLoaded: false
   readonly property string automationOff: "blip: automation=off — set automation=on in ~/.config/blip/bridge.conf to allow ipc send/read"
   FileView {
     id: bridgeConf
@@ -850,14 +855,16 @@ BarWidget {
     onLoaded: {
       var t = text()
       root.otpAutofill = /^\s*otp_autofill\s*=\s*on\s*$/mi.test(t)
+      root.binDir = BinDir.parseBinDir(t, root.home)
       root.automationOn = /^\s*automation\s*=\s*['"]?(on|true|1|yes)\b/mi.test(t)
       // ui_font=theme keeps Omarchy's family even where SF Pro is installed.
       root.uiFontTheme = /^\s*ui_font\s*=\s*['"]?theme\b/mi.test(t)
       var sm = t.match(/^\s*ui_font_size\s*=\s*['"]?(\d+)/mi)
       var n = sm ? parseInt(sm[1], 10) : 0
       root.uiFontSize = (!isFinite(n) || n <= 0) ? 0 : Math.min(24, Math.max(9, n))
+      root.bridgeConfLoaded = true
     }
-    onLoadFailed: { root.otpAutofill = false; root.automationOn = false; root.uiFontTheme = false; root.uiFontSize = 0 }
+    onLoadFailed: { root.otpAutofill = false; root.automationOn = false; root.uiFontTheme = false; root.uiFontSize = 0; root.binDir = root.home + "/bin"; root.bridgeConfLoaded = true }
   }
   IpcHandler {
     target: root.moduleName

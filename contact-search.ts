@@ -12,6 +12,7 @@
  * nobody's contacts.
  */
 
+import { shimPath } from "./shim-path";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -211,7 +212,7 @@ function loadContacts(runner: typeof spawnSync): RawContact[] | "offline" | stri
       if (Array.isArray(parsed)) return (parsed as RawContact[]).map(slimContact);
     }
   } catch { /* miss */ }
-  const res = runner(`${HOME}/bin/contacts`, ["--json", "dump"], {
+  const res = runner(shimPath("contacts"), ["--json", "dump"], {
     encoding: "utf8",
     timeout: 15000, maxBuffer: 64 * 1024 * 1024,
   });

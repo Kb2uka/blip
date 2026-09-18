@@ -8,7 +8,8 @@
 #   2. ~/.ssh/config                 ControlMaster block for the host (47 ms warm
 #                                    round trips — Blip polls; this is required)
 #   3. ~/bin/{imsg,imsg-send,imsg-read,contacts}  the bridge shim (existing files backed up;
-#                                    claude-on-mac remote shims are left alone)
+#                                    claude-on-mac remote shims are left alone). bin_dir= in
+#                                    bridge.conf, or BLIP_BIN_DIR, installs them elsewhere
 #   4. Mac install                   copies bridge/mac to the Mac and runs
 #                                    install.sh there (needs ssh access already)
 #   5. smoke test                    imsg recent 1 through the shim
@@ -32,11 +33,26 @@ conf_dir="$HOME/.config/blip"
 conf="$conf_dir/bridge.conf"
 
 # bridge.conf is DATA (audit #7): read the two keys we care about, never source it.
-prev_automation=""; prev_country=""
+prev_automation=""; prev_country=""; prev_bin_dir=""
 if [[ -r "$conf" ]]; then
   [[ -z "$host" ]] && host="$(sed -n 's/^host=//p' "$conf" | head -1 | tr -d '"\x27 ')"
   prev_automation="$(sed -n 's/^automation=//p' "$conf" | head -1 | tr -d '"\x27 ')"
   prev_country="$(sed -n 's/^country_code=//p' "$conf" | head -1 | tr -d '"\x27 ')"
+  prev_bin_dir="$(sed -n 's/^[[:space:]]*bin_dir[[:space:]]*=//p' "$conf" | head -1 | tr -d '"\x27 ')"
+fi
+# Where the shims go. Same rules as bin-dir.ts, so Blip looks where we install:
+# ~ and $HOME expand here; anything but a plain absolute path means ~/bin.
+bin_dir="${BLIP_BIN_DIR:-${prev_bin_dir:-}}"
+case "$bin_dir" in
+  \~|'$HOME'|'${HOME}') bin_dir="$HOME" ;;
+  \~/*) bin_dir="$HOME/${bin_dir#\~/}" ;;
+  '$HOME/'*) bin_dir="$HOME/${bin_dir#'$HOME/'}" ;;
+  '${HOME}/'*) bin_dir="$HOME/${bin_dir#'${HOME}/'}" ;;
+esac
+while [[ "$bin_dir" == */ ]]; do bin_dir="${bin_dir%/}"; done
+if [[ -z "$bin_dir" ]] || ! [[ "$bin_dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ "/$bin_dir/" == */../* ]]; then
+  [[ -n "$bin_dir" ]] && echo "• bin_dir '$bin_dir' is not a plain absolute path — using ~/bin" >&2
+  bin_dir="$HOME/bin"
 fi
 if [[ -z "${host:-}" ]]; then
   read -r -p "Mac ssh target ([user@]host, Tailscale name works best): " host
@@ -52,10 +68,10 @@ fi
 # spell, otp_autofill, ui_font, ui_font_size, anything set by hand — must survive
 # a re-run; a wholesale rewrite silently re-enabled what the user had turned off (Astra #18).
 kept=""
-[[ -r "$conf" ]] && kept="$(grep -vE '^[[:space:]]*(#|$|host=|remote_bin=|python=|key=|automation=|country_code=)' "$conf" || true)"
+[[ -r "$conf" ]] && kept="$(grep -vE '^[[:space:]]*(#|$|host=|remote_bin=|python=|key=|automation=|country_code=|bin_dir[[:space:]]*=)' "$conf" || true)"
 mkdir -p "$conf_dir"
 {
-  echo "# Blip bridge — read (never sourced) by ~/bin/imsg, imsg-send, imsg-read, contacts"
+  echo "# Blip bridge — read (never sourced) by the imsg, imsg-send, imsg-read, contacts shims"
   echo "host=$host"
   echo "# single-quoted on purpose: expanded on the MAC, not here"
   echo "remote_bin='\$HOME/.blip/bin'"
@@ -65,6 +81,10 @@ mkdir -p "$conf_dir"
   echo "automation=${BLIP_AUTOMATION:-${prev_automation:-off}}"   # a re-run keeps a hand-set value
   echo "# country calling code for numbers typed without one (1 = US/Canada, 44 = UK, 49 = DE…)"
   echo "country_code=${prev_country:-1}"
+  if [[ "$bin_dir" != "$HOME/bin" ]]; then
+    echo "# where the Linux-side shims live (default ~/bin)"
+    echo "bin_dir=$bin_dir"
+  fi
   if [[ -n "$kept" ]]; then echo "# kept from the previous bridge.conf"; printf '%s\n' "$kept"; fi
 } > "$conf"
 chmod 0600 "$conf"
@@ -91,16 +111,16 @@ else
 fi
 
 # 3. shims
-mkdir -p "$HOME/bin"
+mkdir -p "$bin_dir"
 for t in imsg imsg-send imsg-read contacts; do
-  target="$HOME/bin/$t"
+  target="$bin_dir/$t"
   if [[ -e "$target" && ! -L "$target" ]] && ! grep -q "blip-shim" "$target" 2>/dev/null; then
     cp -p "$target" "$target.pre-blip.$(date +%s)"
     echo "• backed up existing $target"
   fi
   install -m 0755 "$here/bridge/linux/blip-shim" "$target"
 done
-echo "✓ shims installed: ~/bin/imsg ~/bin/imsg-send ~/bin/imsg-read ~/bin/contacts"
+echo "✓ shims installed in $bin_dir: imsg imsg-send imsg-read contacts"
 
 # The from= option for the Blip key's authorized_keys line. $1 = the address
 # this machine reached the Mac from. Over Tailscale that address is a stable
@@ -202,7 +222,7 @@ fi
 echo
 # Content-free on purpose: a message body echoed raw into a terminal is an
 # escape-sequence injection vector (audit / war room #53) and a shoulder-surf.
-if out="$("$HOME/bin/imsg" --json recent 1 2>&1)"; then
+if out="$("$bin_dir/imsg" --json recent 1 2>&1)"; then
   n="$(printf '%s' "$out" | jq -r 'length' 2>/dev/null || echo "?")"
   echo "✓ bridge is up — $n message(s) readable through the shim"
   echo
