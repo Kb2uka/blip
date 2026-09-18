@@ -1,8 +1,12 @@
 # Blip X posts
 
 The queue of posts for @nixfred about Blip. Larry drafts, Fred reads and posts.
-A new post is drafted whenever CHANGE.log has collected enough since the last
-one. Source of every fact and every @: CHANGE.log.
+
+CADENCE: a contributor update goes out WEEKLY (Sunday). It is drafted from that
+week's section of `WEEKLY-NOTES.md`, which is written as the work lands, never
+reconstructed on the day. `CHANGE.log` is the raw running log underneath both
+and holds the handle-verification rules. A bigger post can still go out between
+Sundays when something warrants it.
 
 Rules: every contributor is named, and tagged with their verified X handle
 when one exists (see CHANGE.log for how it was verified). Facts, real numbers,
@@ -12,6 +16,7 @@ no pomp, no em dashes. Plain text below the marker; X renders no markdown.
 |---|--------|------|--------|
 | 1 | POSTED | 2026-09-11 | Everyone through 2.4.x: CONTRIBUTORS-X-POST.md |
 | 2 | DRAFT, ready | 2026-09-16 | 19 merged PRs since Post 1, 2.5.0 and Unreleased |
+| 3 | DUE Sun 20 Sep | 2026-W38 | Weekly contributor update, notes in WEEKLY-NOTES.md |
 
 ---
 
