@@ -38,6 +38,14 @@ import {
   saveState,
   selectToasts,
   toastKey,
+  windowCutoff,
+  staleUnreadChats,
+  coversBoundary,
+  fetchChatBack,
+  CATCHUP_CHAT_MAX,
+  mergeCatchupRows,
+  keepUnverifiedUnread,
+  CATCHUP_CHAT_ROWS,
   unreadCounts,
   unreadOldest,
   type ImsgMessage,
@@ -350,6 +358,126 @@ describe("displayName", () => {
     // isGroupChat() files that shape as not-a-DM, so the list labels it through groupName.
     expect(isGroupChat("+18184632606(filtered)")).toBe(true);
     expect(groupName("+18184632606(filtered)", undefined, new Map())).toBe("+18184632606");
+  });
+});
+
+describe("catch-up reconciles each unread against its own boundary", () => {
+  const state = { unreadInitialized: true, watermark: "2026-09-16T12:00:00Z", readMark: "2026-09-01T00:00:00Z" };
+
+  // The bug: one never-opened dot from weeks ago set the fetch depth for every
+  // poll, so the window doubled 150 -> 8192 across that many sequential ssh
+  // calls forever. Measured 2026-09-16: a 45-day-old unread cost 6 calls,
+  // 4798 rows and 3.18 s against a 6 s poll timer.
+  test("a stale unread no longer drags the window cutoff back", () => {
+    expect(windowCutoff(state)).toBe(state.watermark);
+    // the migration case still seeds from the read mark
+    expect(windowCutoff({ ...state, unreadInitialized: false })).toBe(state.readMark);
+  });
+
+  test("only chats the window missed are caught up, oldest boundary first", () => {
+    const oldest = {
+      old: "2026-08-01T00:00:00Z",
+      older: "2026-07-01T00:00:00Z",
+      recent: "2026-09-16T13:00:00Z",
+      empty: "2026-06-01T00:00:00Z",
+    };
+    const counts = { old: 1, older: 2, recent: 5, empty: 0 };
+    const covered = "2026-09-16T11:00:00Z";
+    // "recent" is inside the window and "empty" has nothing outstanding
+    expect(staleUnreadChats(oldest, counts, covered)).toEqual(["older", "old"]);
+    // no window rows at all covers nothing, so nothing is stale
+    expect(staleUnreadChats(oldest, counts, "")).toEqual([]);
+  });
+
+  test("a short read covers the boundary — that is how a deleted unread is noticed", () => {
+    const short = { ok: true, online: true, error: "", msgs: [msg({ ts: "2026-09-10T00:00:00Z" })], fetchedCount: 3 };
+    // The boundary row is not there at all: the conversation has no more rows,
+    // so the count computed from these IS the truth and the dot goes away.
+    expect(coversBoundary(short, "2026-08-01T00:00:00Z", CATCHUP_CHAT_ROWS)).toBe(true);
+  });
+
+  test("a full read counts as covered only if it reached past the boundary", () => {
+    const full = (from: string) => ({
+      ok: true, online: true, error: "",
+      msgs: [msg({ ts: from }), msg({ ts: "2026-09-16T00:00:00Z" })],
+      fetchedCount: CATCHUP_CHAT_ROWS,
+    });
+    expect(coversBoundary(full("2026-07-01T00:00:00Z"), "2026-08-01T00:00:00Z")).toBe(true);
+    expect(coversBoundary(full("2026-09-01T00:00:00Z"), "2026-08-01T00:00:00Z")).toBe(false);
+    const failed = { ok: false, online: false, error: "offline", msgs: [], fetchedCount: 0 };
+    expect(coversBoundary(failed, "2026-08-01T00:00:00Z")).toBe(false);
+  });
+
+  test("catch-up rows join the window once each", () => {
+    const a = msg({ id: 1, ts: "2026-09-16T12:00:00Z" });
+    const b = msg({ id: 2, ts: "2026-08-01T00:00:00Z" });
+    const merged = mergeCatchupRows([a], [a, b]);
+    expect(merged.map((m) => m.id)).toEqual([1, 2]);
+    // a bridge that omits ROWIDs must not lose rows to the dedupe
+    const bare = mergeCatchupRows([msg({ ts: "2026-09-16T12:00:00Z" })], [msg({ ts: "2026-08-01T00:00:00Z" })]);
+    expect(bare).toHaveLength(2);
+  });
+
+  test("one busy conversation escalates alone, and stops at its own ceiling", () => {
+    // The whole point of the change: depth is spent on the chat that needs it.
+    const asked: number[] = [];
+    const runner = ((_cmd: string, args: string[]) => {
+      const limit = Number(args[args.length - 1]);
+      asked.push(limit);
+      // A conversation with more rows than the ceiling: every page comes back
+      // full and never reaches back to the boundary.
+      const msgs = Array.from({ length: limit }, (_, i) =>
+        ({ ...msg({ ts: "2026-09-0" + (1 + (i % 9)) + "T00:00:00Z" }) }));
+      return { status: 0, stdout: JSON.stringify(msgs), stderr: "", error: undefined };
+    }) as never;
+
+    const out = fetchChatBack("+15550100002", "2026-06-01T00:00:00Z", runner);
+    expect(asked).toEqual([400, 800, 1600, 3200]);
+    expect(asked[asked.length - 1]).toBe(CATCHUP_CHAT_MAX);
+    expect(out.capped).toBe(true);   // -> the caller keeps that chat's count
+  });
+
+  test("a quiet conversation is one call, and is not capped", () => {
+    const asked: number[] = [];
+    const runner = ((_cmd: string, args: string[]) => {
+      asked.push(Number(args[args.length - 1]));
+      // 12 rows total: short of the ask, so the whole tail is in hand
+      const msgs = Array.from({ length: 12 }, () => msg({ ts: "2026-07-01T00:00:00Z" }));
+      return { status: 0, stdout: JSON.stringify(msgs), stderr: "", error: undefined };
+    }) as never;
+
+    const out = fetchChatBack("878478", "2026-06-01T00:00:00Z", runner);
+    expect(asked).toEqual([400]);
+    expect(out.capped).toBeUndefined();
+  });
+
+  test("a conversation the catch-up could not verify keeps its dots", () => {
+    const counts = { a: 0, b: 3 };
+    const oldest = { b: "2026-09-16T12:00:00Z" };
+    const kept = keepUnverifiedUnread(
+      counts, oldest,
+      { a: 4, b: 1 }, { a: "2026-07-01T00:00:00Z", b: "2026-06-01T00:00:00Z" },
+      new Set(["a"]),
+    );
+    // "a" was not reached this poll: the window saw none of its rows, so the
+    // ledger keeps what it knew rather than reporting the undercount.
+    expect(kept.counts.a).toBe(4);
+    expect(kept.oldest.a).toBe("2026-07-01T00:00:00Z");
+    // "b" was verified, so this poll's exact count stands even though it is lower
+    expect(kept.counts.b).toBe(3);
+    expect(kept.oldest.b).toBe("2026-09-16T12:00:00Z");
+  });
+
+  test("new arrivals still raise an unverified chat's count", () => {
+    const kept = keepUnverifiedUnread(
+      { a: 6 }, { a: "2026-09-16T12:00:00Z" },
+      { a: 4 }, { a: "2026-07-01T00:00:00Z" },
+      new Set(["a"]),
+    );
+    expect(kept.counts.a).toBe(6);
+    // and the older boundary is the one that survives, so the next poll still
+    // knows how far back this chat has to be reconciled
+    expect(kept.oldest.a).toBe("2026-07-01T00:00:00Z");
   });
 });
 

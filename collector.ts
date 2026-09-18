@@ -1263,6 +1263,158 @@ export function fetchMessagesAfter(
 }
 
 /**
+ * A per-chat catch-up fetch: how many rows one conversation is asked for, and
+ * how many conversations one poll will ask about.
+ *
+ * The ledger has to cover every outstanding unread row so a message deleted or
+ * read elsewhere is reconciled. That boundary is PER CHAT (`unreadOldest`), but
+ * it used to be collapsed into one global minimum and handed to the window
+ * fetch, so a single never-opened unread dragged the whole preview window back
+ * to its date on every poll: 150 -> 300 -> ... -> 8192 rows across that many
+ * SEQUENTIAL ssh calls, forever, for one dot. Measured on the gateway Mac
+ * 2026-09-16, a 45-day-old unread cost 6 calls, 4798 rows and 3.18 s per poll
+ * against a 6 s timer. Each chat now gets ONE bounded fetch of its own instead.
+ */
+export const CATCHUP_CHAT_ROWS = 400;
+export const CATCHUP_CHAT_MAX = 3200;
+export const CATCHUP_MAX_CHATS = 4;
+
+/**
+ * How far back the preview window reaches: NEW arrivals only. On migration it
+ * seeds from the last read mark instead, so the first run after an upgrade
+ * counts the whole backlog once.
+ *
+ * It used to reach back to the oldest outstanding unread ANYWHERE, so that the
+ * ledger covered every unread row and a deletion was reconciled. One chat's
+ * boundary therefore set every chat's fetch depth, and a dot nobody ever opened
+ * held the window open at its own date for good. Those boundaries are per chat
+ * and are now spent per chat — see `staleUnreadChats` below.
+ */
+export function windowCutoff(
+  state: Pick<BlipState, "unreadInitialized" | "watermark" | "readMark">,
+): string {
+  return state.unreadInitialized ? state.watermark : state.readMark;
+}
+
+/**
+ * Conversations whose oldest outstanding unread sits below what the window
+ * reached, oldest boundary first — the ones that used to drag the window back.
+ * `coveredFrom` is the oldest row the window actually returned; an empty
+ * window (or an empty boundary) covers nothing, so nothing is stale.
+ */
+export function staleUnreadChats(
+  unreadOldest: Record<string, string>,
+  counts: Record<string, number>,
+  coveredFrom: string,
+): string[] {
+  if (!coveredFrom) return [];
+  return Object.entries(unreadOldest)
+    .filter(([chat, ts]) => ts && ts < coveredFrom && (counts[chat] ?? 0) > 0)
+    .sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
+    .map(([chat]) => chat);
+}
+
+/** One conversation's own rows — `imsg thread --chat`, the same door as thread.ts. */
+export function fetchChatRows(
+  chat: string,
+  limit = CATCHUP_CHAT_ROWS,
+  runner = spawnSync,
+): FetchResult {
+  const res = runner(`${HOME}/bin/imsg`, ["--json", "thread", "--chat", chat, String(limit)], {
+    encoding: "utf8",
+    timeout: 15000, maxBuffer: 64 * 1024 * 1024,
+  });
+  if (res.error || res.status !== 0) {
+    return {
+      ok: false,
+      online: res.status !== null,
+      error: `catch-up fetch failed for one conversation`,
+      msgs: [], fetchedCount: 0,
+    };
+  }
+  try {
+    const parsed = JSON.parse(res.stdout as string);
+    if (!Array.isArray(parsed)) throw new Error("not an array");
+    const msgs = (parsed as ImsgMessage[]).filter(hasIdentity).map(normalizeMsgStamps);
+    return { ok: true, online: true, error: "", msgs, fetchedCount: parsed.length };
+  } catch {
+    return { ok: false, online: true, error: "bad JSON from imsg thread", msgs: [], fetchedCount: 0 };
+  }
+}
+
+/**
+ * Did a per-chat fetch actually reach that chat's boundary? Short of the limit
+ * means the conversation has no more rows — the whole tail is in hand, which is
+ * also how a DELETED unread row is noticed: the boundary is simply not there.
+ */
+export function coversBoundary(fetched: FetchResult, boundary: string, limit = CATCHUP_CHAT_ROWS): boolean {
+  if (!fetched.ok) return false;
+  if (fetched.fetchedCount < limit) return true;
+  const from = minTs(fetched.msgs, "");
+  return from !== "" && from <= boundary;
+}
+
+/**
+ * One conversation's rows back to its own boundary, doubling only that
+ * conversation's ask — 400 rows reaches years back in the quiet threads where a
+ * never-opened dot actually lives, and a busy one escalates alone instead of
+ * dragging every other conversation's rows along with it. `capped` means the
+ * ceiling came first: the caller keeps that chat's existing count.
+ *
+ * `imsg thread` bounds by row count, not by date; a `--since` on the bridge
+ * would make this one exact call.
+ */
+export function fetchChatBack(chat: string, boundary: string, runner = spawnSync): FetchResult {
+  let limit = CATCHUP_CHAT_ROWS;
+  while (true) {
+    const got = fetchChatRows(chat, limit, runner);
+    if (!got.ok) return got;
+    if (coversBoundary(got, boundary, limit)) return got;
+    if (limit >= CATCHUP_CHAT_MAX) return { ...got, capped: true };
+    limit *= 2;
+  }
+}
+
+/** Window rows plus per-chat catch-up rows, each message once (chat.db ROWID). */
+export function mergeCatchupRows(window: ImsgMessage[], extra: ImsgMessage[]): ImsgMessage[] {
+  if (!extra.length) return window;
+  const seen = new Set(window.map((m) => m.id).filter((id) => id !== undefined));
+  const out = [...window];
+  for (const m of extra) {
+    if (m.id !== undefined && seen.has(m.id)) continue;
+    if (m.id !== undefined) seen.add(m.id);
+    out.push(m);
+  }
+  return out;
+}
+
+/**
+ * A chat the catch-up could not verify keeps the count it already had. The
+ * ledger only ever grows here, which is the safe direction: an unread that IS
+ * gone survives until the conversation is opened (which deletes its entry
+ * outright) or a later poll reaches its boundary, whereas the other direction
+ * would silently drop a real dot.
+ */
+export function keepUnverifiedUnread(
+  counts: Record<string, number>,
+  oldest: Record<string, string>,
+  priorCounts: Record<string, number>,
+  priorOldest: Record<string, string>,
+  unverified: Set<string>,
+): { counts: Record<string, number>; oldest: Record<string, string> } {
+  const out = { ...counts };
+  const from = { ...oldest };
+  for (const chat of unverified) {
+    const prior = priorCounts[chat] ?? 0;
+    if (prior <= 0) continue;
+    if ((out[chat] ?? 0) < prior) out[chat] = prior;
+    const priorFrom = priorOldest[chat];
+    if (priorFrom && (!from[chat] || priorFrom < from[chat]!)) from[chat] = priorFrom;
+  }
+  return { counts: out, oldest: from };
+}
+
+/**
  * A message is unread iff BOTH sides say so:
  *   - Apple side: chat.db `is_read` = 0 (imsg ≥1.9.0 emits `read`; it syncs
  *     from the iPhone via Messages in iCloud) — reading on the PHONE clears
@@ -1662,16 +1814,7 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   // measured against and therefore has to be in the wire format.
   const producedAt = new Date().toISOString();
   const state = loadState();
-  // On migration, seed the ledger all the way back to what the user last read.
-  // Thereafter cover both new arrivals and every outstanding unread row. That
-  // makes the ledger exact even if an unread message is deleted on the Mac.
-  const oldestUnread = Object.values(state.unreadOldest).reduce(
-    (oldest, ts) => !oldest || ts < oldest ? ts : oldest,
-    "",
-  );
-  const cutoff = state.unreadInitialized
-    ? oldestUnread && oldestUnread < state.watermark ? oldestUnread : state.watermark
-    : state.readMark;
+  const cutoff = windowCutoff(state);
   const fetched = fetchMessagesAfter(cutoff, deep ? DEEP_WINDOW : POLL_WINDOW);
 
   if (!fetched.ok) {
@@ -1696,6 +1839,21 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
       codes: [],
       deep: false,
     };
+  }
+
+  // Reconcile every outstanding unread the window did not reach, one bounded
+  // fetch per conversation, oldest boundary first. A chat left unverified — the
+  // fetch failed, the conversation has more rows than the limit, or it sat past
+  // the per-poll cap — keeps the count it already had (never fewer), which is
+  // what the capped global walk did for the same chats before.
+  const stale = staleUnreadChats(state.unreadOldest, state.unreadCounts, minTs(fetched.msgs, ""));
+  const unverified = new Set<string>(stale.slice(CATCHUP_MAX_CHATS));
+  let caughtUp = fetched.msgs;
+  for (const chat of stale.slice(0, CATCHUP_MAX_CHATS)) {
+    const rows = fetchChatBack(chat, state.unreadOldest[chat] ?? "");
+    if (!rows.ok) { unverified.add(chat); continue; }
+    caughtUp = mergeCatchupRows(caughtUp, rows.msgs);
+    if (rows.capped) unverified.add(chat);
   }
 
   const highest = maxTs(fetched.msgs, state.watermark);
@@ -1743,7 +1901,11 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   // absent from the ledger, the thread list and the toasts alike, exactly as
   // if the Mac had never received it. Read fresh each poll, like the allowlist.
   const mute = loadMutelist();
-  const deduped = dedupeSelfEcho(fetched.msgs, selfChats);
+  // The catch-up rows join HERE, where the ledger is counted — not in the
+  // watermark, the failure ring or the toast gates above: every one of them is
+  // older than the watermark by construction, and a message that scrolled out
+  // of the window months ago must not toast now.
+  const deduped = dedupeSelfEcho(caughtUp, selfChats);
   const muted = mutedChats(deduped, mute);
   const msgs = dropMuted(deduped, muted);
   let exactCounts = unreadCounts(msgs, state.readMark, state.readMarks, selfChats);
@@ -1758,6 +1920,13 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
       exactCounts, exactOldest,
       state.unreadCounts, state.unreadOldest,
       inWindow, visibleLedgerChats(msgs, listed),
+    );
+    exactCounts = kept.counts;
+    exactOldest = kept.oldest;
+  }
+  if (unverified.size) {
+    const kept = keepUnverifiedUnread(
+      exactCounts, exactOldest, state.unreadCounts, state.unreadOldest, unverified,
     );
     exactCounts = kept.counts;
     exactOldest = kept.oldest;

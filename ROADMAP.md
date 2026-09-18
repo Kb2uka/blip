@@ -204,9 +204,13 @@ panel (3 lenses × finding, against current main) confirmed 11 closed and
   `state.json` marks migrate on load. Covered by `timezone.test.ts` and
   `bridge/mac/test_wire_time.py` (both pin a zone; the rest of the suite runs
   at UTC, where the bug is invisible).
-- [ ] **One never-opened unread pins the catch-up loop** — every poll walks
-  150→8192 rows across sequential ssh calls. Cache the reconciliation
-  boundary per chat.
+- [x] **One never-opened unread pinned the catch-up loop** — fixed: the window
+  fetch stops at the watermark, and each outstanding unread is reconciled
+  against its OWN boundary with one bounded `thread --chat` fetch that
+  escalates alone (`windowCutoff`, `staleUnreadChats`, `fetchChatBack`). A
+  chat the fetch cannot reach keeps the count it had rather than reporting an
+  undercount. Measured with a 45-day-old dot, one poll: 6 bridge calls /
+  4798 rows / 3.2 s → 2-3 calls / 250-950 rows / 0.9 s, same unread count.
 - [x] Window marks read only while focused (2.2.0, Hyprland active toplevel).
 - [x] Toasts fire for the conversation being read — `selectToasts()` never
   saw `readChat`, so BOTH surfaces toasted, not just the bar popout. It is

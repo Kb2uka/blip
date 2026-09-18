@@ -108,6 +108,24 @@ what it is handed. Keep it that way.
   metadata without message bodies. Catch-up fetches cover new arrivals and the
   oldest outstanding unread so deletions are reconciled; never derive the total
   badge solely from the preview window.
+  **That coverage is PER CHAT, and is spent per chat.** The preview window
+  reaches back to the watermark (`windowCutoff`) — new arrivals. A chat whose
+  boundary sits below what the window returned gets ONE bounded `thread --chat`
+  fetch of its own (`staleUnreadChats` → `fetchChatBack`, 400 rows doubling to
+  3200 for that conversation alone), and those rows join at the LEDGER only:
+  not the watermark, not the failure ring, not the toast gates, all of which
+  the rows predate by construction — a message that scrolled out of the window
+  months ago must not toast now. Collapsing the boundaries into one global
+  minimum and handing it to the window fetch is what pinned the catch-up loop:
+  one never-opened dot set the fetch depth for EVERY poll, 150 → 8192 rows
+  across that many sequential ssh calls (a 45-day-old dot measured 6 calls,
+  4798 rows, 3.18 s against a 6 s timer, 2026-09-16). A chat the fetch cannot
+  verify — it failed, the conversation is longer than the ceiling, or it sat
+  past the four-per-poll cap — KEEPS the count it had. The ledger only grows
+  there: a dot that is really gone survives until the conversation is opened or
+  a later poll reaches it, whereas the other direction silently drops a real
+  one. `imsg thread` bounds by rows, not date; a bridge-side `--since` would
+  make each of these one exact call.
 - **Dedupe the self-thread before counting.** A message you send yourself lands
   twice (`from_me` true and false, same ts+text). `dedupeSelfEcho()` runs before
   `buildThreads()` and before `decorate()`.

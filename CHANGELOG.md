@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **One never-opened unread no longer slows every poll.** The ledger has to
+  cover every outstanding unread so a message deleted or read on another device
+  is reconciled, but that boundary was collapsed into one global minimum and
+  handed to the preview window, so a single dot nobody ever opened set the fetch
+  depth for every poll: 150 rows doubling to 8192 across that many sequential
+  ssh calls, for as long as it sat there. A 45-day-old dot cost 6 bridge calls,
+  4798 rows and 3.18 s against a 6 s timer. The window now stops at the
+  watermark and each conversation the window missed gets one bounded fetch of
+  its own, oldest first, four per poll. A conversation the fetch cannot verify
+  keeps the count it had, so a real dot is never dropped. Measured here with a
+  six-week-old dot: 1.8 s to 0.63 s per poll, same unread count.
+  Thanks @ianswope (#98).
 - **A Send Later message shows as Scheduled, not sent.** Messages writes a
   scheduled message into chat.db the moment you queue it, dated at the time it
   will go out. Blip showed it as already sent, made it the conversation's
