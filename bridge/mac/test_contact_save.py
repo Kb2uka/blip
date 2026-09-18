@@ -115,6 +115,43 @@ class ContactSaveTransportTests(unittest.TestCase):
             self.assertEqual(module.check_duplicates({**REQUEST, "handle": "+12025550187", "phone": "+12025550187"}, self.bin / "contact-save.js"),
                              {"ok": False, "code": "unavailable"})
 
+    def test_phone_matcher_uses_the_bridge_public_entry_point(self):
+        # imsg exposes parse_phone/same_number as a contract. A bridge carrying
+        # only the private names must not satisfy this call: that is the
+        # re-vendor rename that used to turn every regional duplicate check
+        # into a silent "unavailable".
+        public = self.root / "public"
+        public.mkdir()
+        (public / "imsg").write_text(
+            "def _parse_phone(raw):\n    return ('1', '2025550187')\n"
+            "def _same_number(handle, card):\n    return True\n"
+            "parse_phone = _parse_phone\n"
+            "same_number = _same_number\n")
+        parse, matches = module.phone_matcher(public / "contact-save.js")
+        self.assertEqual(parse("+12025550187"), ("1", "2025550187"))
+        self.assertTrue(matches(("1", "2025550187"), ("1", "2025550187")))
+
+        private = self.root / "private"
+        private.mkdir()
+        (private / "imsg").write_text(
+            "def _parse_phone(raw):\n    return None\n"
+            "def _same_number(handle, card):\n    return False\n")
+        with self.assertRaises(AttributeError):
+            module.phone_matcher(private / "contact-save.js")
+
+    def test_private_only_bridge_reports_unavailable_rather_than_matching(self):
+        # And the caller still fails closed: an unusable matcher blocks the
+        # create, it never lets a duplicate through.
+        private = self.root / "private_only"
+        private.mkdir()
+        (private / "imsg").write_text("def _parse_phone(raw):\n    return None\n")
+        response = {"ok": True, "duplicate": False, "phones": ["+12025550187"]}
+        with patch.object(module, "invoke", lambda *args: response):
+            self.assertEqual(
+                module.check_duplicates({**REQUEST, "handle": "+12025550187", "phone": "+12025550187"},
+                                        private / "contact-save.js"),
+                {"ok": False, "code": "unavailable"})
+
     def test_duplicate_inspection_failure_blocks_creation(self):
         for response in [{"ok": False}, {"ok": True}, {"ok": True, "duplicate": False, "phones": [None]},
                          {"ok": True, "duplicate": False, "phones": ["x"] * 65}]:

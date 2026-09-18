@@ -98,13 +98,16 @@ def invoke(payload, helper):
 
 def phone_matcher(helper):
     # Reuse the bridge's tested region and calling-code comparison, without
-    # opening Messages or reading conversation data.
+    # opening Messages or reading conversation data. parse_phone/same_number
+    # are imsg's supported entry point for exactly this: a re-vendor that
+    # renames the private functions breaks imsg's own import, loudly, instead
+    # of leaving this check to fail closed without anyone noticing.
     source = str(helper.with_name("imsg"))
     loader = importlib.machinery.SourceFileLoader("blip_contact_phone_match", source)
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
-    return module._parse_phone, module._same_number
+    return module.parse_phone, module.same_number
 
 
 def check_duplicates(request, helper):
