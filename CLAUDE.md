@@ -263,7 +263,7 @@ what it is handed. Keep it that way.
 - **Configuration is `bridge.conf` keys, not a settings system.** Blip has one
   config file (`~/.config/blip/bridge.conf`, parsed not sourced) carrying
   `host`, `remote_bin`, `automation`, `ui_font_size`, `ui_font_theme`,
-  `link_previews`, `push_read`, `hide_spam`, `hide_unknown`, plus the mute list. Anything worth configuring
+  `link_previews`, `push_read`, `hide_spam`, `hide_unknown`, `prefer_imessage`, plus the mute list. Anything worth configuring
   becomes another key. Settled 2026-09-04 against PR #21, which proposed a
   `preferences.json` with eleven knobs and a ~1300-line settings panel: it was
   careful work (atomic, 0600, ownership and size validated) and was still the

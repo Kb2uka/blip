@@ -31,6 +31,19 @@
   keeps the count it had, so a real dot is never dropped. Measured here with a
   six-week-old dot: 1.8 s to 0.63 s per poll, same unread count.
   Thanks @ianswope (#98).
+- **A blue 1:1 is not turned green by Blip's own last send.** `mergeChats`
+  used to overwrite the window's send service with the chat-list row, which
+  is the cluster's newest bubble — including ours. One green send then made
+  every later send green, even when every inbound row was iMessage. The list
+  may still move a DM onto iMessage; it may not move one off. Thanks
+  @ianswope (#97).
+- **`prefer_imessage=on` keeps mixed 1:1s on iMessage.** Separate from the
+  list overwrite: last-inbound RCS/SMS in a DM that already had iMessage
+  still made the next send green. Opt in with `prefer_imessage=on` in
+  `bridge.conf`. A successful iMessage anywhere in the loaded window wins, a
+  never-iMessage green thread stays green, and a failed iMessage to a phone
+  still flips to SMS. Off by default. Groups still send by chat id.
+
 - **A Send Later message shows as Scheduled, not sent.** Messages writes a
   scheduled message into chat.db the moment you queue it, dated at the time it
   will go out. Blip showed it as already sent, made it the conversation's

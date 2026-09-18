@@ -1298,6 +1298,37 @@ describe("complete conversation list (mergeChats)", () => {
     expect(out[0]!.unread).toBe(windowThread.unread);
   });
 
+  // Live shape (Ian, 2026-09-16): a 1:1 keyed by an iCloud address, with the
+  // phone number as an alias of the same cluster, every inbound iMessage — and
+  // `imsg chats` reporting the cluster as RCS because its newest row was Blip's
+  // own last send. Blip then passed `--service RCS` and every reply left green,
+  // which made the next list row green too.
+  test("a merged 1:1 the window computed as iMessage is not turned green by the chat list", () => {
+    const merged = {
+      ...chats[0]!, id: "nancy@icloud.com", service: "RCS",
+      aliases: ["nancy@icloud.com", "+15551234567"],
+    };
+    const blue = { ...windowThread, chat: "nancy@icloud.com", service: "iMessage" };
+    expect(mergeChats([blue], [merged], {}, {})[0]!.service).toBe("iMessage");
+  });
+
+  test("a genuinely green DM still takes its service from the list", () => {
+    const green = { ...windowThread, chat: "+15559990000", service: "SMS" };
+    expect(mergeChats([green], [chats[2]!], {}, {})[0]!.service).toBe("SMS");
+  });
+
+  test("the list may still move a DM the other way, onto iMessage", () => {
+    const green = { ...windowThread, service: "SMS" };
+    expect(mergeChats([green], [chats[0]!], {}, {})[0]!.service).toBe("iMessage");
+  });
+
+  test("a group still takes the list service, since it sends by chat id", () => {
+    const id = "ce5a593a78af408282d61461ade89135";
+    const group = { ...windowThread, chat: id, service: "iMessage" };
+    const listed = { ...chats[1]!, service: "SMS" };
+    expect(mergeChats([group], [listed], {}, {})[0]!.service).toBe("SMS");
+  });
+
   test("pinned rows receive Messages-style names and cleaned latest previews", () => {
     const namedChats = chats.map((chat, index) => index === 0
       ? { ...chat, pin_name: "Pat", last_text: "Photo" }
@@ -1550,6 +1581,47 @@ describe("which service a DM sends on (@lukejmorrison, PR #4)", () => {
   test("no inbound: the last outbound that SUCCEEDED", () => {
     expect(sendServiceForMessages([at(0, { from_me: true, service: "SMS", error: 0 })])).toBe("SMS");
     expect(sendServiceForMessages([])).toBe("iMessage");
+  });
+
+  test("prefer_imessage keeps iMessage when later inbound is RCS or SMS", () => {
+    const mixed = [
+      at(0, { from_me: false, service: "iMessage" }),
+      at(1, { from_me: false, service: "RCS" }),
+    ];
+    expect(sendServiceForMessages(mixed)).toBe("RCS");
+    expect(sendServiceForMessages(mixed, true)).toBe("iMessage");
+    expect(sendServiceForMessages([
+      at(0, { from_me: true, service: "iMessage", error: 0 }),
+      at(1, { from_me: false, service: "SMS" }),
+    ], true)).toBe("iMessage");
+  });
+
+  test("prefer_imessage does not override a failed newest iMessage to a phone", () => {
+    expect(sendServiceForMessages([
+      at(0, { from_me: false, service: "iMessage" }),
+      at(1, { from_me: true, service: "iMessage", error: 22 }),
+    ], true)).toBe("SMS");
+  });
+
+  test("prefer_imessage leaves a never-iMessage RCS thread on RCS", () => {
+    expect(sendServiceForMessages([
+      at(0, { from_me: false, service: "RCS" }),
+      at(1, { from_me: true, service: "RCS", error: 0 }),
+    ], true)).toBe("RCS");
+  });
+
+  test("prefer_imessage=on is off by default and reads like other bridge.conf flags", () => {
+    const { preferImessagePolicy } = require("./collector") as typeof import("./collector");
+    const conf = (body: string): string => {
+      const p = `${process.env.XDG_CACHE_HOME}/prefer-imessage-${process.pid}-${Math.random().toString(36).slice(2)}`;
+      writeFileSync(p, body);
+      return p;
+    };
+    expect(preferImessagePolicy(conf("host=mac\n"))).toBe(false);
+    expect(preferImessagePolicy(`${process.env.XDG_CACHE_HOME}/absent-prefer-${process.pid}`)).toBe(false);
+    expect(preferImessagePolicy(conf("prefer_imessage=on\n"))).toBe(true);
+    expect(preferImessagePolicy(conf("prefer_imessage=YES\n"))).toBe(true);
+    expect(preferImessagePolicy(conf("prefer_imessage=off\n"))).toBe(false);
   });
 
   test("a group keeps the raw service — it sends by chat-id, not by service", () => {

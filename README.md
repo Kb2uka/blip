@@ -455,6 +455,20 @@ so `--hide-spam` / `--hide-unknown` exist on the far side.
 resolves them: the Mac's own region fills in the code. Green-bubble (SMS/RCS)
 conversations send on their own service automatically.
 
+**Prefer iMessage on mixed 1:1s.** A DM that used to be blue and then got an
+RCS inbound (someone in a mixed-platform group, Continuity falling back)
+otherwise sends RCS/SMS next. Opt in:
+
+```
+# ~/.config/blip/bridge.conf — re-read every poll, no restart
+prefer_imessage=on
+```
+
+A thread with a successful iMessage in the loaded window then stays
+iMessage. A never-iMessage RCS/SMS thread stays green. A failed iMessage to
+a phone still flips to SMS so the send does not stick. Groups are unchanged
+(they send by chat id). Default is off.
+
 **Two or more monitors:** one bar widget per screen is normal; only the one
 on the first screen polls and owns the app window, the others show the
 badge and forward clicks to it.
