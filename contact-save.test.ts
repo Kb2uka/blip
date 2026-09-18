@@ -1,5 +1,7 @@
 import {test,expect} from 'bun:test';
-import {readFileSync} from 'node:fs';
+import {mkdirSync,mkdtempSync,readFileSync,writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {runInNewContext} from 'node:vm';
 import {prepareContact,normalizeContactDraft,previewContact,saveContact,MAX_CONTACT_SAVE_BYTES} from './contact-save';
 const draft={handle:'+15551234567',firstName:'Example',lastName:'Person',phone:'+15551234567',email:'example@example.com'};
@@ -266,5 +268,25 @@ test('unavailable address book differs from denied permission in inspect and cre
     const expected={ok:false,code:denied?'permission':'unavailable'};
     expect(fixture.response).toEqual(expected);
     expect(native().createContact(fixture.value,fixture.adapter)).toEqual(expected);
+  }
+});
+
+test('the save spawns the shim where bin_dir= put it, not a hard-coded ~/bin',()=>{
+  const home = mkdtempSync(join(tmpdir(),'blip-save-'));
+  const previous = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const spawned: string[] = [];
+    const capture: any = (cmd: string)=>{spawned.push(cmd); return {status:0,stdout:JSON.stringify(success)};};
+    expect(saveContact(request,capture)).toEqual({ok:true,name:'Example Person'});
+    expect(spawned).toEqual([`${home}/bin/contact-save`]);
+
+    mkdirSync(join(home,'.config','blip'),{recursive:true});
+    writeFileSync(join(home,'.config','blip','bridge.conf'),'host=me@mac\nbin_dir=~/.local/bin\n');
+    spawned.length = 0;
+    expect(saveContact(request,capture)).toEqual({ok:true,name:'Example Person'});
+    expect(spawned).toEqual([`${home}/.local/bin/contact-save`]);
+  } finally {
+    if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous;
   }
 });

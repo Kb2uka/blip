@@ -2,8 +2,8 @@
 /** New contacts only. All contact fields stay in memory and cross bounded stdin. */
 import {spawnSync} from 'node:child_process';
 import {homedir} from 'node:os';
-import {join} from 'node:path';
 import {normalizeHandle, readStdinBounded} from './contact-review';
+import {shimPath} from './shim-path';
 export const MAX_CONTACT_SAVE_BYTES = 8192;
 const UNSAFE = /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/;
 export interface ContactDraft {handle: string; firstName: string; lastName: string; phone: string; email: string}
@@ -43,7 +43,8 @@ export function saveContact(value: any, runner = spawnSync) {
   if (value.confirmed !== true) throw new Error('Review the contact before saving');
   const input = JSON.stringify({operation:'create',...draft,confirmed:true});
   if (Buffer.byteLength(input)>MAX_CONTACT_SAVE_BYTES) throw new Error('Contact request is too large');
-  const result = runner(join(process.env.HOME ?? homedir(),'bin','contact-save'),[], {
+  const home = process.env.HOME ?? homedir();
+  const result = runner(shimPath('contact-save', home),[], {
     input, encoding:'utf8',timeout:325000,maxBuffer:MAX_CONTACT_SAVE_BYTES,
   });
   // A lost response can follow a successful save. Do not offer an automatic retry.

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { parseBinDir } from "./bin-dir";
 
-export type ShimTool = "imsg" | "imsg-send" | "imsg-read" | "contacts";
+export type ShimTool = "imsg" | "imsg-send" | "imsg-read" | "contacts" | "contact-save";
 
 export function shimPath(tool: ShimTool, home: string = process.env.HOME ?? homedir()): string {
   let conf = "";
