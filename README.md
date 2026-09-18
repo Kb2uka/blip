@@ -800,13 +800,15 @@ The 273,000-message history stays on the Mac where it lives.
 
 ## What it can't do
 
-- **Tapbacks, edits and typing indicators outbound.** Those need SIP-off code
-  injection into Messages. Not happening.
+- **Send tapbacks, edits, or threaded replies.** Blip *displays* all three and
+  does not send any of them. The reason is narrower than this file used to
+  claim: it is not that SIP-off code injection is required. macOS 26 Messages
+  has real menu items for three of them, and a menu item is scriptable through
+  the same Accessibility grant `imsg-read` already uses with SIP on. What is
+  unsolved is selecting an arbitrary bubble from Linux, and a group cannot be
+  addressed at all. Typing indicators have no menu item and stay out. See
+  issue #69 for the live work; nothing from it is in the tree.
   (Showing *their* receipts on your messages works fine — that's in.)
-- **Send tapbacks, edits, or threaded replies.** AppleScript can't; Blip
-  *displays* all three. If you need to send them,
-  [BlueBubbles](https://bluebubbles.app) is the right tool and requires
-  disabling SIP.
 - **Work without a Mac, or while the Mac sleeps.** Inherent to the approach.
   The widget dims and tells you.
 
