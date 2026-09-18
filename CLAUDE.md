@@ -217,13 +217,16 @@ what it is handed. Keep it that way.
   `~/Library/Accounts/Accounts4.sqlite`): `0` the local "On My Mac" store,
   which has no backing account and is what the owner typed; `1` the owner's
   own iCloud (CardDAV owned by Apple ID settings); `2` every other synced
-  source. The lowest rank offering a name wins outright, and the most common
-  spelling only breaks ties WITHIN a rank. Counting sources equally let a
-  synced directory of thousands rename people by sheer volume. An unreadable
-  Accounts db ranks everything the same, i.e. the old behaviour.
-  `_ab_sources()` returns paths IN RANK ORDER, which is also what makes
-  `cmd_avatar` — "first source with a photo wins" — prefer the owner's
-  picture over a corporate headshot.
+  source. The lowest rank offering a name wins outright, and WITHIN a rank the
+  LARGEST source wins outright too (`_record_count` over `ZABCDRECORD`, path
+  as the tie-break). Nothing is ever summed: counting sources equally let a
+  synced directory of thousands rename people by sheer volume, and the most
+  common spelling — which decided ties inside a rank until the v2.0.0 bridge
+  pin — let a handful of small stale stores outvote the primary account
+  (claude-on-mac #4/#5). An unreadable Accounts db puts every source in one
+  rank, so size alone decides. `_ab_sources()` returns paths IN
+  RANK-THEN-SIZE ORDER, which is also what makes `cmd_avatar` — "first source
+  with a photo wins" — prefer the owner's picture over a corporate headshot.
   EXCEPTION on top of that: a Family Sharing child's address book (Screen
   Time ▸ Manage Contacts) is mirrored to the parent's Mac as its OWN CardDAV
   store, flagged `isChildDelegate` in the same Accounts db. Contacts.app hides
