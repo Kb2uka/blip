@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **A read push is only reported as done when the Mac agrees it is done.**
+  `imsg-read` exited 0 when the Mac's unread count merely moved (3 to 2 counted
+  as success) and when chat.db could not be read at all, so a partial or
+  unverifiable push looked clean in `push-read.log`. It now waits out the same
+  bounded settling window for a real zero in the scope it was asked about, and
+  exits 75 with a reason otherwise. A missing menu item still succeeds when the
+  database says the conversation is read. Consequence worth knowing: a message
+  arriving during the three-second settle makes that push report failure even
+  though it cleared what it could. Nothing retries; the exit code is recorded
+  and the next mark-all clears the rest. Thanks @damonjanis (#102).
 - **One never-opened unread no longer slows every poll.** The ledger has to
   cover every outstanding unread so a message deleted or read on another device
   is reconciled, but that boundary was collapsed into one global minimum and

@@ -470,8 +470,8 @@ to whatever has focus otherwise.
     (inbound, non-tapback, `item_type=0`, newer than the chat's
     `last_read_message_timestamp` — the Dock-badge definition) before and
     after; when the menu is dormant it activates Messages for 0.7 s, clicks,
-    hands focus straight back, and exits 75 with a reason if the count did
-    not move. The collector records every push in
+    hands focus straight back, and exits 75 with a reason unless the final
+    count is zero. Partial progress or an unreadable database is not success. The collector records every push in
     `~/.local/state/blip/push-read.log` (exit code + status line, no content).
     A disabled menu item is NOT evidence of anything; chat.db is the referee.
   - With `push_read=all` a per-thread read pushes NOTHING by design — only
