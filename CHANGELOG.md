@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A read dot no longer comes back while the badge says zero.** Reading a
+  conversation clears its dot immediately and remembers that for 60 seconds. If
+  that memory expired before the collector confirmed the read, the next
+  identical poll matched a stale no-op cache, so the badge updated while the
+  list kept showing the conversation as read, or the dot returned on its own.
+  The no-op check is now derived from the model actually on screen.
+  Thanks @damonjanis (#101).
 - **A read push is only reported as done when the Mac agrees it is done.**
   `imsg-read` exited 0 when the Mac's unread count merely moved (3 to 2 counted
   as success) and when chat.db could not be read at all, so a partial or
