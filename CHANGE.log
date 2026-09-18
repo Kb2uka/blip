@@ -13,7 +13,10 @@ RULES FOR THIS FILE (Fred, 2026-09-16, standing)
     Checked with `gh api users/<login>`, `gh api users/<login>/social_accounts`,
     their site, then `x user @<handle>` and `x timeline @<handle>`.
   * No verified handle: write "X: none found (checked YYYY-MM-DD)" so the
-    lookup is visibly done, never silently skipped.
+    lookup is visibly done, never silently skipped, AND ASK FRED EARLY (Fred,
+    standing, 2026-09-18: "Always pair the X account, ask me early if you cant
+    figure out who they are"). Ask when the gap appears, at merge time, not on
+    the day the post is due. He often knows the person or can ask them.
   * Add the entry in the SAME change that merges the work.
 
 PEOPLE (verified handles)
@@ -21,6 +24,7 @@ PEOPLE (verified handles)
   Zach Wilke        github.com/zachwilke    X https://x.com/zachwilke_1  (his site pinefall.dev)
   Brenden Bishop    github.com/bbishdotdev  X https://x.com/bbishdotdev  (his site bbish.dev; X name matches)
   Marshall Huss     github.com/mwhuss       X https://x.com/mwhuss       (X name matches; posts about his Omarchy plugin, replies to @NixFred)
+  Jethro Jones      github.com/jethrojones   X https://x.com/jethrojones  (X name matches; app-building and schools, fits his known work) (confirmed by Fred 2026-09-18)
   Damon Janis      github.com/damonjanis   X https://x.com/damonjanis    (X name matches; posts about Omarchy and replies to @dhh)
   Baden (bpiland)   github.com/bpiland      X https://x.com/bhp35         (published on his GitHub profile; X name matches)
   Danny Cecil       github.com/jefehoser    X https://x.com/jefehoser    (same unique login on X; posts about Omarchy) (confirmed by Fred 2026-09-16)

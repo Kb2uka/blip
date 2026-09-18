@@ -12,6 +12,10 @@ reconstructed on Sunday from memory.
   makes the post worth reading: measured before/after, tests run, what was NOT
   checked.
 - Credit the reporter of a bug as well as its fixer.
+- EVERY contributor is paired with an X account. If the lookup cannot verify
+  one, ask Fred THE SAME DAY the PR merges (standing, 2026-09-18), never at
+  post time: he often knows the person or can just ask them. Open questions
+  live in "Handles Fred still needs to answer" below until they are answered.
 - Anything a contributor should know that is not in the diff (a trade-off, a
   follow-up left open, a decision that went against their PR) goes here too.
 - On Sunday the week's section becomes one post, drafted into `X-POSTS.md`, and
@@ -117,6 +121,19 @@ reconstructed on Sunday from memory.
 - vic ran an old Blip against the updated bridge and showed every message at
   12:00am. Our miss, not a contributor's: a bridge change has to reach every
   client in the same step.
+
+### Handles Fred still needs to answer (asked 2026-09-18)
+- **Ian Swope** (github.com/ianswope), 12 merged PRs, the most of anyone this
+  week. Nothing published; @IanSwope on X carries his name but is dormant with
+  no tie to Linux or GitHub. FRED IS ASKING HIM (2026-09-18). Untagged until he
+  answers; do not guess.
+- **Jethro Jones**: ANSWERED 2026-09-18, tag https://x.com/jethrojones.
+- **cw228** (#100), **Kb2uka** (#90, #91) and **cjoh** (reported #86): asked on
+  their own PRs/issue 2026-09-18 how they want to be credited, with "rather not
+  be tagged" offered as an equally good answer. Waiting.
+- **tolewis**, **jacobaross**, **apexbenny**,
+  **dreinecke**, **znayer**, **Erik Fillipsveen**: nothing published, and Erik
+  is the largest contributor to the project overall.
 
 ### Standing items to mention when they resolve
 - Ian Swope has 12 merged PRs and no X handle anyone can verify. If someone
